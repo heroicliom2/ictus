@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ictus-cli",
+    "crates/ictus-ir",
+    "crates/ictus-frontend-verilog",
+    "crates/ictus-kernel",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"

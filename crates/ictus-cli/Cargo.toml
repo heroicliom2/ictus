@@ -1,0 +1,14 @@
+[package]
+name = "ictus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ictus"
+path = "src/main.rs"
+
+[dependencies]
+ictus-ir = { path = "../ictus-ir" }
+ictus-frontend-verilog = { path = "../ictus-frontend-verilog" }
+ictus-kernel = { path = "../ictus-kernel" }

@@ -1,0 +1,9 @@
+[package]
+name = "ictus-frontend-verilog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ictus-ir = { path = "../ictus-ir" }
+sv-parser = "0.13"
