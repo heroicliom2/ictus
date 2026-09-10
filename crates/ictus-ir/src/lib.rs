@@ -8,11 +8,12 @@
 //! interpreter-first sequencing this supports): a single flat module, no
 //! instances/hierarchy, no parameters/generate blocks, any number of
 //! clocked (`always @(posedge clk)`) processes and continuous `assign`s
-//! but no `always_comb` yet, `if`/`else` (no `else if`) and plain `case`
-//! (exact match; not `casez`/`casex`, which need wildcard-bit-aware
-//! comparison this IR doesn't represent yet) alongside non-blocking
-//! assignment, no bit-select/concatenation. Each of those is a documented
-//! gap to widen incrementally, not a final design.
+//! but no `always_comb` yet, `if`/`else` (no `else if`) and
+//! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
+//! assignment, constant bit-select/part-select on reads only (not
+//! concatenation, not a variable/signal-indexed select, not as an
+//! assignment target). Each of those is a documented gap to widen
+//! incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -78,12 +79,13 @@ pub enum Stmt {
         then_branch: Vec<Stmt>,
         else_branch: Vec<Stmt>,
     },
-    /// Plain `case` only -- exact equality against `selector`, arms tried
-    /// in order, first match wins (matching multiple comma-separated
-    /// values, e.g. `2'd2, 2'd3: ...`, is one `CaseArm` with several
-    /// `values`). `casez`/`casex` are rejected by the frontend rather
-    /// than silently treated as exact-match `case`, which would silently
-    /// mis-match on their wildcard bits.
+    /// `case`, `casez`, or `casex` -- arms tried in order, first matching
+    /// value wins (matching multiple comma-separated values, e.g.
+    /// `2'd2, 2'd3: ...`, is one `CaseArm` with several `values`). Each
+    /// value is independently exact-match or wildcard-match (see
+    /// `CaseValue`) -- mixing both kinds of value within one `casez`'s
+    /// arms is valid and not unusual (most arms are wildcard patterns, a
+    /// `default` or a specific literal arm might not need any `?` bits).
     Case {
         selector: Expr,
         arms: Vec<CaseArm>,
@@ -93,8 +95,27 @@ pub enum Stmt {
 
 #[derive(Debug, Clone)]
 pub struct CaseArm {
-    pub values: Vec<Expr>,
+    pub values: Vec<CaseValue>,
     pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CaseValue {
+    /// Plain `case` semantics, or a non-wildcard item inside a
+    /// `casez`/`casex`: matches when `expr`'s value equals the selector's.
+    Exact(Expr),
+    /// A `casez`/`casex` item with `?`/`z`/`x` wildcard bits (e.g.
+    /// `8'b1010????`). Matches when `(selector ^ value) & care_mask == 0`
+    /// -- i.e. every bit where `care_mask` is 1 must match exactly, and
+    /// every bit where it's 0 matches regardless of the selector's value
+    /// there. Bit positions beyond the literal's own written width are
+    /// *not* covered by `care_mask` (so they're effectively wildcard too,
+    /// not zero-extended the way real Verilog would treat an undersized
+    /// literal) -- a known simplification, fine as long as a wildcard
+    /// item's declared width matches the selector's, which is standard
+    /// style for this construct and the only style this frontend's tests
+    /// use.
+    Wildcard { value: u64, care_mask: u64 },
 }
 
 /// A single `always @(posedge <clock>) begin ... end` block. A module can

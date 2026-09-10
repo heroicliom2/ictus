@@ -122,14 +122,25 @@ fn eval_stmts(stmts: &[Stmt], values: &[u64], updates: &mut Vec<(SignalId, u64)>
                 default,
             } => {
                 let selector_value = eval_expr(selector, values);
-                let matched_arm = arms
-                    .iter()
-                    .find(|arm| arm.values.iter().any(|v| eval_expr(v, values) == selector_value));
+                let matched_arm = arms.iter().find(|arm| {
+                    arm.values
+                        .iter()
+                        .any(|v| case_value_matches(v, selector_value, values))
+                });
                 match matched_arm {
                     Some(arm) => eval_stmts(&arm.body, values, updates),
                     None => eval_stmts(default, values, updates),
                 }
             }
+        }
+    }
+}
+
+fn case_value_matches(value: &ictus_ir::CaseValue, selector_value: u64, values: &[u64]) -> bool {
+    match value {
+        ictus_ir::CaseValue::Exact(expr) => eval_expr(expr, values) == selector_value,
+        ictus_ir::CaseValue::Wildcard { value, care_mask } => {
+            (selector_value ^ value) & care_mask == 0
         }
     }
 }

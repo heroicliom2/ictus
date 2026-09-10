@@ -76,12 +76,22 @@ differential matches against Icarus Verilog:
   write, so silently dropping the select would write the wrong bits with
   no error) and `ictus-cli/tests/differential_select.rs`.
 
+- `casez_test.v` (wildcard-bit matching: `4'b1???`, `4'b01??`, mixed with
+  a plain exact-match item in the same `casez`) --
+  `ictus-frontend-verilog/tests/case.rs::lowers_casez_wildcard_and_exact_arms`
+  and `ictus-cli/tests/differential_casez.rs`. This is the payoff for
+  `case` and bit-select landing first: real instruction decode
+  (`casez (instr[6:0]) 7'b0000???: ...`) needs exactly this combination.
+  Caught a real bug along the way -- the wildcard-literal parser only
+  marked a written `1` digit as "must match", leaving a written `0` digit
+  treated as *also* wildcard (silently matching either 0 or 1 at that
+  position) instead of "must match 0"; `lowers_casez_wildcard_and_exact_arms`
+  asserts the exact `care_mask` bits and caught it immediately.
+
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, no `else if`, plain `case` only (not `casez`/`casex` --
-those need wildcard-bit-aware literal parsing and comparison this IR
-doesn't represent yet), constant bit-select/part-select on reads only (not
-`x[i]`, not as a write target, not concatenation `{a,b}`), no module
+`always_comb`, no `else if`, constant bit-select/part-select on reads only
+(not `x[i]`, not as a write target, not concatenation `{a,b}`), no module
 instantiation. Cranelift codegen, phase 0's actual benchmark designs
 (picorv32 first), and the gaps above are all still ahead of where this
 stands today.

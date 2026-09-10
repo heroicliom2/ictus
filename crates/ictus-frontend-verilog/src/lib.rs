@@ -4,26 +4,28 @@
 //! v1 scope, matching `ictus_ir`'s current shape (see that crate's doc
 //! comment): a single ANSI-style module (`module foo (input wire clk,
 //! ...)`), any number of clocked `always @(posedge clk) begin ... end`
-//! blocks, `if`/`else` (no `else if` chains), plain `case` (not
-//! `casez`/`casex` -- see `lower_case`), non-blocking assignment,
-//! internal `wire`/`reg` declarations (in addition to ports), constant
+//! blocks, `if`/`else` (no `else if` chains), `case`/`casez`/`casex`
+//! (wildcard bits only on a case *item*'s own literal -- see
+//! `lower_case`/`lower_case_value`), non-blocking assignment, internal
+//! `wire`/`reg` declarations (in addition to ports), constant
 //! bit-select/part-select on the *read* side only (`x[3]`, `x[7:0]`; not
 //! `x[i]`, not as an assignment target -- see `lower_select` and
 //! `reject_select_target`), and expressions built from literals
-//! (decimal/binary/hex; not octal, not X/Z-valued), signal references,
-//! unary `!`, and the binary operators `+ & | ^ == != < <= > >= && ||`.
-//! Anything else in the source is either ignored (other module items) or
-//! produces an error, deliberately -- silently mis-lowering an
-//! unsupported construct would make this project's own differential
-//! testing (docs/architecture.md, Validation strategy) meaningless. Also
-//! lowers single-assignment continuous `assign target = expr;` statements
-//! (net-targeted only -- see `lower_continuous_assign`) into
-//! `ictus_ir::Assign`. Widen this as later phases need more of the
-//! language -- `casez`/`casex`, variable-indexed select, concatenation,
-//! `always_comb`, and module instantiation are the next-highest-value
-//! gaps toward running a real design like phase 0's picorv32 benchmark.
+//! (decimal/binary/hex; not octal, not X/Z-valued outside a case item),
+//! signal references, unary `!`, and the binary operators
+//! `+ & | ^ == != < <= > >= && ||`. Anything else in the source is either
+//! ignored (other module items) or produces an error, deliberately --
+//! silently mis-lowering an unsupported construct would make this
+//! project's own differential testing (docs/architecture.md, Validation
+//! strategy) meaningless. Also lowers single-assignment continuous
+//! `assign target = expr;` statements (net-targeted only -- see
+//! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as later
+//! phases need more of the language -- variable-indexed select,
+//! concatenation, `always_comb`, and module instantiation are the
+//! next-highest-value gaps toward running a real design like phase 0's
+//! picorv32 benchmark.
 
-use ictus_ir::{Assign, CaseArm, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
+use ictus_ir::{Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
 use std::path::Path;
 use sv_parser::{
     parse_sv, unwrap_node, AlwaysConstruct, AnsiPortDeclaration, ConditionalStatement,
@@ -288,27 +290,22 @@ fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module
 }
 
 /// `casez`/`casex` share `case`'s grammar (`CaseStatementNormal`, just a
-/// different `CaseKeyword`) but are rejected rather than lowered: treating
-/// their wildcard bits (`?`/`z`/`x`) as literal 0/1 would silently
-/// mis-match instead of failing loudly, which is exactly the class of bug
-/// this project's differential testing exists to catch -- see this
-/// function's `CaseKeyword` match. `inside`/pattern-matching case forms
-/// (`CaseStatement::Matches`/`Inside`) aren't supported either.
+/// different `CaseKeyword`). The kernel is 2-state only (decisions.md
+/// D6), so the part of real `casez`/`casex` semantics that treats an
+/// *unknown* (x/z) selector bit as a wildcard can never actually trigger
+/// here -- a 2-state value has no x/z bits to begin with. What's left,
+/// and what this lowers, is wildcard bits written directly into a case
+/// *item*'s literal (`8'b1010????`): each such item becomes
+/// `CaseValue::Wildcard` (see `lower_case_value`); everything else
+/// (including every item under plain `case`) is exact-match, unchanged
+/// from before. `inside`/pattern-matching case forms
+/// (`CaseStatement::Matches`/`Inside`) aren't supported.
 fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Module) -> Result<Stmt, String> {
     let sv_parser::CaseStatement::Normal(normal) = case else {
         return Err("`inside`/pattern-matching case forms are not supported in v1".to_string());
     };
 
-    match &normal.nodes.1 {
-        sv_parser::CaseKeyword::Case(_) => {}
-        sv_parser::CaseKeyword::Casez(_) | sv_parser::CaseKeyword::Casex(_) => {
-            return Err(
-                "`casez`/`casex` are not supported in v1 -- they need wildcard-bit-aware \
-                 comparison this frontend doesn't implement yet"
-                    .to_string(),
-            );
-        }
-    }
+    let wildcard_mode = !matches!(normal.nodes.1, sv_parser::CaseKeyword::Case(_));
 
     let selector = lower_expr(&normal.nodes.2.nodes.1.nodes.0, tree, module)?;
 
@@ -323,7 +320,7 @@ fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Modul
                     .0
                     .contents()
                     .into_iter()
-                    .map(|item_expr| lower_expr(&item_expr.nodes.0, tree, module))
+                    .map(|item_expr| lower_case_value(&item_expr.nodes.0, tree, module, wildcard_mode))
                     .collect::<Result<Vec<_>, _>>()?;
                 let body = lower_statement_or_null(&nd.nodes.2, tree, module)?;
                 arms.push(CaseArm { values, body });
@@ -339,6 +336,80 @@ fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Modul
         arms,
         default,
     })
+}
+
+/// Lowers one `casez`/`casex` (or plain `case`) item value. When
+/// `wildcard_mode` is set and the item is literally a binary literal
+/// (`8'b1010????`), parses it wildcard-aware via `lower_wildcard_binary`;
+/// otherwise falls back to plain `lower_expr` (exact match) -- covering
+/// both plain `case` entirely, and any `casez`/`casex` item that happens
+/// not to be a binary literal (a decimal/hex value with no wildcard bits
+/// is still valid there, just always an exact match).
+fn lower_case_value(
+    expr: &sv_parser::Expression,
+    tree: &SyntaxTree,
+    module: &Module,
+    wildcard_mode: bool,
+) -> Result<CaseValue, String> {
+    if wildcard_mode {
+        if let Some(binary) = as_binary_number(expr) {
+            let (value, care_mask) = lower_wildcard_binary(binary, tree)?;
+            return Ok(CaseValue::Wildcard { value, care_mask });
+        }
+    }
+    Ok(CaseValue::Exact(lower_expr(expr, tree, module)?))
+}
+
+fn as_binary_number(expr: &sv_parser::Expression) -> Option<&sv_parser::BinaryNumber> {
+    let sv_parser::Expression::Primary(primary) = expr else {
+        return None;
+    };
+    let sv_parser::Primary::PrimaryLiteral(lit) = &**primary else {
+        return None;
+    };
+    let sv_parser::PrimaryLiteral::Number(number) = &**lit else {
+        return None;
+    };
+    let sv_parser::Number::IntegralNumber(integral) = &**number else {
+        return None;
+    };
+    let sv_parser::IntegralNumber::BinaryNumber(binary) = &**integral else {
+        return None;
+    };
+    Some(binary)
+}
+
+/// Parses a (possibly wildcard-containing) binary literal digit-by-digit
+/// into a `(value, care_mask)` pair -- `u64::from_str_radix`, used for
+/// plain binary literals elsewhere in this frontend, rejects `?`/`x`/`z`
+/// characters outright, so wildcard literals need their own parser rather
+/// than reusing `lower_number`.
+fn lower_wildcard_binary(binary: &sv_parser::BinaryNumber, tree: &SyntaxTree) -> Result<(u64, u64), String> {
+    let text = locate_text(&binary.nodes.2.nodes.0, tree)?;
+    let digits = strip_underscores(text);
+
+    let mut value: u64 = 0;
+    let mut care_mask: u64 = 0;
+    for ch in digits.chars() {
+        value <<= 1;
+        care_mask <<= 1;
+        match ch {
+            '0' => {
+                care_mask |= 1;
+            }
+            '1' => {
+                value |= 1;
+                care_mask |= 1;
+            }
+            '?' | 'z' | 'Z' | 'x' | 'X' => {}
+            other => {
+                return Err(format!(
+                    "unexpected character '{other}' in binary literal '{digits}'"
+                ))
+            }
+        }
+    }
+    Ok((value, care_mask))
 }
 
 fn lower_nonblocking_assign(

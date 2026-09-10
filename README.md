@@ -59,15 +59,15 @@ sequencing.
 
 Phase 1 in progress (see docs/roadmap.md). A narrow Verilog subset (single
 module, any number of clocked `always @(posedge clk)` blocks and
-continuous `assign`s, `if`/`else`, plain `case` (not `casez`/`casex`),
-non-blocking assignment, internal `wire`/`reg` declarations, constant
-bit-select/part-select on reads (`x[3]`, `x[7:0]`), the operators
+continuous `assign`s, `if`/`else`, `case`/`casez`/`casex` with wildcard
+bits, non-blocking assignment, internal `wire`/`reg` declarations,
+constant bit-select/part-select on reads (`x[3]`, `x[7:0]`), the operators
 `+ & | ^ == != < <= > >= && !`, decimal/hex/binary literals) parses,
 lowers to `ictus-ir`, and runs correctly on a tree-walking interpreter —
 checked with cycle-for-cycle differential tests against Icarus Verilog.
-Cranelift JIT codegen, `casez`/`casex`, concatenation, and the phase 0
-benchmark designs (picorv32 first) are all still ahead of where this
-stands today.
+Cranelift JIT codegen, concatenation, variable-indexed select, and the
+phase 0 benchmark designs (picorv32 first) are all still ahead of where
+this stands today.
 
 ## Workspace layout
 
