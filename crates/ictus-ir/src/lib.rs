@@ -6,10 +6,12 @@
 //!
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
 //! interpreter-first sequencing this supports): a single flat module, no
-//! instances/hierarchy, no parameters/generate blocks, one clocked
-//! (`always @(posedge clk)`) process per module, `if`/`else` and
-//! non-blocking assignment only. Each of those is a documented gap to
-//! widen incrementally, not a final design.
+//! instances/hierarchy, no parameters/generate blocks, any number of
+//! clocked (`always @(posedge clk)`) processes but no combinational
+//! (`always_comb`/`assign`) processes yet, `if`/`else` (no `else if`) and
+//! non-blocking assignment only, no `case`, no bit-select/concatenation.
+//! Each of those is a documented gap to widen incrementally, not a final
+//! design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -34,8 +36,27 @@ pub struct Signal {
 pub enum Expr {
     Literal { value: u64, width: u32 },
     Ref(SignalId),
+    /// Logical negation (`!`) -- result is always 0 or 1. Bitwise `~` is
+    /// not supported yet: doing it correctly needs each sub-expression's
+    /// width tracked so the complement gets masked at the point of
+    /// negation, not just when the final result is written to a signal
+    /// (see docs/decisions.md and this crate's kernel counterpart for why
+    /// write-time-only masking is fine for the operators below but not for
+    /// `~`).
     Not(Box<Expr>),
     Add(Box<Expr>, Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Xor(Box<Expr>, Box<Expr>),
+    /// Result is always 0 or 1, like all comparison/logical variants below.
+    Eq(Box<Expr>, Box<Expr>),
+    Ne(Box<Expr>, Box<Expr>),
+    Lt(Box<Expr>, Box<Expr>),
+    Le(Box<Expr>, Box<Expr>),
+    Gt(Box<Expr>, Box<Expr>),
+    Ge(Box<Expr>, Box<Expr>),
+    LogicalAnd(Box<Expr>, Box<Expr>),
+    LogicalOr(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -48,9 +69,9 @@ pub enum Stmt {
     },
 }
 
-/// A single `always @(posedge <clock>) begin ... end` block. v1 supports
-/// exactly one of these per module -- multiple clocked processes and
-/// combinational (`always_comb`/`assign`) processes are not lowered yet.
+/// A single `always @(posedge <clock>) begin ... end` block. A module can
+/// have any number of these; combinational (`always_comb`/`assign`)
+/// processes are not lowered yet (see this crate's doc comment).
 #[derive(Debug, Clone)]
 pub struct ClockedProcess {
     pub clock: SignalId,

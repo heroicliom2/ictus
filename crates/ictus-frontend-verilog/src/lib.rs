@@ -3,21 +3,27 @@
 //!
 //! v1 scope, matching `ictus_ir`'s current shape (see that crate's doc
 //! comment): a single ANSI-style module (`module foo (input wire clk,
-//! ...)`), one clocked `always @(posedge clk) begin ... end` block,
-//! `if`/`else` (no `else if` chains), non-blocking assignment, and
-//! expressions built from literals, signal references, unary `!`, and
-//! binary `+`. Anything else in the source is either ignored (other
-//! module items) or produces an error, deliberately -- silently
-//! mis-lowering an unsupported construct would make this project's own
-//! differential testing (docs/architecture.md, Validation strategy)
-//! meaningless. Widen this as later phases need more of the language.
+//! ...)`), any number of clocked `always @(posedge clk) begin ... end`
+//! blocks, `if`/`else` (no `else if` chains), non-blocking assignment,
+//! internal `wire`/`reg` declarations (in addition to ports), and
+//! expressions built from literals (decimal/binary/hex; not octal, not
+//! X/Z-valued), signal references, unary `!`, and the binary operators
+//! `+ & | ^ == != < <= > >= && ||`. Anything else in the source is either
+//! ignored (other module items) or produces an error, deliberately --
+//! silently mis-lowering an unsupported construct would make this
+//! project's own differential testing (docs/architecture.md, Validation
+//! strategy) meaningless. Widen this as later phases need more of the
+//! language -- `assign`/combinational processes, `case`, bit-select and
+//! concatenation, and module instantiation are the next-highest-value
+//! gaps toward running a real design like phase 0's picorv32 benchmark.
 
 use ictus_ir::{ClockedProcess, Direction, Expr, Module, Signal, Stmt};
 use std::path::Path;
 use sv_parser::{
     parse_sv, unwrap_node, AlwaysConstruct, AnsiPortDeclaration, ConditionalStatement,
-    EdgeIdentifier, Locate, NonblockingAssignment, PortDirection, RefNode, SeqBlock,
-    StatementItem, StatementOrNull, SyntaxTree,
+    DataDeclaration, DecimalNumber, EdgeIdentifier, IntegralNumber, Locate,
+    NonblockingAssignment, Number, PortDirection, RefNode, SeqBlock, StatementItem,
+    StatementOrNull, SyntaxTree,
 };
 
 pub fn lower_file(path: &Path) -> Result<Module, String> {
@@ -50,6 +56,18 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     for port_node in module_node.into_iter() {
         if let RefNode::AnsiPortDeclaration(port) = port_node {
             module.push_signal(lower_port(port, &tree)?);
+        }
+    }
+
+    for decl_node in module_node.into_iter() {
+        match decl_node {
+            RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net)) => {
+                module.push_signal(lower_internal_signal(&**net, &tree)?);
+            }
+            RefNode::DataDeclaration(DataDeclaration::Variable(var)) => {
+                module.push_signal(lower_internal_signal(&**var, &tree)?);
+            }
+            _ => {}
         }
     }
 
@@ -106,6 +124,38 @@ fn lower_port(port: &AnsiPortDeclaration, tree: &SyntaxTree) -> Result<Signal, S
         name,
         width,
         direction: Some(direction),
+    })
+}
+
+/// Lowers a `wire`/`reg` declaration in the module body (as opposed to a
+/// port declaration -- see `lower_port`) into an internal `Signal`
+/// (`direction: None`). Generic over the declaration's concrete node type
+/// (`NetDeclarationNetType` for `wire`, `DataDeclarationVariable` for
+/// `reg`) since both are searched the same way: find the declared name
+/// and an optional packed range, wherever they sit in that node's
+/// subtree, without needing to hand-decode either grammar's exact nested
+/// shape (`ListOfNetDeclAssignments`/`ListOfVariableDeclAssignments`,
+/// `NetIdentifier`/`VariableIdentifier`, ...). Doesn't yet handle a
+/// declaration naming more than one signal (`wire a, b;`) -- only the
+/// first identifier found is used.
+fn lower_internal_signal<'a, T>(decl: &'a T, tree: &'a SyntaxTree) -> Result<Signal, String>
+where
+    &'a T: IntoIterator<Item = RefNode<'a>>,
+{
+    let ident = unwrap_node!(decl, SimpleIdentifier).ok_or("declaration has no identifier")?;
+    let name = ident_str(ident, tree)
+        .ok_or("declaration identifier unreadable")?
+        .to_string();
+
+    let width = match unwrap_node!(decl, PackedDimensionRange) {
+        Some(range_node) => lower_packed_range(range_node, tree)?,
+        None => 1,
+    };
+
+    Ok(Signal {
+        name,
+        width,
+        direction: None,
     })
 }
 
@@ -266,6 +316,17 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Module) 
             let rhs = lower_expr(&binary.nodes.3, tree, module)?;
             match op_text {
                 "+" => Ok(Expr::Add(Box::new(lhs), Box::new(rhs))),
+                "&" => Ok(Expr::And(Box::new(lhs), Box::new(rhs))),
+                "|" => Ok(Expr::Or(Box::new(lhs), Box::new(rhs))),
+                "^" => Ok(Expr::Xor(Box::new(lhs), Box::new(rhs))),
+                "==" => Ok(Expr::Eq(Box::new(lhs), Box::new(rhs))),
+                "!=" => Ok(Expr::Ne(Box::new(lhs), Box::new(rhs))),
+                "<" => Ok(Expr::Lt(Box::new(lhs), Box::new(rhs))),
+                "<=" => Ok(Expr::Le(Box::new(lhs), Box::new(rhs))),
+                ">" => Ok(Expr::Gt(Box::new(lhs), Box::new(rhs))),
+                ">=" => Ok(Expr::Ge(Box::new(lhs), Box::new(rhs))),
+                "&&" => Ok(Expr::LogicalAnd(Box::new(lhs), Box::new(rhs))),
+                "||" => Ok(Expr::LogicalOr(Box::new(lhs), Box::new(rhs))),
                 other => Err(format!("unsupported binary operator '{other}'")),
             }
         }
@@ -273,20 +334,38 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Module) 
     }
 }
 
+/// Matches `Primary`'s own variants directly rather than deep-searching
+/// its subtree for `Number`/`HierarchicalIdentifier` -- a deep search is
+/// too permissive here: for a parenthesized sub-expression like
+/// `(a == b)`, searching the whole subtree for the first
+/// `HierarchicalIdentifier` finds `a` (nested inside the parenthesized
+/// expression) and would wrongly lower the *entire* primary as just a
+/// reference to `a`, silently discarding the `== b` part. Matching the
+/// immediate variant avoids reaching past the primary's own top level.
 fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Module) -> Result<Expr, String> {
-    if let Some(number) = unwrap_node!(primary, Number) {
-        return lower_number(number, tree);
+    use sv_parser::Primary as P;
+    match primary {
+        P::PrimaryLiteral(lit) => match &**lit {
+            sv_parser::PrimaryLiteral::Number(number) => lower_number(number, tree),
+            other => Err(format!("literal form not supported in v1: {other:?}")),
+        },
+        P::Hierarchical(h) => {
+            let simple = unwrap_node!(&h.nodes.1, SimpleIdentifier)
+                .ok_or("identifier reference unreadable")?;
+            let name = ident_str(simple, tree).ok_or("identifier reference unreadable")?;
+            let id = module
+                .signal_id(name)
+                .ok_or_else(|| format!("reference to unknown signal '{name}'"))?;
+            Ok(Expr::Ref(id))
+        }
+        P::MintypmaxExpression(paren) => match &paren.nodes.0.nodes.1 {
+            sv_parser::MintypmaxExpression::Expression(inner) => lower_expr(inner, tree, module),
+            sv_parser::MintypmaxExpression::Ternary(_) => {
+                Err("min:typ:max expressions are not supported in v1".to_string())
+            }
+        },
+        other => Err(format!("primary expression form not supported in v1: {other:?}")),
     }
-    if let Some(ident) = unwrap_node!(primary, HierarchicalIdentifier) {
-        let simple =
-            unwrap_node!(ident, SimpleIdentifier).ok_or("identifier reference unreadable")?;
-        let name = ident_str(simple, tree).ok_or("identifier reference unreadable")?;
-        let id = module
-            .signal_id(name)
-            .ok_or_else(|| format!("reference to unknown signal '{name}'"))?;
-        return Ok(Expr::Ref(id));
-    }
-    Err(format!("primary expression form not supported in v1: {primary:?}"))
 }
 
 fn symbol_text<'a, T>(op: &'a T, tree: &'a SyntaxTree) -> Option<&'a str>
@@ -299,43 +378,74 @@ where
     })
 }
 
-fn lower_number(node: RefNode, tree: &SyntaxTree) -> Result<Expr, String> {
-    // v1 supports plain unsized decimals (`0`, `7`) and sized decimals
-    // (`8'd0`) -- the two forms this frontend's target designs actually
-    // use. Binary/octal/hex literals are a documented gap. Sized must be
-    // checked first: its digits are themselves an UnsignedNumber node, so
-    // checking the unsized case first would match those digits but lose
-    // the declared width.
-    if let Some(sized) = unwrap_node!(node.clone(), DecimalNumberBaseUnsigned) {
-        let digits_node = unwrap_node!(sized.clone(), UnsignedNumber)
-            .ok_or("sized decimal literal has no digits")?;
-        let digits =
-            unsigned_number_str(digits_node, tree).ok_or("could not read literal digits")?;
-        let value = digits
-            .parse::<u64>()
-            .map_err(|_| format!("could not parse decimal literal '{digits}'"))?;
-
-        let width = match unwrap_node!(sized, NonZeroUnsignedNumber) {
-            Some(RefNode::NonZeroUnsignedNumber(x)) => {
-                let text = tree
-                    .get_str(&x.nodes.0)
-                    .ok_or("could not read literal size")?;
-                text.parse::<u32>()
-                    .map_err(|_| format!("could not parse literal size '{text}'"))?
-            }
-            _ => 32,
-        };
-        return Ok(Expr::Literal { value, width });
+/// Takes the concrete `Number` type for the same reason `lower_expr` takes
+/// `&Expression` rather than `RefNode`: matching its variants directly is
+/// precise, instead of pattern-matching a `RefNode` shape that's only
+/// reliable when it comes straight from the tree walker.
+fn lower_number(number: &Number, tree: &SyntaxTree) -> Result<Expr, String> {
+    let integral = match number {
+        Number::IntegralNumber(i) => i,
+        Number::RealNumber(_) => return Err("real number literals are not supported".to_string()),
+    };
+    match &**integral {
+        IntegralNumber::DecimalNumber(d) => lower_decimal_number(d, tree),
+        IntegralNumber::BinaryNumber(b) => {
+            let width = lower_size(&b.nodes.0, tree)?;
+            let text = locate_text(&b.nodes.2.nodes.0, tree)?;
+            let value = u64::from_str_radix(&strip_underscores(text), 2)
+                .map_err(|_| format!("could not parse binary literal '{text}'"))?;
+            Ok(Expr::Literal { value, width })
+        }
+        IntegralNumber::HexNumber(h) => {
+            let width = lower_size(&h.nodes.0, tree)?;
+            let text = locate_text(&h.nodes.2.nodes.0, tree)?;
+            let value = u64::from_str_radix(&strip_underscores(text), 16)
+                .map_err(|_| format!("could not parse hex literal '{text}'"))?;
+            Ok(Expr::Literal { value, width })
+        }
+        IntegralNumber::OctalNumber(_) => Err("octal literals are not supported in v1".to_string()),
     }
+}
 
-    if let Some(digits_node) = unwrap_node!(node, UnsignedNumber) {
-        let text =
-            unsigned_number_str(digits_node, tree).ok_or("could not read literal digits")?;
-        let value = text
-            .parse::<u64>()
-            .map_err(|_| format!("could not parse decimal literal '{text}'"))?;
-        return Ok(Expr::Literal { value, width: 32 });
+fn lower_decimal_number(decimal: &DecimalNumber, tree: &SyntaxTree) -> Result<Expr, String> {
+    match decimal {
+        DecimalNumber::UnsignedNumber(u) => {
+            let text = locate_text(&u.nodes.0, tree)?;
+            let value = strip_underscores(text)
+                .parse::<u64>()
+                .map_err(|_| format!("could not parse decimal literal '{text}'"))?;
+            Ok(Expr::Literal { value, width: 32 })
+        }
+        DecimalNumber::BaseUnsigned(b) => {
+            let width = lower_size(&b.nodes.0, tree)?;
+            let text = locate_text(&b.nodes.2.nodes.0, tree)?;
+            let value = strip_underscores(text)
+                .parse::<u64>()
+                .map_err(|_| format!("could not parse decimal literal '{text}'"))?;
+            Ok(Expr::Literal { value, width })
+        }
+        DecimalNumber::BaseXNumber(_) | DecimalNumber::BaseZNumber(_) => {
+            Err("X/Z-valued literals are not supported (v1 is 2-state only)".to_string())
+        }
     }
+}
 
-    Err("literal is not a supported decimal form in v1".to_string())
+fn lower_size(size: &Option<sv_parser::Size>, tree: &SyntaxTree) -> Result<u32, String> {
+    match size {
+        Some(s) => {
+            let text = locate_text(&s.nodes.0.nodes.0, tree)?;
+            strip_underscores(text)
+                .parse::<u32>()
+                .map_err(|_| format!("could not parse literal size '{text}'"))
+        }
+        None => Ok(32),
+    }
+}
+
+fn locate_text<'a>(locate: &'a Locate, tree: &'a SyntaxTree) -> Result<&'a str, String> {
+    tree.get_str(locate).ok_or_else(|| "could not read literal text".to_string())
+}
+
+fn strip_underscores(s: &str) -> String {
+    s.chars().filter(|c| *c != '_').collect()
 }

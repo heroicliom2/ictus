@@ -31,18 +31,30 @@ separate compiler — see glossary.md) → VCD or basic FST output.
 
 **Status**: in progress. A tree-walking interpreter (not yet Cranelift --
 see decisions.md D12 for why that's the correct order) proves the
-frontend → IR → execution pipeline correct on a small hand-written design
-(`crates/ictus-frontend-verilog/tests/fixtures/counter.v`: ports, an
-`if`/`else`-guarded `always @(posedge clk)` block, non-blocking assignment,
-`+`/`!`), checked both by direct assertions on the lowered IR
-(`ictus-frontend-verilog/tests/counter.rs`) and by a cycle-for-cycle
-differential match against Icarus Verilog
-(`ictus-cli/tests/differential_counter.rs`). The supported language subset
-is intentionally narrow (single ANSI-style module, one clocked process, no
-`else if`, decimal literals only, `+`/`!` operators only) and needs to grow
-toward what the phase 0 benchmark designs (picorv32 first) actually use;
-Cranelift codegen and phase 0's actual benchmark designs are both still
-ahead of where this stands today.
+frontend → IR → execution pipeline correct on small hand-written designs,
+checked both by direct assertions on the lowered IR and by cycle-for-cycle
+differential matches against Icarus Verilog:
+
+- `counter.v` (ports, an `if`/`else`-guarded `always @(posedge clk)`
+  block, non-blocking assignment, `+`/`!`) --
+  `ictus-frontend-verilog/tests/counter.rs`,
+  `ictus-cli/tests/differential_counter.rs`.
+- `ops_test.v` (internal, non-port `reg` declarations; the binary
+  operators `& | ^ == != < <= > >= && ||`; hex/binary literals including
+  an underscore digit separator; parenthesized sub-expressions -- which
+  caught a real bug: a naive subtree search for an identifier inside a
+  parenthesized expression like `(a == b)` was matching `a` alone and
+  silently discarding the comparison, fixed by matching `Primary`'s
+  variants precisely instead) --
+  `ictus-frontend-verilog/tests/ops.rs`,
+  `ictus-cli/tests/differential_ops.rs`.
+
+The supported language subset is still intentionally narrow: single
+ANSI-style module, any number of clocked processes but no
+`assign`/combinational logic yet, no `else if`, no `case`, no bit-select
+or concatenation, no module instantiation. Cranelift codegen, phase 0's
+actual benchmark designs (picorv32 first), and the gaps above are all
+still ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

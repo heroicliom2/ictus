@@ -83,20 +83,30 @@ fn eval_stmts(stmts: &[Stmt], values: &[u64], updates: &mut Vec<(SignalId, u64)>
 }
 
 fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
+    let bool_val = |b: bool| u64::from(b);
     match expr {
         Expr::Literal { value, .. } => *value,
         Expr::Ref(id) => values[*id],
         // Verilog `!` is logical negation (result is 0 or 1), not a
         // bitwise complement across the operand's width -- that's `~`,
         // which this frontend doesn't lower yet.
-        Expr::Not(inner) => {
-            if eval_expr(inner, values) == 0 {
-                1
-            } else {
-                0
-            }
-        }
+        Expr::Not(inner) => bool_val(eval_expr(inner, values) == 0),
         Expr::Add(lhs, rhs) => eval_expr(lhs, values).wrapping_add(eval_expr(rhs, values)),
+        Expr::And(lhs, rhs) => eval_expr(lhs, values) & eval_expr(rhs, values),
+        Expr::Or(lhs, rhs) => eval_expr(lhs, values) | eval_expr(rhs, values),
+        Expr::Xor(lhs, rhs) => eval_expr(lhs, values) ^ eval_expr(rhs, values),
+        Expr::Eq(lhs, rhs) => bool_val(eval_expr(lhs, values) == eval_expr(rhs, values)),
+        Expr::Ne(lhs, rhs) => bool_val(eval_expr(lhs, values) != eval_expr(rhs, values)),
+        Expr::Lt(lhs, rhs) => bool_val(eval_expr(lhs, values) < eval_expr(rhs, values)),
+        Expr::Le(lhs, rhs) => bool_val(eval_expr(lhs, values) <= eval_expr(rhs, values)),
+        Expr::Gt(lhs, rhs) => bool_val(eval_expr(lhs, values) > eval_expr(rhs, values)),
+        Expr::Ge(lhs, rhs) => bool_val(eval_expr(lhs, values) >= eval_expr(rhs, values)),
+        Expr::LogicalAnd(lhs, rhs) => {
+            bool_val(eval_expr(lhs, values) != 0 && eval_expr(rhs, values) != 0)
+        }
+        Expr::LogicalOr(lhs, rhs) => {
+            bool_val(eval_expr(lhs, values) != 0 || eval_expr(rhs, values) != 0)
+        }
     }
 }
 
