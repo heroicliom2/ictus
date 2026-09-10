@@ -1,5 +1,9 @@
 # Roadmap
 
+*Software/compiler terms (Cranelift, JIT, MTask, AOT) get a short inline
+gloss on first use below; full explanations are in
+[glossary.md](glossary.md).*
+
 Phases are sequential; don't start a phase's core work before the previous
 phase's acceptance bar is met, since later phases depend on the earlier
 ones being real (a benchmark suite you can't trust makes every later
@@ -13,22 +17,28 @@ chunk of CV32E40P or Rocket) as the standing regression/perf suite.
 
 **Acceptance**: harness can run each target design against at least one
 reference simulator (Icarus/Verilator) and record pass/fail + timing,
-repeatably, in CI or locally. "Faster than Verilator" is meaningless without
-this existing first — see docs/architecture.md, Validation strategy.
+repeatably, in CI (Continuous Integration — automatically building and
+testing on every change) or locally. Pillar 1 (speed/lightweight,
+decisions.md D11) is just an assumption until this harness exists to
+measure it — see docs/architecture.md, Validation strategy.
 
 ## Phase 1 — Single-language Verilog simulator
 
 Verilog RTL subset → `ictus-ir` → single-threaded cycle-based engine
-(2-state) via Cranelift JIT → VCD or basic FST output.
+(2-state) via Cranelift JIT (compiling the design to native machine code
+at startup, in-process, rather than writing out C++ and invoking a
+separate compiler — see glossary.md) → VCD or basic FST output.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
-match against a reference simulator) and timing is recorded, even if not
-yet winning on speed.
+match against a reference simulator) and timing is recorded as a baseline.
 
 ## Phase 2 — Static multi-threaded partitioning
 
-Partition the dataflow graph into independent clusters at elaboration time,
-schedule statically across threads (MTask-style, see decisions.md D5).
+Partition the dataflow graph (design represented as operations-and-their-
+dependencies, not a flat statement list) into independent clusters at
+elaboration time, schedule statically across threads — decided once, in
+advance, not renegotiated at runtime (MTask-style, Verilator's term for
+this; see decisions.md D5).
 
 **Acceptance**: measurable speedup on the phase 0 benchmark suite from
 multithreading, without correctness regressions.
@@ -63,12 +73,17 @@ Ictus.
 
 ## Phase 6 — Performance passes (stretch)
 
-Optional AOT path (`rustc`/LLVM) for max-throughput CI runs alongside the
-Cranelift JIT default (D3). Opt-in 4-state fidelity mode. Possibly
-gate-level/SDF if there's a deliberate reason to go there (D10).
+Optional AOT (Ahead-Of-Time — compile fully as a separate step before
+running, trading slower builds for faster execution) path via `rustc`/LLVM
+for max-throughput CI runs, alongside the Cranelift JIT default (D3).
+Opt-in 4-state fidelity mode. Possibly gate-level/SDF if there's a
+deliberate reason to go there (D10).
 
-## Explicitly not on this roadmap
+## Deferred beyond phase 6
 
-UVM, constrained-random, functional/code coverage, full SVA, IP encryption.
-See decisions.md D10 for why, and don't add these back without a new
-decision entry explaining what changed.
+UVM, constrained-random, functional/code coverage, full SVA, IP encryption
+are real long-term goals (decisions.md D11, pillar 3), not rejected scope —
+they're just not part of phases 0-6. Pull one forward only with an explicit
+check against pillars 1-2 (speed/lightweight, native mixed-language support
+with no C/C++ model requirement) and a new decisions.md entry explaining
+why it can be added now without compromising them.

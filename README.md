@@ -1,60 +1,59 @@
 # Ictus
 
-A Rust HDL simulator aimed at beating Verilator on the thing that actually
-matters for adoption: the edit-simulate loop. Not a bid for QuestaSim/Vivado
-feature parity (no UVM, no full SVA, no gate-level SDF in the near term) —
-the wedge is raw performance plus usability, not a verification-suite
-checklist.
+Ictus is an open-source HDL simulator for **mixed-language RTL
+simulation** — Verilog, SystemVerilog, and VHDL in the same design,
+natively, without wrapping the design or its testbench in C/C++ or
+SystemC models to make it work.
 
-## The bet
+*(This README uses a few software-engineering terms that aren't standard
+EE vocabulary — "JIT," "Cranelift," "dataflow graph," and so on. Every one
+of them is explained in full in [docs/glossary.md](docs/glossary.md); this
+file only gives the short version inline.)*
 
-- **JIT instead of AOT-via-system-compiler.** Verilator generates C++ and
-  shells out to GCC/Clang; for large designs that recompile step dominates
-  iteration time. Ictus compiles the elaborated design straight to native
-  code in-process via Cranelift, so both codegen and turnaround stay fast.
-- **Native SystemVerilog testbenches.** Verilator requires a C++/SystemC
-  harness around the DUT. Ictus runs the synthesizable RTL through the
-  compiled engine and the non-synthesizable testbench layer (`initial`,
-  `#delay`, `fork`/`join`) through a lighter interpreted path, so a plain SV
-  testbench just works.
+## Why this exists
 
-## Architecture
+There isn't a real open-source simulator today that does this well. Icarus
+Verilog is Verilog-only. GHDL is VHDL-only. Verilator is fast but 2-state,
+RTL-focused, and requires a C++/SystemC harness even to run a testbench.
+Mixed VHDL/Verilog verification — routine in real chip and FPGA projects —
+is effectively proprietary-tool-only territory: QuestaSim, Xcelium, Vivado
+Simulator. Ictus is built to close that gap in the open.
 
-1. **Frontend per language** (Verilog first, via `sv-parser`; VHDL later via
-   `vhdl_lang`) parses into its own AST, then lowers to a shared `ictus-ir`.
-2. **Elaboration** resolves generics/parameters, generate blocks, instance
-   hierarchy, and cross-language port binding.
-3. **Kernel**: cycle-based, not classic delta-cycle event-driven. The
-   dataflow graph is topologically sorted and evaluated once per relevant
-   clock edge — a deliberate accuracy/throughput trade for synchronous RTL.
-   A small classic event-driven kernel handles the testbench layer
-   alongside it.
-4. **Signal representation**: 2-state, bit-packed, SIMD-friendly by default;
-   4-state (X/Z) is opt-in per-signal/module, not the default cost.
-5. **Parallelism**: static partitioning of the dataflow graph into
-   independent clusters at elaboration time (Verilator's MTask approach),
-   not fine-grained per-process scheduling.
-6. **Waveforms**: FST via a clean-room writer (or `wellen`, BSD-3) — not
-   ported from gtkwave's GPLv2 core. Debug UI integrates with
-   [Surfer](https://gitlab.com/surfer-project/surfer).
+## Three pillars
 
-## Roadmap
+Every design and scope decision is checked against all three of these —
+none of them gets sacrificed for another:
 
-- [ ] **Phase 0** — benchmark harness against real open cores (PicoRV32,
-      Ibex, ...) before any kernel code, so "faster than Verilator" is a
-      measured claim, not an assumption.
-- [ ] **Phase 1** — Verilog RTL subset → IR → single-threaded cycle-based
-      engine (2-state) via Cranelift JIT.
-- [ ] **Phase 2** — static multi-threaded partitioning.
-- [ ] **Phase 3** — SystemVerilog RTL constructs (interfaces, packed
-      structs/enums; no classes/UVM) + interpreted testbench layer.
-- [ ] **Phase 4** — VHDL frontend + mixed-language elaboration.
-- [ ] **Phase 5** — FST output + Surfer integration.
-- [ ] **Phase 6 (stretch)** — optional rustc/LLVM AOT path for max-throughput
-      CI runs, opt-in 4-state fidelity, gate-level/SDF.
+1. **Speed and a lightweight footprint.** A cycle-based execution kernel
+   — re-evaluate the whole design once per clock edge, in dependency
+   order, rather than processing a fine-grained queue of individual signal
+   change events the way classic simulators do — paired with Cranelift, a
+   Rust code generator that compiles the design directly into real CPU
+   instructions *while the tool is running* ("JIT," Just-In-Time
+   compilation), instead of writing out C++ and separately invoking a
+   full C++ compiler the way Verilator does. That collapses what's
+   normally a slow two-step build into one fast in-process step, so the
+   edit-simulate loop stays quick without a second compiler toolchain in
+   the way.
+2. **True mixed-language support, natively.** Verilog/SystemVerilog and
+   VHDL in one simulation, with cross-language elaboration and port
+   binding as a first-class concern — and no requirement to drop into
+   C/C++ or SystemC models, for the design *or* the testbench, to make any
+   of it work.
+3. **A real path to full verification-suite capability.** UVM-class
+   methodology, SVA, functional/code coverage — genuine long-term goals,
+   not rejected scope. They're deliberately sequenced behind getting
+   pillars 1 and 2 right first, and only ever added in ways that don't
+   compromise them.
 
-Explicitly out of scope unless the strategy changes: UVM, constrained-random,
-functional coverage, full SVA, IP encryption.
+## Current scope
+
+Early stage, RTL simulation first. Verilog now, SystemVerilog RTL
+constructs and VHDL next; verification-suite features (UVM/SVA/coverage)
+come later, once the mixed-language RTL foundation and the kernel are
+solid — see [docs/roadmap.md](docs/roadmap.md) for the phase-by-phase plan
+and [docs/decisions.md](docs/decisions.md) for the reasoning behind that
+sequencing.
 
 ## Status
 

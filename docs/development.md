@@ -2,7 +2,11 @@
 
 ## Toolchain
 
-Rust is installed **inside WSL (Ubuntu)**, not on the Windows side. As of
+Rust is installed **inside WSL (Ubuntu)** — WSL, Windows Subsystem for
+Linux, is Microsoft's built-in way of running a real Linux environment
+directly inside Windows, which is what a Rust toolchain and the rest of
+the HDL/EDA tooling ecosystem generally expect — not on the Windows side.
+As of
 2026-09-10: rustc/cargo 1.98.1 (stable), installed via `rustup`, with a
 working C linker (`/usr/bin/cc`) already present for linking. Windows-native
 `cargo`/`rustc` are not installed and there's no current plan to install
@@ -37,8 +41,13 @@ wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/Musa/Desktop/Ictus && cargo build
 - `crates/ictus-kernel` — the cycle-based execution engine.
 - `crates/ictus-cli` — the `ictus` binary.
 
-`Cargo.lock` is committed (this workspace produces a binary, `ictus-cli`),
-per standard Rust practice for applications vs. libraries.
+`Cargo.lock` (a file listing the exact version of every dependency used,
+so a build is reproducible) is committed — this workspace produces a
+binary (`ictus-cli`, a runnable program), and standard Rust practice is to
+commit the lock file for runnable programs (so everyone builds the exact
+same versions) but not for libraries meant to be used inside other
+projects (where pinning exact versions could conflict with whatever the
+consuming project needs).
 
 ## Version control
 
