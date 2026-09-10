@@ -49,12 +49,22 @@ differential matches against Icarus Verilog:
   `ictus-frontend-verilog/tests/ops.rs`,
   `ictus-cli/tests/differential_ops.rs`.
 
+- `comb_test.v` (continuous `assign`/combinational logic, including a
+  signal assigned from another signal that's itself a register -- proving
+  `ictus_kernel::Simulation`'s two-settle-points-per-`tick()` design
+  actually matches a real event-driven simulator, not just that it seemed
+  reasonable on paper) -- `ictus-frontend-verilog/tests/comb.rs`,
+  `ictus-cli/tests/differential_comb.rs` (which also pins down specific
+  values, including an 8-bit-wraparound case and a boundary condition, so
+  a future change to the settle order fails loudly here even in the
+  unlikely case it somehow still matched Icarus).
+
 The supported language subset is still intentionally narrow: single
-ANSI-style module, any number of clocked processes but no
-`assign`/combinational logic yet, no `else if`, no `case`, no bit-select
-or concatenation, no module instantiation. Cranelift codegen, phase 0's
-actual benchmark designs (picorv32 first), and the gaps above are all
-still ahead of where this stands today.
+ANSI-style module, any number of clocked processes and `assign`s but no
+`always_comb`, no `else if`, no `case`, no bit-select or concatenation, no
+module instantiation. Cranelift codegen, phase 0's actual benchmark
+designs (picorv32 first), and the gaps above are all still ahead of where
+this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

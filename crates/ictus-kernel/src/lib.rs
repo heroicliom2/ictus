@@ -16,6 +16,29 @@
 //! the resulting writes committed together -- matching Verilog's
 //! non-blocking assignment rule that `<=` reads pre-edge values regardless
 //! of statement order within the same clock edge.
+//!
+//! Combinational logic (`ictus_ir::Assign`, i.e. `assign target = value;`)
+//! is "settled" -- every `Assign` re-evaluated and written immediately,
+//! not deferred like non-blocking assignment -- at two points per `tick()`:
+//! once *before* clocked processes run (so a clocked process reading a
+//! combinationally-derived signal sees it reflect the pre-edge register
+//! state, matching real continuous-assignment semantics) and once *after*
+//! they commit (so a caller reading state right after `tick()` -- or the
+//! *next* `tick()`'s initial settle -- sees combinational logic reflect
+//! the registers this edge just updated). `new()` also settles once, so a
+//! `Simulation` that's never been ticked still has correct combinational
+//! output for its (zeroed) initial state.
+//!
+//! Settling is a **single pass over `Module::assigns` in declaration
+//! order**, not a full fixed-point/topological solve. This is correct as
+//! long as combinational signals are declared in dependency order in the
+//! source (the overwhelmingly common style, and the only style this
+//! frontend's test fixtures use) -- a signal assigned from another
+//! combinational signal declared *later* in the source won't see that
+//! later signal's fresh value until the *next* settle call. Worth fixing
+//! properly (topological sort, matching the kernel's eventual compiled
+//! design in docs/architecture.md) if this ever bites a real design;
+//! flagged here rather than silently trusted.
 
 use ictus_ir::{Expr, Module, SignalId, Stmt};
 
@@ -26,10 +49,12 @@ pub struct Simulation<'m> {
 
 impl<'m> Simulation<'m> {
     pub fn new(module: &'m Module) -> Self {
-        Self {
+        let mut sim = Self {
             module,
             values: vec![0; module.signals.len()],
-        }
+        };
+        sim.settle_combinational();
+        sim
     }
 
     pub fn set(&mut self, name: &str, value: u64) {
@@ -50,12 +75,25 @@ impl<'m> Simulation<'m> {
 
     /// Evaluates one rising edge on every clocked process in the module.
     pub fn tick(&mut self) {
+        self.settle_combinational();
+
         let mut updates = Vec::new();
         for process in &self.module.clocked_processes {
             eval_stmts(&process.body, &self.values, &mut updates);
         }
         for (id, value) in updates {
             self.values[id] = mask(value, self.module.signals[id].width);
+        }
+
+        self.settle_combinational();
+    }
+
+    /// Re-evaluates every continuous `assign` once, in declaration order.
+    /// See this module's doc comment for when `tick()` calls this and why.
+    fn settle_combinational(&mut self) {
+        for assign in &self.module.assigns {
+            let value = eval_expr(&assign.value, &self.values);
+            self.values[assign.target] = mask(value, self.module.signals[assign.target].width);
         }
     }
 }

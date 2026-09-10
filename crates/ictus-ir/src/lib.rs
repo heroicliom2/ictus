@@ -7,11 +7,10 @@
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
 //! interpreter-first sequencing this supports): a single flat module, no
 //! instances/hierarchy, no parameters/generate blocks, any number of
-//! clocked (`always @(posedge clk)`) processes but no combinational
-//! (`always_comb`/`assign`) processes yet, `if`/`else` (no `else if`) and
-//! non-blocking assignment only, no `case`, no bit-select/concatenation.
-//! Each of those is a documented gap to widen incrementally, not a final
-//! design.
+//! clocked (`always @(posedge clk)`) processes and continuous `assign`s
+//! but no `always_comb` yet, `if`/`else` (no `else if`) and non-blocking
+//! assignment only, no `case`, no bit-select/concatenation. Each of those
+//! is a documented gap to widen incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -70,12 +69,26 @@ pub enum Stmt {
 }
 
 /// A single `always @(posedge <clock>) begin ... end` block. A module can
-/// have any number of these; combinational (`always_comb`/`assign`)
-/// processes are not lowered yet (see this crate's doc comment).
+/// have any number of these; `always_comb` is not lowered yet (see this
+/// crate's doc comment) -- use `Assign` (below) for combinational logic.
 #[derive(Debug, Clone)]
 pub struct ClockedProcess {
     pub clock: SignalId,
     pub body: Vec<Stmt>,
+}
+
+/// A continuous assignment (`assign target = value;`). Unlike
+/// `Stmt::NonBlockingAssign`, this isn't triggered by a clock edge --
+/// conceptually it's always active, so the kernel re-evaluates every
+/// `Assign` in a module whenever it needs combinational logic to be
+/// current (see `ictus_kernel::Simulation`'s doc comment for exactly
+/// when). No conditional form (`if`) exists at this level: a `?:`
+/// ternary inside `value` would be the Verilog-faithful way to express
+/// conditional combinational logic, but that operator isn't lowered yet.
+#[derive(Debug, Clone)]
+pub struct Assign {
+    pub target: SignalId,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,6 +96,7 @@ pub struct Module {
     pub name: String,
     pub signals: Vec<Signal>,
     pub clocked_processes: Vec<ClockedProcess>,
+    pub assigns: Vec<Assign>,
 }
 
 impl Module {

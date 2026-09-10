@@ -12,16 +12,19 @@
 //! ignored (other module items) or produces an error, deliberately --
 //! silently mis-lowering an unsupported construct would make this
 //! project's own differential testing (docs/architecture.md, Validation
-//! strategy) meaningless. Widen this as later phases need more of the
-//! language -- `assign`/combinational processes, `case`, bit-select and
-//! concatenation, and module instantiation are the next-highest-value
-//! gaps toward running a real design like phase 0's picorv32 benchmark.
+//! strategy) meaningless. Also lowers single-assignment continuous
+//! `assign target = expr;` statements (net-targeted only -- see
+//! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as later
+//! phases need more of the language -- `case`, bit-select and
+//! concatenation, `always_comb`, and module instantiation are the
+//! next-highest-value gaps toward running a real design like phase 0's
+//! picorv32 benchmark.
 
-use ictus_ir::{ClockedProcess, Direction, Expr, Module, Signal, Stmt};
+use ictus_ir::{Assign, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
 use std::path::Path;
 use sv_parser::{
     parse_sv, unwrap_node, AlwaysConstruct, AnsiPortDeclaration, ConditionalStatement,
-    DataDeclaration, DecimalNumber, EdgeIdentifier, IntegralNumber, Locate,
+    ContinuousAssignNet, DataDeclaration, DecimalNumber, EdgeIdentifier, IntegralNumber, Locate,
     NonblockingAssignment, Number, PortDirection, RefNode, SeqBlock, StatementItem,
     StatementOrNull, SyntaxTree,
 };
@@ -76,6 +79,12 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
             if let Some(process) = lower_always(always, &tree, &module)? {
                 module.clocked_processes.push(process);
             }
+        }
+    }
+
+    for assign_node in module_node.into_iter() {
+        if let RefNode::ContinuousAssign(sv_parser::ContinuousAssign::Net(net)) = assign_node {
+            module.assigns.push(lower_continuous_assign(net, &tree, &module)?);
         }
     }
 
@@ -289,6 +298,41 @@ fn lower_nonblocking_assign(
     let value = lower_expr(&assign.nodes.3, tree, module)?;
 
     Ok(Stmt::NonBlockingAssign { target, value })
+}
+
+/// Lowers `assign target = expr;` (the `Net`-targeted form -- `assign`ing
+/// to a `reg`/variable via `ContinuousAssignVariable` is legal SV but
+/// rare and not lowered in v1). Only handles a single plain-identifier
+/// target: `assign a = x, b = y;` (comma-joined multiple assignments) and
+/// bit-select/concatenation targets (`assign {a,b} = x;`) aren't
+/// supported -- `NetAssignment` is found via a subtree search rather than
+/// hand-decoding `ListOfNetAssignments`' `List<Symbol, NetAssignment>`
+/// wrapper, so a comma-joined statement would silently only lower its
+/// first assignment; that's an acceptable v1 gap since it's an unusual
+/// style, not a silent-wrong-*value* bug like the ones this frontend's
+/// tests specifically guard against.
+fn lower_continuous_assign(
+    net: &ContinuousAssignNet,
+    tree: &SyntaxTree,
+    module: &Module,
+) -> Result<Assign, String> {
+    let assignment_node =
+        unwrap_node!(net, NetAssignment).ok_or("assign statement has no assignment")?;
+    let RefNode::NetAssignment(assignment) = assignment_node else {
+        unreachable!("unwrap_node! guarantees the requested variant");
+    };
+
+    let lhs_ident = unwrap_node!(&assignment.nodes.0, SimpleIdentifier).ok_or(
+        "assign target is not a simple identifier (bit-select/concatenation targets are not supported in v1)",
+    )?;
+    let target_name = ident_str(lhs_ident, tree).ok_or("assign target unreadable")?;
+    let target = module
+        .signal_id(target_name)
+        .ok_or_else(|| format!("assign target '{target_name}' is not a known signal"))?;
+
+    let value = lower_expr(&assignment.nodes.2, tree, module)?;
+
+    Ok(Assign { target, value })
 }
 
 /// Takes the concrete `Expression` type (not a `RefNode`) deliberately:
