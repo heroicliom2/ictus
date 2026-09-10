@@ -1,0 +1,3 @@
+[submodule "bench/designs/picorv32"]
+	path = bench/designs/picorv32
+	url = https://github.com/YosysHQ/picorv32.git
