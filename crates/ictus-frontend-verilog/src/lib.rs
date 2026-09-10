@@ -6,20 +6,22 @@
 //! ...)`), any number of clocked `always @(posedge clk) begin ... end`
 //! blocks, `if`/`else` (no `else if` chains), plain `case` (not
 //! `casez`/`casex` -- see `lower_case`), non-blocking assignment,
-//! internal `wire`/`reg` declarations (in addition to ports), and
-//! expressions built from literals (decimal/binary/hex; not octal, not
-//! X/Z-valued), signal references, unary `!`, and the binary operators
-//! `+ & | ^ == != < <= > >= && ||`. Anything else in the source is either
-//! ignored (other module items) or produces an error, deliberately --
-//! silently mis-lowering an unsupported construct would make this
-//! project's own differential testing (docs/architecture.md, Validation
-//! strategy) meaningless. Also lowers single-assignment continuous
-//! `assign target = expr;` statements (net-targeted only -- see
-//! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as later
-//! phases need more of the language -- `casez`/`casex`, bit-select and
-//! concatenation, `always_comb`, and module instantiation are the
-//! next-highest-value gaps toward running a real design like phase 0's
-//! picorv32 benchmark.
+//! internal `wire`/`reg` declarations (in addition to ports), constant
+//! bit-select/part-select on the *read* side only (`x[3]`, `x[7:0]`; not
+//! `x[i]`, not as an assignment target -- see `lower_select` and
+//! `reject_select_target`), and expressions built from literals
+//! (decimal/binary/hex; not octal, not X/Z-valued), signal references,
+//! unary `!`, and the binary operators `+ & | ^ == != < <= > >= && ||`.
+//! Anything else in the source is either ignored (other module items) or
+//! produces an error, deliberately -- silently mis-lowering an
+//! unsupported construct would make this project's own differential
+//! testing (docs/architecture.md, Validation strategy) meaningless. Also
+//! lowers single-assignment continuous `assign target = expr;` statements
+//! (net-targeted only -- see `lower_continuous_assign`) into
+//! `ictus_ir::Assign`. Widen this as later phases need more of the
+//! language -- `casez`/`casex`, variable-indexed select, concatenation,
+//! `always_comb`, and module instantiation are the next-highest-value
+//! gaps toward running a real design like phase 0's picorv32 benchmark.
 
 use ictus_ir::{Assign, CaseArm, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
 use std::path::Path;
@@ -347,6 +349,7 @@ fn lower_nonblocking_assign(
     let lhs_ident = unwrap_node!(&assign.nodes.0, SimpleIdentifier)
         .ok_or("non-blocking assignment target is not a simple identifier")?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assignment target unreadable")?;
+    reject_select_target(&assign.nodes.0, target_name)?;
     let target = module
         .signal_id(target_name)
         .ok_or_else(|| format!("assignment target '{target_name}' is not a known signal"))?;
@@ -382,6 +385,7 @@ fn lower_continuous_assign(
         "assign target is not a simple identifier (bit-select/concatenation targets are not supported in v1)",
     )?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assign target unreadable")?;
+    reject_select_target(&assignment.nodes.0, target_name)?;
     let target = module
         .signal_id(target_name)
         .ok_or_else(|| format!("assign target '{target_name}' is not a known signal"))?;
@@ -456,7 +460,7 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Modul
             let id = module
                 .signal_id(name)
                 .ok_or_else(|| format!("reference to unknown signal '{name}'"))?;
-            Ok(Expr::Ref(id))
+            lower_select(&h.nodes.2, Expr::Ref(id), tree, module)
         }
         P::MintypmaxExpression(paren) => match &paren.nodes.0.nodes.1 {
             sv_parser::MintypmaxExpression::Expression(inner) => lower_expr(inner, tree, module),
@@ -466,6 +470,96 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Modul
         },
         other => Err(format!("primary expression form not supported in v1: {other:?}")),
     }
+}
+
+/// Applies a `Select` (`x[3]` or `x[7:0]`, or neither for a plain
+/// reference) to an already-lowered `base` expression. v1 requires every
+/// index/bound to be a constant, known at lowering time, not a
+/// variable/signal-indexed select (`x[i]`) -- and requires
+/// `PartSelectRange::ConstantRange` (`x[7:0]`) over `IndexedRange`
+/// (`x[base +: width]`), which isn't supported yet either.
+fn lower_select(
+    select: &sv_parser::Select,
+    base: Expr,
+    tree: &SyntaxTree,
+    module: &Module,
+) -> Result<Expr, String> {
+    // Part-select: `x[msb:lsb]`.
+    if let Some(bracket) = &select.nodes.2 {
+        return match &bracket.nodes.1 {
+            sv_parser::PartSelectRange::ConstantRange(range) => {
+                let msb = lower_constant_index(&range.nodes.0, tree)?;
+                let lsb = lower_constant_index(&range.nodes.2, tree)?;
+                if lsb > msb {
+                    return Err(format!("part-select `[{msb}:{lsb}]` has lsb greater than msb"));
+                }
+                Ok(Expr::Select {
+                    base: Box::new(base),
+                    msb,
+                    lsb,
+                })
+            }
+            sv_parser::PartSelectRange::IndexedRange(_) => Err(
+                "indexed part-select (`x[base +: width]`/`x[base -: width]`) is not supported in v1"
+                    .to_string(),
+            ),
+        };
+    }
+
+    // Bit-select: `x[3]` (or no select at all, if the bracket list is empty).
+    match select.nodes.1.nodes.0.as_slice() {
+        [] => Ok(base),
+        [only] => match lower_expr(&only.nodes.1, tree, module)? {
+            Expr::Literal { value, .. } => {
+                let bit = value as u32;
+                Ok(Expr::Select {
+                    base: Box::new(base),
+                    msb: bit,
+                    lsb: bit,
+                })
+            }
+            _ => Err(
+                "bit-select index must be a plain numeric literal in v1 (variable/signal-indexed select is not supported)"
+                    .to_string(),
+            ),
+        },
+        _ => Err("multi-dimensional array indexing is not supported in v1".to_string()),
+    }
+}
+
+fn lower_constant_index(expr: &sv_parser::ConstantExpression, tree: &SyntaxTree) -> Result<u32, String> {
+    let number_node = unwrap_node!(expr, Number)
+        .ok_or("bit-select/part-select bound must be a plain numeric literal in v1")?;
+    let RefNode::Number(number) = number_node else {
+        unreachable!("unwrap_node! guarantees the requested variant");
+    };
+    match lower_number(number, tree)? {
+        Expr::Literal { value, .. } => Ok(value as u32),
+        _ => unreachable!("lower_number always returns Expr::Literal"),
+    }
+}
+
+/// Rejects an assignment target that uses a bit-select/part-select
+/// (`x[3:0] <= v;` or `assign x[3:0] = v;`) -- v1's `Signal` model has no
+/// notion of a partial write, so lowering this as a full-width write to
+/// `x` would silently discard the select and write the wrong bits rather
+/// than fail loudly. `target` is searched for a `Select` node the same
+/// way its identifier already is; a `Select` with no brackets (a plain
+/// reference, the overwhelmingly common case) is fine and returns `Ok`.
+fn reject_select_target<'a, T>(target: &'a T, target_name: &str) -> Result<(), String>
+where
+    &'a T: IntoIterator<Item = RefNode<'a>>,
+{
+    let Some(RefNode::Select(select)) = unwrap_node!(target, Select) else {
+        return Ok(());
+    };
+    let has_select = !select.nodes.1.nodes.0.is_empty() || select.nodes.2.is_some();
+    if has_select {
+        return Err(format!(
+            "assignment target '{target_name}' uses a bit-select/part-select, which v1 doesn't support as a write target (only as part of a read expression)"
+        ));
+    }
+    Ok(())
 }
 
 fn symbol_text<'a, T>(op: &'a T, tree: &'a SyntaxTree) -> Option<&'a str>

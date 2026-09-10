@@ -159,6 +159,9 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
         Expr::LogicalOr(lhs, rhs) => {
             bool_val(eval_expr(lhs, values) != 0 || eval_expr(rhs, values) != 0)
         }
+        Expr::Select { base, msb, lsb } => {
+            mask(eval_expr(base, values) >> lsb, msb - lsb + 1)
+        }
     }
 }
 

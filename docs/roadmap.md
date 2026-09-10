@@ -67,11 +67,21 @@ differential matches against Icarus Verilog:
   the code that's supposed to produce it) and
   `ictus-cli/tests/differential_case.rs`.
 
+- `select_test.v` (constant bit-select `data[15]` and part-select
+  `data[7:0]`/`data[15:8]`, read side only) --
+  `ictus-frontend-verilog/tests/select.rs` (which, like the `casez` test,
+  also confirms a bit-select used as an *assignment target*
+  (`result[3:0] <= v;`) is actively rejected rather than silently lowered
+  as a full-width write -- v1's `Signal` model has no notion of a partial
+  write, so silently dropping the select would write the wrong bits with
+  no error) and `ictus-cli/tests/differential_select.rs`.
+
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
 `always_comb`, no `else if`, plain `case` only (not `casez`/`casex` --
 those need wildcard-bit-aware literal parsing and comparison this IR
-doesn't represent yet), no bit-select or concatenation, no module
+doesn't represent yet), constant bit-select/part-select on reads only (not
+`x[i]`, not as a write target, not concatenation `{a,b}`), no module
 instantiation. Cranelift codegen, phase 0's actual benchmark designs
 (picorv32 first), and the gaps above are all still ahead of where this
 stands today.

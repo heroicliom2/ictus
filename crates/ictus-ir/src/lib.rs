@@ -58,6 +58,16 @@ pub enum Expr {
     Ge(Box<Expr>, Box<Expr>),
     LogicalAnd(Box<Expr>, Box<Expr>),
     LogicalOr(Box<Expr>, Box<Expr>),
+    /// Bit-select (`x[3]`, `msb == lsb`) or part-select (`x[7:0]`).
+    /// `msb`/`lsb` are constants fixed at lowering time -- v1 doesn't
+    /// support a variable/signal-indexed select (`x[i]`), and doesn't
+    /// support a select as an *assignment target* (`x[3:0] <= v;`) either;
+    /// the frontend rejects both rather than silently lowering them as a
+    /// full-width reference/write. Unlike most other operators here, this
+    /// one masks its own result immediately (to `msb - lsb + 1` bits) in
+    /// the kernel rather than relying on masking happening later at
+    /// signal-write time, since its width is exactly known.
+    Select { base: Box<Expr>, msb: u32, lsb: u32 },
 }
 
 #[derive(Debug, Clone)]
