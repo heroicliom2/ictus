@@ -254,3 +254,30 @@ just whichever one is most top-of-mind at the time. A feature that helps
 verification-completeness but meaningfully hurts speed, bloats the binary,
 or requires a C/C++ shim to implement mixed-language support needs an
 explicit tradeoff discussion, not a default yes.
+
+## D12 — Phase 1 implementation order: interpreter before Cranelift JIT
+
+**Decision**: `ictus-kernel`'s first working version is a plain tree-walking
+interpreter over `ictus-ir` (see that crate's module doc comment), not the
+Cranelift-JIT-compiled engine D3/architecture.md describe as the target.
+The interpreter's external behavior (a `Simulation` with `set`/`get`/`tick`)
+is meant to be what a later JIT-based implementation still honors --
+replacing internals, not the validated semantics.
+
+**Why**: D3 fixed the *target* execution model (Cranelift JIT), but not the
+*build order*. Writing JIT codegen for `if`/non-blocking-assignment/expression
+evaluation before anything has ever been checked against a reference
+simulator would mean optimizing correctness-unknown code -- there'd be
+nothing to tell you whether a wrong answer came from the frontend's
+lowering, the semantics, or the codegen itself. The interpreter is cheap
+to write and to get right, and it's what phase 1's actual acceptance bar
+(docs/roadmap.md: differential match against a reference simulator) is
+checked against here. Concretely: `crates/ictus-frontend-verilog/tests/counter.rs`
+and `crates/ictus-cli/tests/differential_counter.rs` lower and run a small
+clocked counter design and check the result against Icarus Verilog,
+cycle-for-cycle, via this interpreter.
+
+**Practical implication**: don't read `ictus-kernel`'s current
+interpreter as the finished kernel architecture -- it's the correctness
+baseline the eventual JIT engine gets built and checked against, per this
+entry, not a change to D2/D3's target design.

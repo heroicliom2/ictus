@@ -57,8 +57,12 @@ sequencing.
 
 ## Status
 
-Early scaffold. Crate layout exists; no parsing, elaboration, or simulation
-logic yet.
+Phase 1 in progress (see docs/roadmap.md). A narrow Verilog subset (single
+module, one clocked `always @(posedge clk)` block, `if`/`else`, non-blocking
+assignment, `+`/`!`) parses, lowers to `ictus-ir`, and runs correctly on a
+tree-walking interpreter — checked with a cycle-for-cycle differential test
+against Icarus Verilog. Cranelift JIT codegen and the phase 0 benchmark
+designs (picorv32 first) are both still ahead of where this stands today.
 
 ## Workspace layout
 
