@@ -116,6 +116,20 @@ fn eval_stmts(stmts: &[Stmt], values: &[u64], updates: &mut Vec<(SignalId, u64)>
                 };
                 eval_stmts(branch, values, updates);
             }
+            Stmt::Case {
+                selector,
+                arms,
+                default,
+            } => {
+                let selector_value = eval_expr(selector, values);
+                let matched_arm = arms
+                    .iter()
+                    .find(|arm| arm.values.iter().any(|v| eval_expr(v, values) == selector_value));
+                match matched_arm {
+                    Some(arm) => eval_stmts(&arm.body, values, updates),
+                    None => eval_stmts(default, values, updates),
+                }
+            }
         }
     }
 }

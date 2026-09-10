@@ -4,7 +4,8 @@
 //! v1 scope, matching `ictus_ir`'s current shape (see that crate's doc
 //! comment): a single ANSI-style module (`module foo (input wire clk,
 //! ...)`), any number of clocked `always @(posedge clk) begin ... end`
-//! blocks, `if`/`else` (no `else if` chains), non-blocking assignment,
+//! blocks, `if`/`else` (no `else if` chains), plain `case` (not
+//! `casez`/`casex` -- see `lower_case`), non-blocking assignment,
 //! internal `wire`/`reg` declarations (in addition to ports), and
 //! expressions built from literals (decimal/binary/hex; not octal, not
 //! X/Z-valued), signal references, unary `!`, and the binary operators
@@ -15,12 +16,12 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as later
-//! phases need more of the language -- `case`, bit-select and
+//! phases need more of the language -- `casez`/`casex`, bit-select and
 //! concatenation, `always_comb`, and module instantiation are the
 //! next-highest-value gaps toward running a real design like phase 0's
 //! picorv32 benchmark.
 
-use ictus_ir::{Assign, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
+use ictus_ir::{Assign, CaseArm, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
 use std::path::Path;
 use sv_parser::{
     parse_sv, unwrap_node, AlwaysConstruct, AnsiPortDeclaration, ConditionalStatement,
@@ -243,8 +244,9 @@ fn lower_statement_item(
             Ok(vec![lower_nonblocking_assign(assign, tree, module)?])
         }
         StatementItem::ConditionalStatement(cond) => Ok(vec![lower_if(cond, tree, module)?]),
+        StatementItem::CaseStatement(case) => Ok(vec![lower_case(case, tree, module)?]),
         _ => Err(
-            "statement form not supported in v1 (only begin/end blocks, if/else, and non-blocking assignment)"
+            "statement form not supported in v1 (only begin/end blocks, if/else, case, and non-blocking assignment)"
                 .to_string(),
         ),
     }
@@ -280,6 +282,60 @@ fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module
         cond,
         then_branch,
         else_branch,
+    })
+}
+
+/// `casez`/`casex` share `case`'s grammar (`CaseStatementNormal`, just a
+/// different `CaseKeyword`) but are rejected rather than lowered: treating
+/// their wildcard bits (`?`/`z`/`x`) as literal 0/1 would silently
+/// mis-match instead of failing loudly, which is exactly the class of bug
+/// this project's differential testing exists to catch -- see this
+/// function's `CaseKeyword` match. `inside`/pattern-matching case forms
+/// (`CaseStatement::Matches`/`Inside`) aren't supported either.
+fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Module) -> Result<Stmt, String> {
+    let sv_parser::CaseStatement::Normal(normal) = case else {
+        return Err("`inside`/pattern-matching case forms are not supported in v1".to_string());
+    };
+
+    match &normal.nodes.1 {
+        sv_parser::CaseKeyword::Case(_) => {}
+        sv_parser::CaseKeyword::Casez(_) | sv_parser::CaseKeyword::Casex(_) => {
+            return Err(
+                "`casez`/`casex` are not supported in v1 -- they need wildcard-bit-aware \
+                 comparison this frontend doesn't implement yet"
+                    .to_string(),
+            );
+        }
+    }
+
+    let selector = lower_expr(&normal.nodes.2.nodes.1.nodes.0, tree, module)?;
+
+    let mut arms = Vec::new();
+    let mut default = Vec::new();
+    let items = std::iter::once(&normal.nodes.3).chain(normal.nodes.4.iter());
+    for item in items {
+        match item {
+            sv_parser::CaseItem::NonDefault(nd) => {
+                let values = nd
+                    .nodes
+                    .0
+                    .contents()
+                    .into_iter()
+                    .map(|item_expr| lower_expr(&item_expr.nodes.0, tree, module))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let body = lower_statement_or_null(&nd.nodes.2, tree, module)?;
+                arms.push(CaseArm { values, body });
+            }
+            sv_parser::CaseItem::Default(d) => {
+                default = lower_statement_or_null(&d.nodes.2, tree, module)?;
+            }
+        }
+    }
+
+    Ok(Stmt::Case {
+        selector,
+        arms,
+        default,
     })
 }
 

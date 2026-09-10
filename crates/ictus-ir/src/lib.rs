@@ -8,9 +8,11 @@
 //! interpreter-first sequencing this supports): a single flat module, no
 //! instances/hierarchy, no parameters/generate blocks, any number of
 //! clocked (`always @(posedge clk)`) processes and continuous `assign`s
-//! but no `always_comb` yet, `if`/`else` (no `else if`) and non-blocking
-//! assignment only, no `case`, no bit-select/concatenation. Each of those
-//! is a documented gap to widen incrementally, not a final design.
+//! but no `always_comb` yet, `if`/`else` (no `else if`) and plain `case`
+//! (exact match; not `casez`/`casex`, which need wildcard-bit-aware
+//! comparison this IR doesn't represent yet) alongside non-blocking
+//! assignment, no bit-select/concatenation. Each of those is a documented
+//! gap to widen incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -66,6 +68,23 @@ pub enum Stmt {
         then_branch: Vec<Stmt>,
         else_branch: Vec<Stmt>,
     },
+    /// Plain `case` only -- exact equality against `selector`, arms tried
+    /// in order, first match wins (matching multiple comma-separated
+    /// values, e.g. `2'd2, 2'd3: ...`, is one `CaseArm` with several
+    /// `values`). `casez`/`casex` are rejected by the frontend rather
+    /// than silently treated as exact-match `case`, which would silently
+    /// mis-match on their wildcard bits.
+    Case {
+        selector: Expr,
+        arms: Vec<CaseArm>,
+        default: Vec<Stmt>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseArm {
+    pub values: Vec<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 /// A single `always @(posedge <clock>) begin ... end` block. A module can

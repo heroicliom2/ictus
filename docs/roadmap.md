@@ -59,12 +59,22 @@ differential matches against Icarus Verilog:
   a future change to the settle order fails loudly here even in the
   unlikely case it somehow still matched Icarus).
 
+- `case_test.v` (plain `case`: a single-value arm, a comma-joined
+  multi-value arm, and `default`) -- `ictus-frontend-verilog/tests/case.rs`
+  (which also confirms `casez`/`casex` are actively rejected with a clear
+  error rather than silently mis-lowered by treating their wildcard bits
+  as literal 0/1 -- worth testing the rejection itself, not just trusting
+  the code that's supposed to produce it) and
+  `ictus-cli/tests/differential_case.rs`.
+
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, no `else if`, no `case`, no bit-select or concatenation, no
-module instantiation. Cranelift codegen, phase 0's actual benchmark
-designs (picorv32 first), and the gaps above are all still ahead of where
-this stands today.
+`always_comb`, no `else if`, plain `case` only (not `casez`/`casex` --
+those need wildcard-bit-aware literal parsing and comparison this IR
+doesn't represent yet), no bit-select or concatenation, no module
+instantiation. Cranelift codegen, phase 0's actual benchmark designs
+(picorv32 first), and the gaps above are all still ahead of where this
+stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.
