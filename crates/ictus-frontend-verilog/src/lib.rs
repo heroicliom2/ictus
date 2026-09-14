@@ -11,12 +11,15 @@
 //! own literal -- see `lower_case`/`lower_case_value`), non-blocking
 //! assignment, internal `wire`/`reg` declarations naming one or more
 //! signals per declaration (`reg a, b, c;` -- see `lower_internal_signal`)
-//! in addition to ports, constant and variable bit-select, constant
-//! part-select, concatenation, and the ternary operator, all on the
-//! *read* side only (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`, `c ? a : b`; no
-//! indexed part-select `x[base +: width]`, no bit-select/part-select/
-//! concatenation as an assignment target -- see
-//! `lower_select`/`lower_concatenation` and
+//! in addition to ports, module parameters (`#(parameter [7:0] X = 1)`,
+//! resolved to plain `Expr::Literal`s at lowering time and substituted
+//! directly into every reference -- see `lower_parameters`; a parameter
+//! is not a signal and never appears in `ictus_ir::Module` at all),
+//! constant and variable bit-select, constant part-select, concatenation,
+//! and the ternary operator, all on the *read* side only (`x[3]`, `x[i]`,
+//! `x[7:0]`, `{a,b}`, `c ? a : b`; no indexed part-select
+//! `x[base +: width]`, no bit-select/part-select/concatenation as an
+//! assignment target -- see `lower_select`/`lower_concatenation` and
 //! `reject_select_target`/the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue`
 //! checks in the two assignment-lowering functions), and expressions
 //! built from literals (decimal/binary/hex; not octal, not X/Z-valued
@@ -35,14 +38,17 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- module parameters
-//! (`#(parameter ...)`, confirmed needed: picorv32 references its own
-//! parameters like `COMPRESSED_ISA` throughout), array/memory signals
-//! (`reg [31:0] mem [0:31]`), `always_comb`, and module instantiation are
-//! the next-highest-value gaps toward running a real design like phase
-//! 0's picorv32 benchmark.
+//! later phases need more of the language -- bit-select/part-select as an
+//! *assignment target* (confirmed needed: picorv32 does
+//! `mem_rdata_q[...] <= ...`; needs read-modify-write semantics in the
+//! kernel, not just frontend parsing, so it's a bigger step than the
+//! read-side support that already exists), array/memory signals (`reg
+//! [31:0] mem [0:31]`), `always_comb`, and module instantiation are the
+//! next-highest-value gaps toward running a real design like phase 0's
+//! picorv32 benchmark.
 
 use ictus_ir::{Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
+use std::collections::HashMap;
 use std::path::Path;
 use sv_parser::{
     parse_sv, unwrap_node, AlwaysConstruct, AnsiPortDeclaration, ConditionalStatement,
@@ -50,6 +56,27 @@ use sv_parser::{
     NonblockingAssignment, Number, PortDirection, RefNode, SeqBlock, StatementItem,
     StatementOrNull, SyntaxTree,
 };
+
+/// Bundles the module being lowered with its resolved parameter table,
+/// threaded through expression lowering so `lower_primary` can resolve an
+/// identifier against either. Derefs to `Module` so every existing
+/// `module.signal_id(...)`/`module.signals[...]` call site throughout
+/// this file keeps working unchanged -- only `lower_primary` needs
+/// `.parameters` directly. Parameters themselves never appear in the
+/// final `ictus_ir::Module`: each reference is fully resolved to an
+/// `Expr::Literal` during lowering (see `lower_parameters`), so the IR
+/// and the kernel never need to know parameters exist at all.
+struct Ctx<'a> {
+    module: &'a Module,
+    parameters: &'a HashMap<String, (u64, u32)>,
+}
+
+impl<'a> std::ops::Deref for Ctx<'a> {
+    type Target = Module;
+    fn deref(&self) -> &Module {
+        self.module
+    }
+}
 
 pub fn lower_file(path: &Path) -> Result<Module, String> {
     let defines = std::collections::HashMap::new();
@@ -77,6 +104,12 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
         name,
         ..Default::default()
     };
+
+    // Resolved before anything else, matching source order (`module foo
+    // #(parameters) (ports)`) and so that a parameter's default value can
+    // reference an *earlier* parameter, per real Verilog elaboration
+    // order -- see lower_parameters.
+    let parameters = lower_parameters(module_node, &tree)?;
 
     // A port that omits its own `input`/`output` keyword (`input clk,
     // resetn,` -- resetn has no keyword of its own) inherits the
@@ -106,21 +139,113 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
         }
     }
 
+    // Every remaining item (always blocks, assigns) may reference a
+    // signal *or* a parameter, so all of them lower through `ctx` rather
+    // than `&module` directly from here on. `ctx` borrows `module`
+    // immutably for the rest of this scope, so its results are collected
+    // into plain Vecs here and only written into `module` once that
+    // borrow ends, rather than pushing into `module` while `ctx` is still
+    // alive (which the borrow checker won't allow).
+    let ctx = Ctx {
+        module: &module,
+        parameters: &parameters,
+    };
+
+    let mut clocked_processes = Vec::new();
     for always_node in module_node.into_iter() {
         if let RefNode::AlwaysConstruct(always) = always_node {
-            if let Some(process) = lower_always(always, &tree, &module)? {
-                module.clocked_processes.push(process);
+            if let Some(process) = lower_always(always, &tree, &ctx)? {
+                clocked_processes.push(process);
             }
         }
     }
 
+    let mut assigns = Vec::new();
     for assign_node in module_node.into_iter() {
         if let RefNode::ContinuousAssign(sv_parser::ContinuousAssign::Net(net)) = assign_node {
-            module.assigns.push(lower_continuous_assign(net, &tree, &module)?);
+            assigns.push(lower_continuous_assign(net, &tree, &ctx)?);
         }
     }
 
+    module.clocked_processes = clocked_processes;
+    module.assigns = assigns;
+
     Ok(module)
+}
+
+/// Parses the module's `#(parameter ...)` list into a name -> (value,
+/// width) table. Parameters are never simulated as signals -- every
+/// reference is fully resolved to an `Expr::Literal` right here at
+/// lowering time, substituted directly into the expression tree (see
+/// `lower_primary`), so `ictus_ir::Module` and the kernel never need to
+/// know parameters exist. A parameter's default value uses Verilog's
+/// separate *constant*-expression grammar (`ConstantParamExpression` ->
+/// `ConstantExpression`, the same restricted grammar already used for
+/// bit-select/part-select bounds -- see `lower_constant_index`), not the
+/// general `Expression` this frontend's normal `lower_expr` handles, so
+/// it's read directly here via the same "deep-search for the one Number"
+/// approach rather than going through `lower_expr`/`Ctx` at all. That
+/// grammar difference is also *why* a parameter default referencing
+/// another parameter isn't supported: `ConstantPrimary`'s identifier
+/// handling isn't wired up here since picorv32's own parameters never
+/// cross-reference each other, so there was nothing to verify this
+/// against yet -- a real gap if a future design needs it, not an
+/// oversight to silently work around. Only a default that reduces to a
+/// plain literal is supported; overriding a parameter at instantiation
+/// (module instantiation isn't supported at all yet) is a separate,
+/// larger gap.
+fn lower_parameters(
+    module_node: &sv_parser::ModuleDeclarationAnsi,
+    tree: &SyntaxTree,
+) -> Result<HashMap<String, (u64, u32)>, String> {
+    let mut parameters = HashMap::new();
+
+    for node in module_node.into_iter() {
+        let RefNode::ParameterDeclarationParam(param_decl) = node else {
+            continue;
+        };
+
+        let width = match unwrap_node!(&param_decl.nodes.1, PackedDimensionRange) {
+            Some(range_node) => lower_packed_range(range_node, tree)?,
+            None => 32,
+        };
+
+        for assignment in param_decl.nodes.2.nodes.0.contents() {
+            let ident = unwrap_node!(&assignment.nodes.0, SimpleIdentifier)
+                .ok_or("parameter has no identifier")?;
+            let name = ident_str(ident, tree)
+                .ok_or("parameter identifier unreadable")?
+                .to_string();
+
+            let Some((_, default)) = &assignment.nodes.2 else {
+                return Err(format!(
+                    "parameter '{name}' has no default value (overriding a parameter at \
+                     instantiation is not supported in v1)"
+                ));
+            };
+            let value = lower_constant_param_value(default, tree)
+                .map_err(|e| format!("parameter '{name}' default: {e}"))?;
+
+            parameters.insert(name, (value, width));
+        }
+    }
+
+    Ok(parameters)
+}
+
+fn lower_constant_param_value(
+    expr: &sv_parser::ConstantParamExpression,
+    tree: &SyntaxTree,
+) -> Result<u64, String> {
+    let number_node =
+        unwrap_node!(expr, Number).ok_or("is not a plain numeric literal in v1")?;
+    let RefNode::Number(number) = number_node else {
+        unreachable!("unwrap_node! guarantees the requested variant");
+    };
+    match lower_number(number, tree)? {
+        Expr::Literal { value, .. } => Ok(value),
+        _ => unreachable!("lower_number always returns Expr::Literal"),
+    }
 }
 
 fn ident_str<'a>(node: RefNode<'a>, tree: &'a SyntaxTree) -> Option<&'a str> {
@@ -251,7 +376,7 @@ fn lower_packed_range(range_node: RefNode, tree: &SyntaxTree) -> Result<u32, Str
 fn lower_always(
     always: &AlwaysConstruct,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Option<ClockedProcess>, String> {
     let edge_node = match unwrap_node!(always, EdgeIdentifier) {
         Some(n) => n,
@@ -289,7 +414,7 @@ fn lower_always(
 fn lower_statement_or_null(
     node: &StatementOrNull,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Vec<Stmt>, String> {
     match node {
         StatementOrNull::Statement(stmt) => lower_statement_item(&stmt.nodes.2, tree, module),
@@ -302,7 +427,7 @@ fn lower_statement_or_null(
 fn lower_statement_item(
     item: &StatementItem,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Vec<Stmt>, String> {
     match item {
         StatementItem::SeqBlock(seq) => lower_seq_block(seq, tree, module),
@@ -319,7 +444,7 @@ fn lower_statement_item(
     }
 }
 
-fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Module) -> Result<Vec<Stmt>, String> {
+fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Ctx) -> Result<Vec<Stmt>, String> {
     let mut out = Vec::new();
     for stmt in &seq.nodes.3 {
         out.extend(lower_statement_or_null(stmt, tree, module)?);
@@ -333,7 +458,7 @@ fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Module) -> Result
 /// folding `cond_stmt.nodes.4`'s `else if` clauses onto the final `else`
 /// (`nodes.5`) from the last clause backward, then wrapping the first
 /// `if` around the result.
-fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module) -> Result<Stmt, String> {
+fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Ctx) -> Result<Stmt, String> {
     let cond = lower_cond_predicate(&cond_stmt.nodes.2.nodes.1, tree, module)?;
     let then_branch = lower_statement_or_null(&cond_stmt.nodes.3, tree, module)?;
 
@@ -365,7 +490,7 @@ fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module
 fn lower_cond_predicate(
     cond_predicate: &sv_parser::CondPredicate,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Expr, String> {
     let cond_predicate_node = unwrap_node!(cond_predicate, Expression)
         .ok_or("condition is not a plain expression (cond patterns are not supported in v1)")?;
@@ -386,7 +511,7 @@ fn lower_cond_predicate(
 /// (including every item under plain `case`) is exact-match, unchanged
 /// from before. `inside`/pattern-matching case forms
 /// (`CaseStatement::Matches`/`Inside`) aren't supported.
-fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Module) -> Result<Stmt, String> {
+fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Ctx) -> Result<Stmt, String> {
     let sv_parser::CaseStatement::Normal(normal) = case else {
         return Err("`inside`/pattern-matching case forms are not supported in v1".to_string());
     };
@@ -434,7 +559,7 @@ fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Modul
 fn lower_case_value(
     expr: &sv_parser::Expression,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
     wildcard_mode: bool,
 ) -> Result<CaseValue, String> {
     if wildcard_mode {
@@ -501,7 +626,7 @@ fn lower_wildcard_binary(binary: &sv_parser::BinaryNumber, tree: &SyntaxTree) ->
 fn lower_nonblocking_assign(
     assign: &NonblockingAssignment,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Stmt, String> {
     // A concatenation target (`{a, b} <= x;`) is its own `VariableLvalue`
     // variant (`Lvalue`, wrapping a brace-list of lvalues), not just an
@@ -544,7 +669,7 @@ fn lower_nonblocking_assign(
 fn lower_continuous_assign(
     net: &ContinuousAssignNet,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Assign, String> {
     let assignment_node =
         unwrap_node!(net, NetAssignment).ok_or("assign statement has no assignment")?;
@@ -582,7 +707,7 @@ fn lower_continuous_assign(
 /// walker-produced nodes do -- matching on the concrete enum's own
 /// variants directly sidesteps that ambiguity entirely instead of trying
 /// to pattern-match an inconsistently-shaped `RefNode`.
-fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Module) -> Result<Expr, String> {
+fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> Result<Expr, String> {
     use sv_parser::Expression as E;
     match expr {
         E::Primary(primary) => lower_primary(primary, tree, module),
@@ -675,7 +800,7 @@ fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> 
 /// expression) and would wrongly lower the *entire* primary as just a
 /// reference to `a`, silently discarding the `== b` part. Matching the
 /// immediate variant avoids reaching past the primary's own top level.
-fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Module) -> Result<Expr, String> {
+fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) -> Result<Expr, String> {
     use sv_parser::Primary as P;
     match primary {
         P::PrimaryLiteral(lit) => match &**lit {
@@ -686,10 +811,18 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Modul
             let simple = unwrap_node!(&h.nodes.1, SimpleIdentifier)
                 .ok_or("identifier reference unreadable")?;
             let name = ident_str(simple, tree).ok_or("identifier reference unreadable")?;
-            let id = module
-                .signal_id(name)
-                .ok_or_else(|| format!("reference to unknown signal '{name}'"))?;
-            lower_select(&h.nodes.2, Expr::Ref(id), tree, module)
+            // A parameter isn't a signal -- it's a compile-time constant,
+            // resolved to a plain Literal right here rather than an
+            // Expr::Ref, since it has no SignalId and the kernel never
+            // needs to know it existed (see lower_parameters).
+            let base = if let Some(id) = module.signal_id(name) {
+                Expr::Ref(id)
+            } else if let Some(&(value, width)) = module.parameters.get(name) {
+                Expr::Literal { value, width }
+            } else {
+                return Err(format!("reference to unknown signal or parameter '{name}'"));
+            };
+            lower_select(&h.nodes.2, base, tree, module)
         }
         P::MintypmaxExpression(paren) => match &paren.nodes.0.nodes.1 {
             sv_parser::MintypmaxExpression::Expression(inner) => lower_expr(inner, tree, module),
@@ -722,7 +855,7 @@ fn lower_select(
     select: &sv_parser::Select,
     base: Expr,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Expr, String> {
     // Part-select: `x[msb:lsb]`.
     if let Some(bracket) = &select.nodes.2 {
@@ -782,7 +915,7 @@ fn lower_constant_index(expr: &sv_parser::ConstantExpression, tree: &SyntaxTree)
 fn lower_concatenation(
     concat: &sv_parser::Concatenation,
     tree: &SyntaxTree,
-    module: &Module,
+    module: &Ctx,
 ) -> Result<Expr, String> {
     let exprs = concat.nodes.0.nodes.1.contents();
     if exprs.is_empty() {

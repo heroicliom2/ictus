@@ -168,17 +168,41 @@ against Icarus) rather than left as a guess:
   differential coverage for all three before moving on, per
   docs/decisions.md's own established practice for this project.
 
-**Next confirmed blocker**: module parameters (`#(parameter ... = ...)`).
-picorv32 references its own parameters (`COMPRESSED_ISA`, etc.) directly
-in expressions throughout the design body -- not yet lowered at all (no
-signal, no constant-folding), so any such reference currently fails with
-"reference to unknown signal". Not yet attempted.
+**Module parameters** (`#(parameter [7:0] X = 1, ...)`): picorv32
+references its own parameters (`COMPRESSED_ISA`, etc.) directly in
+expressions throughout the design body -- fixed. A parameter isn't a
+signal: `lower_parameters` resolves every parameter's default value (via
+Verilog's own separate *constant*-expression grammar, the same one
+already used for bit-select/part-select bounds -- not the general
+`lower_expr` path, so a default can't yet reference another parameter,
+not needed by picorv32's own parameters) to a plain integer at lowering
+time, and every reference to a parameter is substituted directly into the
+expression tree as `Expr::Literal` -- so `ictus_ir::Module` and the
+kernel never need to know parameters exist at all. This required
+threading a small `Ctx` (module + resolved parameter table) through
+expression lowering in place of a bare `&Module` reference, since
+`lower_primary`'s identifier resolution now needs to check both.
+Verified per this project's usual practice: `param.rs` asserts every
+parameter reference in the fixture resolved to the correct literal value
+(not just that lowering succeeded), and `differential_param.rs` drives
+several cycles against Icarus Verilog, including the wraparound behavior
+the two parameters together produce.
+
+**Next confirmed blocker**: bit-select/part-select as an *assignment
+target* (`mem_rdata_q[...] <= ...` -- picorv32 does this). Meaningfully
+bigger than the read-side support that already exists: a partial-width
+write needs read-modify-write semantics in the kernel (write just the
+selected bits, leave the rest of the signal's current value alone), not
+just frontend parsing -- currently `reject_select_target` explicitly
+rejects this rather than silently truncating to a full-width write. Not
+yet attempted.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, constant/variable bit-select, constant part-select,
-concatenation, and ternary on reads only (no indexed part-select, not as
-a write target), no module parameters, no array/memory signals (`reg
+`always_comb`, module parameters (defaults must be constant literals, no
+overriding at instantiation), constant/variable bit-select, constant
+part-select, concatenation, and ternary on reads only (no indexed
+part-select, not as a write target), no array/memory signals (`reg
 [31:0] mem [0:31]` -- this is what picorv32's register file actually
 needs, and is a distinct, likely-larger gap from bit-select on a single
 signal), no module instantiation. Cranelift codegen and actually getting

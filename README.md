@@ -62,16 +62,18 @@ module, ports that may inherit direction in a list, any number of clocked
 `always @(posedge clk)` blocks and continuous `assign`s, `if`/`else`/`else
 if`, `case`/`casez`/`casex` with wildcard bits, non-blocking assignment,
 internal `wire`/`reg` declarations naming one or more signals each,
+module parameters resolved to constants at lowering time,
 constant/variable bit-select, constant part-select, concatenation, and
 the ternary operator on reads (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`,
 `c ? a : b`), the operators `+ & | ^ == != < <= > >= && !`,
 decimal/hex/binary literals) parses, lowers to `ictus-ir`, and runs
 correctly on a tree-walking interpreter — checked with cycle-for-cycle
-differential tests against Icarus Verilog, now including a first real
+differential tests against Icarus Verilog, including an ongoing real
 attempt at lowering the actual phase 0 picorv32 benchmark design (not
 just hand-written fixtures), which is how most of the gaps just closed
-were found. Module parameters (confirmed needed, next up), array/memory
-signals (picorv32's register file needs these), module instantiation, and
+were found. Bit-select as a write target (confirmed needed, next up —
+needs read-modify-write semantics in the kernel), array/memory signals
+(picorv32's register file needs these), module instantiation, and
 Cranelift JIT codegen are all still ahead of where this stands today.
 
 ## Workspace layout
