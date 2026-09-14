@@ -4,7 +4,8 @@
 //! v1 scope, matching `ictus_ir`'s current shape (see that crate's doc
 //! comment): a single ANSI-style module (`module foo (input wire clk,
 //! ...)`), any number of clocked `always @(posedge clk) begin ... end`
-//! blocks, `if`/`else` (no `else if` chains), `case`/`casez`/`casex`
+//! blocks, `if`/`else`/`else if` chains (lowered to nested `Stmt::If` --
+//! see `lower_if` -- no new IR needed), `case`/`casez`/`casex`
 //! (wildcard bits only on a case *item*'s own literal -- see
 //! `lower_case`/`lower_case_value`), non-blocking assignment, internal
 //! `wire`/`reg` declarations (in addition to ports), constant
@@ -264,29 +265,48 @@ fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Module) -> Result
     Ok(out)
 }
 
+/// `else if` chains need no new IR: `if (c1) s1 else if (c2) s2 else s3`
+/// lowers to the same nested `Stmt::If` a hand-written
+/// `if (c1) s1 else begin if (c2) s2 else s3 end` would -- built by
+/// folding `cond_stmt.nodes.4`'s `else if` clauses onto the final `else`
+/// (`nodes.5`) from the last clause backward, then wrapping the first
+/// `if` around the result.
 fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module) -> Result<Stmt, String> {
-    if !cond_stmt.nodes.4.is_empty() {
-        return Err("`else if` chains are not supported in v1 (use nested if/else)".to_string());
-    }
-
-    let cond_predicate_node = unwrap_node!(&cond_stmt.nodes.2.nodes.1, Expression)
-        .ok_or("if condition is not a plain expression (cond patterns are not supported in v1)")?;
-    let RefNode::Expression(cond_expr) = cond_predicate_node else {
-        unreachable!("unwrap_node! guarantees the requested variant");
-    };
-    let cond = lower_expr(cond_expr, tree, module)?;
-
+    let cond = lower_cond_predicate(&cond_stmt.nodes.2, tree, module)?;
     let then_branch = lower_statement_or_null(&cond_stmt.nodes.3, tree, module)?;
-    let else_branch = match &cond_stmt.nodes.5 {
+
+    let mut else_branch = match &cond_stmt.nodes.5 {
         Some((_else_kw, stmt)) => lower_statement_or_null(stmt, tree, module)?,
         None => Vec::new(),
     };
+    for (_else_kw, _if_kw, paren, stmt) in cond_stmt.nodes.4.iter().rev() {
+        let elseif_cond = lower_cond_predicate(paren, tree, module)?;
+        let elseif_then = lower_statement_or_null(stmt, tree, module)?;
+        else_branch = vec![Stmt::If {
+            cond: elseif_cond,
+            then_branch: elseif_then,
+            else_branch,
+        }];
+    }
 
     Ok(Stmt::If {
         cond,
         then_branch,
         else_branch,
     })
+}
+
+fn lower_cond_predicate(
+    paren: &sv_parser::Paren<sv_parser::CondPredicate>,
+    tree: &SyntaxTree,
+    module: &Module,
+) -> Result<Expr, String> {
+    let cond_predicate_node = unwrap_node!(&paren.nodes.1, Expression)
+        .ok_or("condition is not a plain expression (cond patterns are not supported in v1)")?;
+    let RefNode::Expression(cond_expr) = cond_predicate_node else {
+        unreachable!("unwrap_node! guarantees the requested variant");
+    };
+    lower_expr(cond_expr, tree, module)
 }
 
 /// `casez`/`casex` share `case`'s grammar (`CaseStatementNormal`, just a

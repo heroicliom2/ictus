@@ -88,10 +88,18 @@ differential matches against Icarus Verilog:
   position) instead of "must match 0"; `lowers_casez_wildcard_and_exact_arms`
   asserts the exact `care_mask` bits and caught it immediately.
 
+- `elseif_test.v` (a 3-rung `else if` chain plus a final `else`) --
+  `ictus-frontend-verilog/tests/elseif.rs` (asserts the actual nested
+  `Stmt::If` shape, one level per rung, not just that it lowers without
+  error) and `ictus-cli/tests/differential_elseif.rs`. No new IR was
+  needed -- `else if` is just sugar for a nested `if` inside the previous
+  one's `else` branch, built by folding the chain from the last rung
+  backward onto the final `else`.
+
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, no `else if`, constant bit-select/part-select on reads only
-(not `x[i]`, not as a write target, not concatenation `{a,b}`), no module
+`always_comb`, constant bit-select/part-select on reads only (not `x[i]`,
+not as a write target, not concatenation `{a,b}`), no module
 instantiation. Cranelift codegen, phase 0's actual benchmark designs
 (picorv32 first), and the gaps above are all still ahead of where this
 stands today.
