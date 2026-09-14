@@ -6,16 +6,17 @@
 //!
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
 //! interpreter-first sequencing this supports): a single flat module, no
-//! instances/hierarchy, no parameters/generate blocks (so no array/memory
-//! signals either -- `reg [31:0] mem [0:31]`-style declarations aren't
-//! lowered, a distinct and likely-larger gap from bit-select on a single
-//! signal), any number of clocked (`always @(posedge clk)`) processes and
-//! continuous `assign`s but no `always_comb` yet, `if`/`else`/`else if`
-//! and `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
+//! instances/hierarchy, no module parameters (`#(parameter ...)`) and no
+//! generate blocks (so no array/memory signals either -- `reg [31:0] mem
+//! [0:31]`-style declarations aren't lowered, a distinct and
+//! likely-larger gap from bit-select on a single signal), any number of
+//! clocked (`always @(posedge clk)`) processes and continuous `assign`s
+//! but no `always_comb` yet, `if`/`else`/`else if` and
+//! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
 //! assignment, constant and variable bit-select, constant part-select,
-//! and concatenation, all on reads only (no indexed part-select
-//! `x[base +: width]`, not as an assignment target). Each of those is a
-//! documented gap to widen incrementally, not a final design.
+//! concatenation, and the ternary operator, all on reads only (no indexed
+//! part-select `x[base +: width]`, not as an assignment target). Each of
+//! those is a documented gap to widen incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -96,6 +97,12 @@ pub enum Expr {
     /// this masks each part to its own declared width immediately during
     /// evaluation, not deferred to signal-write time.
     Concat(Vec<(Expr, u32)>),
+    /// Ternary/conditional operator (`cond ? then_val : else_val`).
+    Ternary {
+        cond: Box<Expr>,
+        then_val: Box<Expr>,
+        else_val: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone)]

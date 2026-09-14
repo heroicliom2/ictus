@@ -3,28 +3,41 @@
 //!
 //! v1 scope, matching `ictus_ir`'s current shape (see that crate's doc
 //! comment): a single ANSI-style module (`module foo (input wire clk,
-//! ...)`), any number of clocked `always @(posedge clk) begin ... end`
-//! blocks, `if`/`else`/`else if` chains (lowered to nested `Stmt::If` --
-//! see `lower_if` -- no new IR needed), `case`/`casez`/`casex`
-//! (wildcard bits only on a case *item*'s own literal -- see
-//! `lower_case`/`lower_case_value`), non-blocking assignment, internal
-//! `wire`/`reg` declarations (in addition to ports), constant and
-//! variable bit-select, constant part-select, and concatenation, all on
-//! the *read* side only (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`; no indexed
-//! part-select `x[base +: width]`, not as an assignment target -- see
+//! ...)`, ports may inherit direction from the previous one in the list
+//! -- `input clk, resetn,` -- see `lower_port`), any number of clocked
+//! `always @(posedge clk) begin ... end` blocks, `if`/`else`/`else if`
+//! chains (lowered to nested `Stmt::If` -- see `lower_if` -- no new IR
+//! needed), `case`/`casez`/`casex` (wildcard bits only on a case *item*'s
+//! own literal -- see `lower_case`/`lower_case_value`), non-blocking
+//! assignment, internal `wire`/`reg` declarations naming one or more
+//! signals per declaration (`reg a, b, c;` -- see `lower_internal_signal`)
+//! in addition to ports, constant and variable bit-select, constant
+//! part-select, concatenation, and the ternary operator, all on the
+//! *read* side only (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`, `c ? a : b`; no
+//! indexed part-select `x[base +: width]`, no bit-select/part-select/
+//! concatenation as an assignment target -- see
 //! `lower_select`/`lower_concatenation` and
 //! `reject_select_target`/the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue`
 //! checks in the two assignment-lowering functions), and expressions
 //! built from literals (decimal/binary/hex; not octal, not X/Z-valued
 //! outside a case item), signal references, unary `!`, and the binary
-//! operators `+ & | ^ == != < <= > >= && ||`. Anything else in the source
-//! is either ignored (other module items) or produces an error,
-//! deliberately -- silently mis-lowering an unsupported construct would
-//! make this project's own differential testing (docs/architecture.md,
-//! Validation strategy) meaningless. Also lowers single-assignment
-//! continuous `assign target = expr;` statements (net-targeted only --
-//! see `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- array/memory signals
+//! operators `+ & | ^ == != < <= > >= && ||`. `lower_expr`'s `E::Binary`
+//! arm also corrects a real `sv-parser` precedence-handling gap: it
+//! mis-associates an *unparenthesized* ternary immediately following a
+//! binary operator's right operand (`a > c ? a : c` structured as if it
+//! were `a > (c ? a : c)`, when real Verilog precedence makes `(a > c) ?
+//! a : c` the only correct reading) -- confirmed empirically, not
+//! assumed, against both forms; see that arm's own comment and
+//! decisions.md D13 for the full story. Anything else in the source is
+//! either ignored (other module items) or produces an error, deliberately
+//! -- silently mis-lowering an unsupported construct would make this
+//! project's own differential testing (docs/architecture.md, Validation
+//! strategy) meaningless. Also lowers single-assignment continuous
+//! `assign target = expr;` statements (net-targeted only -- see
+//! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
+//! later phases need more of the language -- module parameters
+//! (`#(parameter ...)`, confirmed needed: picorv32 references its own
+//! parameters like `COMPRESSED_ISA` throughout), array/memory signals
 //! (`reg [31:0] mem [0:31]`), `always_comb`, and module instantiation are
 //! the next-highest-value gaps toward running a real design like phase
 //! 0's picorv32 benchmark.
@@ -65,19 +78,29 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
         ..Default::default()
     };
 
+    // A port that omits its own `input`/`output` keyword (`input clk,
+    // resetn,` -- resetn has no keyword of its own) inherits the
+    // direction of the previous port in the same list, per IEEE 1800 --
+    // real, common style (picorv32 uses it in its very first two ports),
+    // not an edge case. last_direction tracks that across the loop.
+    let mut last_direction: Option<Direction> = None;
     for port_node in module_node.into_iter() {
         if let RefNode::AnsiPortDeclaration(port) = port_node {
-            module.push_signal(lower_port(port, &tree)?);
+            module.push_signal(lower_port(port, &tree, &mut last_direction)?);
         }
     }
 
     for decl_node in module_node.into_iter() {
         match decl_node {
             RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net)) => {
-                module.push_signal(lower_internal_signal(&**net, &tree)?);
+                for signal in lower_internal_signal(&**net, &tree)? {
+                    module.push_signal(signal);
+                }
             }
             RefNode::DataDeclaration(DataDeclaration::Variable(var)) => {
-                module.push_signal(lower_internal_signal(&**var, &tree)?);
+                for signal in lower_internal_signal(&**var, &tree)? {
+                    module.push_signal(signal);
+                }
             }
             _ => {}
         }
@@ -116,7 +139,11 @@ fn unsigned_number_str<'a>(node: RefNode<'a>, tree: &'a SyntaxTree) -> Option<&'
     }
 }
 
-fn lower_port(port: &AnsiPortDeclaration, tree: &SyntaxTree) -> Result<Signal, String> {
+fn lower_port(
+    port: &AnsiPortDeclaration,
+    tree: &SyntaxTree,
+    last_direction: &mut Option<Direction>,
+) -> Result<Signal, String> {
     let ident_node =
         unwrap_node!(port, PortIdentifier).ok_or("port declaration has no identifier")?;
     let ident_simple =
@@ -125,13 +152,21 @@ fn lower_port(port: &AnsiPortDeclaration, tree: &SyntaxTree) -> Result<Signal, S
         .ok_or("could not read port identifier")?
         .to_string();
 
-    let direction_node =
-        unwrap_node!(port, PortDirection).ok_or_else(|| format!("port '{name}' has no explicit direction (inherited direction is not supported in v1)"))?;
-    let direction = match direction_node {
-        RefNode::PortDirection(PortDirection::Input(_)) => Direction::Input,
-        RefNode::PortDirection(PortDirection::Output(_)) => Direction::Output,
-        _ => return Err(format!("port '{name}' has an unsupported direction (only input/output in v1)")),
+    let direction = match unwrap_node!(port, PortDirection) {
+        Some(RefNode::PortDirection(PortDirection::Input(_))) => Direction::Input,
+        Some(RefNode::PortDirection(PortDirection::Output(_))) => Direction::Output,
+        Some(_) => {
+            return Err(format!(
+                "port '{name}' has an unsupported direction (only input/output in v1)"
+            ))
+        }
+        // No direction keyword of its own -- inherit from the previous
+        // port in the list (see the comment at this function's call site).
+        None => last_direction.ok_or_else(|| {
+            format!("port '{name}' has no direction, and there's no previous port to inherit one from")
+        })?,
     };
+    *last_direction = Some(direction);
 
     let width = match unwrap_node!(port, PackedDimensionRange) {
         Some(range_node) => lower_packed_range(range_node, tree)?,
@@ -146,35 +181,59 @@ fn lower_port(port: &AnsiPortDeclaration, tree: &SyntaxTree) -> Result<Signal, S
 }
 
 /// Lowers a `wire`/`reg` declaration in the module body (as opposed to a
-/// port declaration -- see `lower_port`) into an internal `Signal`
-/// (`direction: None`). Generic over the declaration's concrete node type
-/// (`NetDeclarationNetType` for `wire`, `DataDeclarationVariable` for
-/// `reg`) since both are searched the same way: find the declared name
-/// and an optional packed range, wherever they sit in that node's
-/// subtree, without needing to hand-decode either grammar's exact nested
-/// shape (`ListOfNetDeclAssignments`/`ListOfVariableDeclAssignments`,
-/// `NetIdentifier`/`VariableIdentifier`, ...). Doesn't yet handle a
-/// declaration naming more than one signal (`wire a, b;`) -- only the
-/// first identifier found is used.
-fn lower_internal_signal<'a, T>(decl: &'a T, tree: &'a SyntaxTree) -> Result<Signal, String>
+/// port declaration -- see `lower_port`) into one internal `Signal`
+/// (`direction: None`) per declared name -- a single declaration can name
+/// several (`reg a, b, c;`, real and common: picorv32 itself declares
+/// three registers this way in one line). Generic over the declaration's
+/// concrete node type (`NetDeclarationNetType` for `wire`,
+/// `DataDeclarationVariable` for `reg`) since both are searched the same
+/// way: collect every `NetIdentifier`/`VariableIdentifier` node in the
+/// declaration's subtree -- these are the grammar's own "this is a
+/// declared name" markers, used only in a declaration's own
+/// name-and-optional-initializer list, never inside a general expression
+/// -- so this can't accidentally pick up an unrelated identifier from an
+/// initializer expression the way a blind search for any
+/// `SimpleIdentifier` anywhere in the subtree could (e.g. `reg x = Y;`
+/// would wrongly also match `Y`). All declared names in one declaration
+/// share the same width.
+fn lower_internal_signal<'a, T>(decl: &'a T, tree: &'a SyntaxTree) -> Result<Vec<Signal>, String>
 where
     &'a T: IntoIterator<Item = RefNode<'a>>,
 {
-    let ident = unwrap_node!(decl, SimpleIdentifier).ok_or("declaration has no identifier")?;
-    let name = ident_str(ident, tree)
-        .ok_or("declaration identifier unreadable")?
-        .to_string();
-
     let width = match unwrap_node!(decl, PackedDimensionRange) {
         Some(range_node) => lower_packed_range(range_node, tree)?,
         None => 1,
     };
 
-    Ok(Signal {
-        name,
-        width,
-        direction: None,
-    })
+    let mut names = Vec::new();
+    for node in decl {
+        let is_declared_name = matches!(
+            node,
+            RefNode::NetIdentifier(_) | RefNode::VariableIdentifier(_)
+        );
+        if !is_declared_name {
+            continue;
+        }
+        let simple =
+            unwrap_node!(node, SimpleIdentifier).ok_or("declaration identifier unreadable")?;
+        let name = ident_str(simple, tree)
+            .ok_or("declaration identifier unreadable")?
+            .to_string();
+        names.push(name);
+    }
+
+    if names.is_empty() {
+        return Err("declaration has no identifier".to_string());
+    }
+
+    Ok(names
+        .into_iter()
+        .map(|name| Signal {
+            name,
+            width,
+            direction: None,
+        })
+        .collect())
 }
 
 fn lower_packed_range(range_node: RefNode, tree: &SyntaxTree) -> Result<u32, String> {
@@ -275,7 +334,7 @@ fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Module) -> Result
 /// (`nodes.5`) from the last clause backward, then wrapping the first
 /// `if` around the result.
 fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module) -> Result<Stmt, String> {
-    let cond = lower_cond_predicate(&cond_stmt.nodes.2, tree, module)?;
+    let cond = lower_cond_predicate(&cond_stmt.nodes.2.nodes.1, tree, module)?;
     let then_branch = lower_statement_or_null(&cond_stmt.nodes.3, tree, module)?;
 
     let mut else_branch = match &cond_stmt.nodes.5 {
@@ -283,7 +342,7 @@ fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module
         None => Vec::new(),
     };
     for (_else_kw, _if_kw, paren, stmt) in cond_stmt.nodes.4.iter().rev() {
-        let elseif_cond = lower_cond_predicate(paren, tree, module)?;
+        let elseif_cond = lower_cond_predicate(&paren.nodes.1, tree, module)?;
         let elseif_then = lower_statement_or_null(stmt, tree, module)?;
         else_branch = vec![Stmt::If {
             cond: elseif_cond,
@@ -299,12 +358,16 @@ fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Module
     })
 }
 
+/// Takes a bare `CondPredicate` (not `Paren<CondPredicate>`) since it's
+/// shared between `if`'s condition (parenthesized: `if (c) ...`) and the
+/// ternary operator's (not: `c ? a : b`) -- callers slice off the `Paren`
+/// wrapper themselves when they have one.
 fn lower_cond_predicate(
-    paren: &sv_parser::Paren<sv_parser::CondPredicate>,
+    cond_predicate: &sv_parser::CondPredicate,
     tree: &SyntaxTree,
     module: &Module,
 ) -> Result<Expr, String> {
-    let cond_predicate_node = unwrap_node!(&paren.nodes.1, Expression)
+    let cond_predicate_node = unwrap_node!(cond_predicate, Expression)
         .ok_or("condition is not a plain expression (cond patterns are not supported in v1)")?;
     let RefNode::Expression(cond_expr) = cond_predicate_node else {
         unreachable!("unwrap_node! guarantees the requested variant");
@@ -533,25 +596,74 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Module) 
         }
         E::Binary(binary) => {
             let op_text = symbol_text(&binary.nodes.1, tree).ok_or("binary operator unreadable")?;
+
+            // sv-parser mis-associates an *unparenthesized* ternary
+            // immediately following a binary operator's right operand:
+            // `a > c ? a : c` comes back structured as `a > (c ? a : c)`
+            // (Binary{op: >, lhs: a, rhs: ConditionalExpression{cond: c,
+            // then: a, else: c}}) instead of the only-correct real-Verilog
+            // parse `(a > c) ? a : c` -- every operator handled below
+            // binds tighter than `?:`, so a bare (no explicit parens)
+            // ConditionalExpression can never legitimately be a binary
+            // operator's own right operand; a *parenthesized* ternary
+            // operand parses as Primary::MintypmaxExpression instead and
+            // is unaffected by this check. Confirmed empirically (not
+            // assumed) against both the parenthesized and unparenthesized
+            // forms before writing this -- see decl_style.rs and
+            // ternary_precedence.rs. Only the immediate-RHS case is fixed
+            // here; a ternary appearing deeper on the right (e.g.
+            // `a > b + (c ? x : y)`, sic -- without parens there this
+            // mis-parses too, one level down) is corrected by this same
+            // check firing again during the recursive lower_expr call for
+            // that inner operator, but a case where the *outer* operator
+            // would ALSO need to re-associate past an already-fixed inner
+            // ternary is not handled.
+            if let sv_parser::Expression::ConditionalExpression(ternary) = &binary.nodes.3 {
+                let lhs = lower_expr(&binary.nodes.0, tree, module)?;
+                let inner_cond = lower_cond_predicate(&ternary.nodes.0, tree, module)?;
+                let cond = apply_binary_op(op_text, lhs, inner_cond)?;
+                let then_val = lower_expr(&ternary.nodes.3, tree, module)?;
+                let else_val = lower_expr(&ternary.nodes.5, tree, module)?;
+                return Ok(Expr::Ternary {
+                    cond: Box::new(cond),
+                    then_val: Box::new(then_val),
+                    else_val: Box::new(else_val),
+                });
+            }
+
             let lhs = lower_expr(&binary.nodes.0, tree, module)?;
             let rhs = lower_expr(&binary.nodes.3, tree, module)?;
-            match op_text {
-                "+" => Ok(Expr::Add(Box::new(lhs), Box::new(rhs))),
-                "&" => Ok(Expr::And(Box::new(lhs), Box::new(rhs))),
-                "|" => Ok(Expr::Or(Box::new(lhs), Box::new(rhs))),
-                "^" => Ok(Expr::Xor(Box::new(lhs), Box::new(rhs))),
-                "==" => Ok(Expr::Eq(Box::new(lhs), Box::new(rhs))),
-                "!=" => Ok(Expr::Ne(Box::new(lhs), Box::new(rhs))),
-                "<" => Ok(Expr::Lt(Box::new(lhs), Box::new(rhs))),
-                "<=" => Ok(Expr::Le(Box::new(lhs), Box::new(rhs))),
-                ">" => Ok(Expr::Gt(Box::new(lhs), Box::new(rhs))),
-                ">=" => Ok(Expr::Ge(Box::new(lhs), Box::new(rhs))),
-                "&&" => Ok(Expr::LogicalAnd(Box::new(lhs), Box::new(rhs))),
-                "||" => Ok(Expr::LogicalOr(Box::new(lhs), Box::new(rhs))),
-                other => Err(format!("unsupported binary operator '{other}'")),
-            }
+            apply_binary_op(op_text, lhs, rhs)
+        }
+        E::ConditionalExpression(ternary) => {
+            let cond = lower_cond_predicate(&ternary.nodes.0, tree, module)?;
+            let then_val = lower_expr(&ternary.nodes.3, tree, module)?;
+            let else_val = lower_expr(&ternary.nodes.5, tree, module)?;
+            Ok(Expr::Ternary {
+                cond: Box::new(cond),
+                then_val: Box::new(then_val),
+                else_val: Box::new(else_val),
+            })
         }
         other => Err(format!("expression form not supported in v1: {other:?}")),
+    }
+}
+
+fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> {
+    match op_text {
+        "+" => Ok(Expr::Add(Box::new(lhs), Box::new(rhs))),
+        "&" => Ok(Expr::And(Box::new(lhs), Box::new(rhs))),
+        "|" => Ok(Expr::Or(Box::new(lhs), Box::new(rhs))),
+        "^" => Ok(Expr::Xor(Box::new(lhs), Box::new(rhs))),
+        "==" => Ok(Expr::Eq(Box::new(lhs), Box::new(rhs))),
+        "!=" => Ok(Expr::Ne(Box::new(lhs), Box::new(rhs))),
+        "<" => Ok(Expr::Lt(Box::new(lhs), Box::new(rhs))),
+        "<=" => Ok(Expr::Le(Box::new(lhs), Box::new(rhs))),
+        ">" => Ok(Expr::Gt(Box::new(lhs), Box::new(rhs))),
+        ">=" => Ok(Expr::Ge(Box::new(lhs), Box::new(rhs))),
+        "&&" => Ok(Expr::LogicalAnd(Box::new(lhs), Box::new(rhs))),
+        "||" => Ok(Expr::LogicalOr(Box::new(lhs), Box::new(rhs))),
+        other => Err(format!("unsupported binary operator '{other}'")),
     }
 }
 
@@ -701,10 +813,13 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         Expr::Select { msb, lsb, .. } => Ok(msb - lsb + 1),
         Expr::DynamicBitSelect { .. } => Ok(1),
         Expr::Concat(parts) => Ok(parts.iter().map(|(_, w)| w).sum()),
+        Expr::Ternary { then_val, else_val, .. } => {
+            Ok(expr_width(then_val, module)?.max(expr_width(else_val, module)?))
+        }
         other => Err(format!(
             "concatenation operand's width can't be determined in v1 (only literals, signal \
-             references, bit-select/part-select, and nested concatenation are supported as \
-             operands): {other:?}"
+             references, bit-select/part-select, nested concatenation, and ternary are \
+             supported as operands): {other:?}"
         )),
     }
 }

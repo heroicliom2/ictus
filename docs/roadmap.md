@@ -133,15 +133,57 @@ differential matches against Icarus Verilog:
   Indexed *part*-select (`x[base +: width]`, a fixed width at a variable
   base) is still not supported -- only single-bit variable select.
 
+**First real attempt at lowering picorv32 itself** (not a hand-written
+fixture -- `bench/designs/picorv32/picorv32.v`, already vendored for phase
+0): this surfaced several real gaps directly, each fixed and tested the
+same way as everything above (fixture, structural test, differential test
+against Icarus) rather than left as a guess:
+
+- Ports that inherit their direction from the previous one in the list
+  (`input clk, resetn,` -- picorv32's own first two ports, verbatim) --
+  `lower_port` now tracks and propagates the last explicit direction
+  instead of erroring.
+- A single declaration naming several signals (`reg a, b, c;` -- picorv32
+  does this too) -- `lower_internal_signal` now collects every declared
+  name in the declaration (found by searching for the grammar's own
+  `NetIdentifier`/`VariableIdentifier` "this is a declared name" markers,
+  not a blind search for any identifier, which could wrongly also match a
+  name inside an initializer expression like `reg x = Y;`), not just the
+  first.
+- The ternary operator (`cond ? a : b`), not supported at all before this
+  -- new `ictus_ir::Expr::Ternary`. While adding it, found and worked
+  around a genuine `sv-parser` bug: an *unparenthesized* ternary right
+  after a binary operator's right operand (`a > c ? a : c`, extremely
+  common style, used throughout picorv32) gets mis-parsed as if it were
+  `a > (c ? a : c)` instead of the only correct reading, `(a > c) ? a :
+  c`. See decisions.md D13 for the full story and the fix.
+- (`decl_style_test.v`/`decl_style.rs`/`differential_decl_style.rs` cover
+  the first two together with nested nested ternaries;
+  `ternary_precedence_test.v`/`ternary_precedence.rs`/
+  `differential_ternary_precedence.rs` cover the precedence fix in
+  isolation.)
+- Also caught and fixed a process gap, not a code gap: three fixes landed
+  before their tests were written, chasing the picorv32 diagnostic output
+  turn by turn -- corrected by writing the full fixture/structural/
+  differential coverage for all three before moving on, per
+  docs/decisions.md's own established practice for this project.
+
+**Next confirmed blocker**: module parameters (`#(parameter ... = ...)`).
+picorv32 references its own parameters (`COMPRESSED_ISA`, etc.) directly
+in expressions throughout the design body -- not yet lowered at all (no
+signal, no constant-folding), so any such reference currently fails with
+"reference to unknown signal". Not yet attempted.
+
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, constant/variable bit-select, constant part-select, and
-concatenation on reads only (no indexed part-select, not as a write
-target), no array/memory signals (`reg [31:0] mem [0:31]` -- this is what
-picorv32's register file actually needs, and is a distinct, likely-larger
-gap from bit-select on a single signal), no module instantiation.
-Cranelift codegen, phase 0's actual benchmark designs (picorv32 first),
-and the gaps above are all still ahead of where this stands today.
+`always_comb`, constant/variable bit-select, constant part-select,
+concatenation, and ternary on reads only (no indexed part-select, not as
+a write target), no module parameters, no array/memory signals (`reg
+[31:0] mem [0:31]` -- this is what picorv32's register file actually
+needs, and is a distinct, likely-larger gap from bit-select on a single
+signal), no module instantiation. Cranelift codegen and actually getting
+picorv32 fully through the pipeline are both still ahead of where this
+stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

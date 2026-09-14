@@ -281,3 +281,56 @@ cycle-for-cycle, via this interpreter.
 interpreter as the finished kernel architecture -- it's the correctness
 baseline the eventual JIT engine gets built and checked against, per this
 entry, not a change to D2/D3's target design.
+
+## D13 — Work around a real `sv-parser` precedence bug for `binop ? :`
+
+**Decision**: `ictus-frontend-verilog::lower_expr`'s `E::Binary` arm
+detects and corrects a specific `sv-parser` mis-parse: an *unparenthesized*
+ternary operator immediately following a binary operator's right operand
+(`a > c ? a : c`) comes back from `sv-parser` structured as if it were
+`a > (c ? a : c)` -- a `Binary` node whose right-hand side is itself a
+bare `ConditionalExpression` -- rather than the only semantically-correct
+reading, `(a > c) ? a : c`. Every binary operator this frontend lowers
+binds tighter than `?:` in real Verilog, so this input is unambiguous;
+`sv-parser` gets it wrong. The fix rewrites the mis-nested tree: pull the
+inner ternary's `cond` out, re-apply the outer binary operator to just
+that (`apply_binary_op(op, lhs, inner.cond)`), and use the inner
+ternary's `then`/`else` as the new outer ternary's -- see the arm's own
+comment for the exact transform and its known limit (only the *immediate*
+right-operand case is fixed; a ternary buried deeper on the right, e.g.
+past a nested binary operator, is corrected at that inner level during
+recursion but an outer operator needing to *also* re-associate past an
+already-fixed inner ternary is not handled).
+
+**Alternatives considered**: reject unparenthesized `binop ? :` outright
+and require source changes -- rejected immediately, since the whole point
+of lowering real designs (picorv32) is running the source as written, not
+demanding it be rewritten; requiring every Verilog file this project
+might ever lower to be hand-edited first defeats the purpose. Patching
+`sv-parser` itself upstream -- plausible, worth doing eventually (it's a
+real bug, not just a limitation, and other consumers would hit it too),
+but out of scope for unblocking this project right now, and the local fix
+is small, well-contained, and easy to test in isolation regardless of
+whether an upstream fix ever lands.
+
+**Why discovered / confirmed, not assumed**: found by actually lowering
+`bench/designs/picorv32/picorv32.v` (a real design already vendored for
+phase 0) and inspecting the exact mis-lowered tree for
+`docs/roadmap.md`-worthy diagnostic value; confirmed as specifically a
+missing-parens issue (not a general ternary bug) by writing the identical
+expression both with and without explicit parens around the condition and
+comparing the two lowered trees -- see
+`ictus-frontend-verilog/tests/ternary_precedence.rs` and
+`ictus-cli/tests/differential_ternary_precedence.rs`, the latter checked
+against Icarus Verilog including a case where the condition is false, not
+just the "obviously worked" case.
+
+**Practical implication for future work**: if a *new* binary operator is
+added later (subtraction, shift, multiply, ...), it automatically goes
+through the same `E::Binary` arm and gets this fix for free -- no
+per-operator repetition needed. If a similar mis-association is ever
+found for a *different* operator pair (e.g. unary operators, once/if
+their operand type ever changes from the current `Primary` restriction
+that structurally prevents this class of bug today), treat it as its own
+new finding to verify empirically the same way, not an assumed
+extension of this one.

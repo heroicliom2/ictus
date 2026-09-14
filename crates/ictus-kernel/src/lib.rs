@@ -193,6 +193,17 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
                 (eval_expr(base, values) >> index) & 1
             }
         }
+        Expr::Ternary {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            if eval_expr(cond, values) != 0 {
+                eval_expr(then_val, values)
+            } else {
+                eval_expr(else_val, values)
+            }
+        }
     }
 }
 
