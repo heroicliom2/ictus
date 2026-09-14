@@ -10,7 +10,7 @@ fn lowers_variable_bit_select() {
     let idx = module.signal_id("idx").expect("idx port");
     let bit_out = module.signal_id("bit_out").expect("bit_out port");
 
-    let Stmt::NonBlockingAssign { target, value } = &module.clocked_processes[0].body[0] else {
+    let Stmt::NonBlockingAssign { target, value, .. } = &module.clocked_processes[0].body[0] else {
         panic!("expected the process body to be a single non-blocking assignment");
     };
     assert_eq!(*target, bit_out);

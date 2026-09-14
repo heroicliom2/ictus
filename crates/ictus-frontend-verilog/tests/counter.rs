@@ -42,7 +42,7 @@ fn lowers_counter_module_correctly() {
     // then: count <= 8'd0;
     assert_eq!(then_branch.len(), 1);
     match &then_branch[0] {
-        Stmt::NonBlockingAssign { target, value } => {
+        Stmt::NonBlockingAssign { target, value, .. } => {
             assert_eq!(*target, count);
             assert!(matches!(value, Expr::Literal { value: 0, width: 8 }));
         }
@@ -52,7 +52,7 @@ fn lowers_counter_module_correctly() {
     // else: count <= count + 8'd1;
     assert_eq!(else_branch.len(), 1);
     match &else_branch[0] {
-        Stmt::NonBlockingAssign { target, value } => {
+        Stmt::NonBlockingAssign { target, value, .. } => {
             assert_eq!(*target, count);
             match value {
                 Expr::Add(lhs, rhs) => {

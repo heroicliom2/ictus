@@ -71,7 +71,7 @@ fn assert_eq_literal(cond: &Expr, expected_ref: ictus_ir::SignalId, expected_val
 fn assert_target_value(body: &[Stmt], target: ictus_ir::SignalId, expected: u64) {
     assert_eq!(body.len(), 1);
     match &body[0] {
-        Stmt::NonBlockingAssign { target: t, value } => {
+        Stmt::NonBlockingAssign { target: t, value, .. } => {
             assert_eq!(*t, target);
             assert!(
                 matches!(value, Expr::Literal { value: v, .. } if *v == expected),

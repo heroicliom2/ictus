@@ -74,7 +74,7 @@ fn find_assign(stmts: &[Stmt], target: ictus_ir::SignalId) -> &Expr {
     stmts
         .iter()
         .find_map(|s| match s {
-            Stmt::NonBlockingAssign { target: t, value } if *t == target => Some(value),
+            Stmt::NonBlockingAssign { target: t, value, .. } if *t == target => Some(value),
             _ => None,
         })
         .unwrap_or_else(|| panic!("no assignment found for signal id {target}"))

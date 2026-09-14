@@ -104,7 +104,7 @@ fn rejects_wildcard_literal_outside_case() {
 fn assert_target_value(body: &[Stmt], target: ictus_ir::SignalId, expected: u64) {
     assert_eq!(body.len(), 1);
     match &body[0] {
-        Stmt::NonBlockingAssign { target: t, value } => {
+        Stmt::NonBlockingAssign { target: t, value, .. } => {
             assert_eq!(*t, target);
             assert!(
                 matches!(value, Expr::Literal { value: v, .. } if *v == expected),

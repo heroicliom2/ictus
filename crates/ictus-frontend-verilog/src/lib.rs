@@ -16,12 +16,16 @@
 //! directly into every reference -- see `lower_parameters`; a parameter
 //! is not a signal and never appears in `ictus_ir::Module` at all),
 //! constant and variable bit-select, constant part-select, concatenation,
-//! and the ternary operator, all on the *read* side only (`x[3]`, `x[i]`,
-//! `x[7:0]`, `{a,b}`, `c ? a : b`; no indexed part-select
-//! `x[base +: width]`, no bit-select/part-select/concatenation as an
-//! assignment target -- see `lower_select`/`lower_concatenation` and
-//! `reject_select_target`/the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue`
-//! checks in the two assignment-lowering functions), and expressions
+//! and the ternary operator on the *read* side (`x[3]`, `x[i]`, `x[7:0]`,
+//! `{a,b}`, `c ? a : b`; no indexed part-select `x[base +: width]`; no
+//! concatenation as an assignment target -- see `lower_concatenation` and
+//! the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue` checks in the two
+//! assignment-lowering functions), plus a *constant* bit-select/part-select
+//! as a non-blocking-assignment target (`x[7:0] <= v;`, picorv32's
+//! `mem_rdata_q[...] <= ...` style -- see `lower_select_target_range`;
+//! a variable index/indexed-range target, and any select as a
+//! *continuous*-assignment target, are still rejected, since only `<=`
+//! has a commit phase to do the read-modify-write in), and expressions
 //! built from literals (decimal/binary/hex; not octal, not X/Z-valued
 //! outside a case item), signal references, unary `!`, and the binary
 //! operators `+ & | ^ == != < <= > >= && ||`. `lower_expr`'s `E::Binary`
@@ -38,16 +42,17 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- bit-select/part-select as an
-//! *assignment target* (confirmed needed: picorv32 does
-//! `mem_rdata_q[...] <= ...`; needs read-modify-write semantics in the
-//! kernel, not just frontend parsing, so it's a bigger step than the
-//! read-side support that already exists), array/memory signals (`reg
-//! [31:0] mem [0:31]`), `always_comb`, and module instantiation are the
+//! later phases need more of the language -- concatenation-of-selects as
+//! an assignment target (`{a[7:5], b[2:0]} <= v;`, seen a handful of
+//! times in picorv32), the `$signed(...)` system function (also seen
+//! there, on the read side), array/memory signals (`reg [31:0] mem
+//! [0:31]`), `always_comb`, and module instantiation are the
 //! next-highest-value gaps toward running a real design like phase 0's
 //! picorv32 benchmark.
 
-use ictus_ir::{Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
+use ictus_ir::{
+    Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use sv_parser::{
@@ -644,14 +649,20 @@ fn lower_nonblocking_assign(
     let lhs_ident = unwrap_node!(&assign.nodes.0, SimpleIdentifier)
         .ok_or("non-blocking assignment target is not a simple identifier")?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assignment target unreadable")?;
-    reject_select_target(&assign.nodes.0, target_name)?;
     let target = module
         .signal_id(target_name)
         .ok_or_else(|| format!("assignment target '{target_name}' is not a known signal"))?;
+    let target_range =
+        lower_select_target_range(&assign.nodes.0, target_name, tree, module)?;
+    check_target_range(target_range, target, target_name, module)?;
 
     let value = lower_expr(&assign.nodes.3, tree, module)?;
 
-    Ok(Stmt::NonBlockingAssign { target, value })
+    Ok(Stmt::NonBlockingAssign {
+        target,
+        target_range,
+        value,
+    })
 }
 
 /// Lowers `assign target = expr;` (the `Net`-targeted form -- `assign`ing
@@ -690,7 +701,18 @@ fn lower_continuous_assign(
     let lhs_ident = unwrap_node!(&assignment.nodes.0, SimpleIdentifier)
         .ok_or("assign target is not a simple identifier")?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assign target unreadable")?;
-    reject_select_target(&assignment.nodes.0, target_name)?;
+    // Continuous assignment (`ictus_ir::Assign`) has no partial-write
+    // representation -- unlike non-blocking assignment, it's not deferred
+    // to a commit phase, so read-modify-write would need to happen inline
+    // against `Simulation::settle_combinational`'s single pass, which
+    // isn't implemented. A constant bit-select/part-select target is
+    // therefore still rejected here, even though it's now accepted for
+    // `<=`.
+    if lower_select_target_range(&assignment.nodes.0, target_name, tree, module)?.is_some() {
+        return Err(format!(
+            "assign target '{target_name}' uses a bit-select/part-select, which v1 doesn't support as a continuous-assignment write target (only for non-blocking `<=`)"
+        ));
+    }
     let target = module
         .signal_id(target_name)
         .ok_or_else(|| format!("assign target '{target_name}' is not a known signal"))?;
@@ -957,24 +979,88 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
     }
 }
 
-/// Rejects an assignment target that uses a bit-select/part-select
-/// (`x[3:0] <= v;` or `assign x[3:0] = v;`) -- v1's `Signal` model has no
-/// notion of a partial write, so lowering this as a full-width write to
-/// `x` would silently discard the select and write the wrong bits rather
-/// than fail loudly. `target` is searched for a `Select` node the same
-/// way its identifier already is; a `Select` with no brackets (a plain
-/// reference, the overwhelmingly common case) is fine and returns `Ok`.
-fn reject_select_target<'a, T>(target: &'a T, target_name: &str) -> Result<(), String>
+/// Extracts a `(msb, lsb)` write range from an assignment target that uses
+/// a *constant* bit-select/part-select (`x[3:0] <= v;`, `x[5] <= v;`, or
+/// `assign x[3:0] = v;`) -- `None` means the target is a plain reference
+/// with no select at all, the overwhelmingly common case. `target` is
+/// searched for a `Select` node the same way its identifier already is.
+///
+/// Only constant bounds are supported: a variable bit-select target
+/// (`x[i] <= v;`) or an indexed part-select (`x[base +: width] <= v;`)
+/// would need the kernel to compute the write range at simulation time
+/// rather than lowering time, which the kernel doesn't implement -- both
+/// are rejected here with a specific error rather than silently doing the
+/// wrong thing. Multi-dimensional indexing (array signals) is likewise
+/// rejected, matching `lower_select`'s read-side restriction.
+fn lower_select_target_range<'a, T>(
+    target: &'a T,
+    target_name: &str,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Option<(u32, u32)>, String>
 where
     &'a T: IntoIterator<Item = RefNode<'a>>,
 {
     let Some(RefNode::Select(select)) = unwrap_node!(target, Select) else {
+        return Ok(None);
+    };
+
+    // Part-select: `x[msb:lsb]`.
+    if let Some(bracket) = &select.nodes.2 {
+        return match &bracket.nodes.1 {
+            sv_parser::PartSelectRange::ConstantRange(range) => {
+                let msb = lower_constant_index(&range.nodes.0, tree)?;
+                let lsb = lower_constant_index(&range.nodes.2, tree)?;
+                if lsb > msb {
+                    return Err(format!(
+                        "assignment target '{target_name}' has a part-select `[{msb}:{lsb}]` with lsb greater than msb"
+                    ));
+                }
+                Ok(Some((msb, lsb)))
+            }
+            sv_parser::PartSelectRange::IndexedRange(_) => Err(format!(
+                "assignment target '{target_name}' uses an indexed part-select (`x[base +: width]`), which v1 doesn't support as a write target"
+            )),
+        };
+    }
+
+    // Bit-select: `x[3]` (or no select at all, if the bracket list is empty).
+    match select.nodes.1.nodes.0.as_slice() {
+        [] => Ok(None),
+        [only] => match lower_expr(&only.nodes.1, tree, module)? {
+            Expr::Literal { value, .. } => {
+                let bit = value as u32;
+                Ok(Some((bit, bit)))
+            }
+            _ => Err(format!(
+                "assignment target '{target_name}' uses a variable-indexed bit-select (`x[i] <= v;`), which v1 doesn't support as a write target"
+            )),
+        },
+        _ => Err(format!(
+            "assignment target '{target_name}' uses multi-dimensional indexing, which v1 doesn't support"
+        )),
+    }
+}
+
+/// Confirms a target write range's `msb` actually fits inside the target
+/// signal's declared width -- `lower_select_target_range` only knows the
+/// literal bounds written in the source, not the signal's width, so
+/// `x[40:38] <= v;` on an 8-bit `x` needs to be caught here rather than
+/// silently accepted and producing an out-of-range write at simulation
+/// time.
+fn check_target_range(
+    range: Option<(u32, u32)>,
+    target: SignalId,
+    target_name: &str,
+    module: &Module,
+) -> Result<(), String> {
+    let Some((msb, _lsb)) = range else {
         return Ok(());
     };
-    let has_select = !select.nodes.1.nodes.0.is_empty() || select.nodes.2.is_some();
-    if has_select {
+    let width = module.signals[target].width;
+    if msb >= width {
         return Err(format!(
-            "assignment target '{target_name}' uses a bit-select/part-select, which v1 doesn't support as a write target (only as part of a read expression)"
+            "assignment target '{target_name}' selects bit {msb}, which is out of range for its {width}-bit width"
         ));
     }
     Ok(())

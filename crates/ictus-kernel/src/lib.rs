@@ -15,7 +15,15 @@
 //! against the state as it was *before* this tick, and only then are all
 //! the resulting writes committed together -- matching Verilog's
 //! non-blocking assignment rule that `<=` reads pre-edge values regardless
-//! of statement order within the same clock edge.
+//! of statement order within the same clock edge. A write with a
+//! `target_range` (`x[7:0] <= v;` -- a constant bit-select/part-select
+//! target, see `ictus_ir::Stmt::NonBlockingAssign`) is committed as a
+//! read-modify-write against the signal's current stored value rather
+//! than a full-width replace, so it leaves the rest of the signal's bits
+//! untouched; see the commit loop in `tick()` for why applying these in
+//! declaration order via direct mutation (rather than staging them in a
+//! separate map first) is still correct even when more than one partial
+//! write targets the same signal in one tick.
 //!
 //! Combinational logic (`ictus_ir::Assign`, i.e. `assign target = value;`)
 //! is "settled" -- every `Assign` re-evaluated and written immediately,
@@ -81,8 +89,24 @@ impl<'m> Simulation<'m> {
         for process in &self.module.clocked_processes {
             eval_stmts(&process.body, &self.values, &mut updates);
         }
-        for (id, value) in updates {
-            self.values[id] = mask(value, self.module.signals[id].width);
+        // Applied in order via direct mutation, not staged in a separate
+        // map: every RHS above was already evaluated against the pre-tick
+        // snapshot before this loop starts touching `self.values`, so a
+        // later partial write to the same signal correctly builds on an
+        // earlier one from this same tick (matching real hardware, where
+        // multiple non-blocking writes to the same bits in one process is
+        // "last write wins" and writes to disjoint bit ranges combine).
+        for (id, range, value) in updates {
+            match range {
+                None => self.values[id] = mask(value, self.module.signals[id].width),
+                Some((msb, lsb)) => {
+                    let width = msb - lsb + 1;
+                    let clear_mask = mask(u64::MAX, width) << lsb;
+                    let current = self.values[id] & !clear_mask;
+                    let new_bits = (mask(value, width)) << lsb;
+                    self.values[id] = mask(current | new_bits, self.module.signals[id].width);
+                }
+            }
         }
 
         self.settle_combinational();
@@ -98,11 +122,17 @@ impl<'m> Simulation<'m> {
     }
 }
 
-fn eval_stmts(stmts: &[Stmt], values: &[u64], updates: &mut Vec<(SignalId, u64)>) {
+type PendingUpdate = (SignalId, Option<(u32, u32)>, u64);
+
+fn eval_stmts(stmts: &[Stmt], values: &[u64], updates: &mut Vec<PendingUpdate>) {
     for stmt in stmts {
         match stmt {
-            Stmt::NonBlockingAssign { target, value } => {
-                updates.push((*target, eval_expr(value, values)));
+            Stmt::NonBlockingAssign {
+                target,
+                target_range,
+                value,
+            } => {
+                updates.push((*target, *target_range, eval_expr(value, values)));
             }
             Stmt::If {
                 cond,
@@ -251,10 +281,12 @@ mod tests {
                 cond: Expr::Not(Box::new(Expr::Ref(resetn))),
                 then_branch: vec![Stmt::NonBlockingAssign {
                     target: count,
+                    target_range: None,
                     value: Expr::Literal { value: 0, width: 8 },
                 }],
                 else_branch: vec![Stmt::NonBlockingAssign {
                     target: count,
+                    target_range: None,
                     value: Expr::Add(
                         Box::new(Expr::Ref(count)),
                         Box::new(Expr::Literal { value: 1, width: 8 }),
@@ -308,6 +340,118 @@ mod tests {
         sim.set("resetn", 0);
         sim.tick();
         assert_eq!(sim.get("count"), 0);
+    }
+
+    /// Two non-blocking assignments to *disjoint* bit ranges of the same
+    /// signal, in the same clocked process, must both take effect in the
+    /// same tick -- a partial write's commit is a read-modify-write against
+    /// the signal's *current* stored value, not a full-width replace, and
+    /// this must hold even when more than one partial write to the same
+    /// signal lands in one tick (see `tick()`'s doc comment above the
+    /// commit loop for why applying them in order via direct mutation is
+    /// correct here).
+    #[test]
+    fn partial_writes_to_disjoint_ranges_combine_in_one_tick() {
+        let mut m = Module {
+            name: "nibble_pair".to_string(),
+            ..Default::default()
+        };
+        let clk = m.push_signal(Signal {
+            name: "clk".to_string(),
+            width: 1,
+            direction: Some(Direction::Input),
+        });
+        let hi_in = m.push_signal(Signal {
+            name: "hi_in".to_string(),
+            width: 4,
+            direction: Some(Direction::Input),
+        });
+        let acc = m.push_signal(Signal {
+            name: "acc".to_string(),
+            width: 8,
+            direction: Some(Direction::Output),
+        });
+
+        m.clocked_processes.push(ClockedProcess {
+            clock: clk,
+            body: vec![
+                // acc[3:0] <= acc[3:0] + 1;
+                Stmt::NonBlockingAssign {
+                    target: acc,
+                    target_range: Some((3, 0)),
+                    value: Expr::Add(
+                        Box::new(Expr::Select {
+                            base: Box::new(Expr::Ref(acc)),
+                            msb: 3,
+                            lsb: 0,
+                        }),
+                        Box::new(Expr::Literal { value: 1, width: 4 }),
+                    ),
+                },
+                // acc[7:4] <= hi_in;
+                Stmt::NonBlockingAssign {
+                    target: acc,
+                    target_range: Some((7, 4)),
+                    value: Expr::Ref(hi_in),
+                },
+            ],
+        });
+
+        let mut sim = Simulation::new(&m);
+        sim.set("hi_in", 0xA);
+        sim.tick();
+        assert_eq!(sim.get("acc"), 0xA1, "hi nibble loaded, lo nibble 0 -> 1");
+
+        sim.set("hi_in", 0xB);
+        sim.tick();
+        assert_eq!(sim.get("acc"), 0xB2, "hi nibble reloaded, lo nibble 1 -> 2");
+    }
+
+    /// A partial write's range must mask/wrap within its own width, not
+    /// the whole signal's -- `acc[3:0]` at 0xF must wrap to 0x0 on
+    /// increment without touching `acc[7:4]`, exactly like real hardware
+    /// where the RHS is evaluated in the target range's own bit width.
+    #[test]
+    fn partial_write_wraps_within_its_own_width_not_the_full_signal() {
+        let mut m = Module {
+            name: "nibble_wrap".to_string(),
+            ..Default::default()
+        };
+        let clk = m.push_signal(Signal {
+            name: "clk".to_string(),
+            width: 1,
+            direction: Some(Direction::Input),
+        });
+        let acc = m.push_signal(Signal {
+            name: "acc".to_string(),
+            width: 8,
+            direction: Some(Direction::Output),
+        });
+
+        m.clocked_processes.push(ClockedProcess {
+            clock: clk,
+            body: vec![Stmt::NonBlockingAssign {
+                target: acc,
+                target_range: Some((3, 0)),
+                value: Expr::Add(
+                    Box::new(Expr::Select {
+                        base: Box::new(Expr::Ref(acc)),
+                        msb: 3,
+                        lsb: 0,
+                    }),
+                    Box::new(Expr::Literal { value: 1, width: 4 }),
+                ),
+            }],
+        });
+
+        let mut sim = Simulation::new(&m);
+        sim.values[acc] = 0xF0 | 0x0F; // acc = 0xFF: high nibble 0xF, low nibble 0xF
+        sim.tick();
+        assert_eq!(
+            sim.get("acc"),
+            0xF0,
+            "low nibble must wrap 0xF -> 0x0 without touching the high nibble"
+        );
     }
 
     #[test]

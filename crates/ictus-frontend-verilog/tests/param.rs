@@ -38,7 +38,7 @@ fn lowers_module_parameters_as_literals() {
     // `result <= OFFSET;` -- OFFSET resolved to `8'd5`.
     assert_eq!(then_branch.len(), 1);
     match &then_branch[0] {
-        Stmt::NonBlockingAssign { target, value } => {
+        Stmt::NonBlockingAssign { target, value, .. } => {
             assert_eq!(*target, result);
             assert!(matches!(value, Expr::Literal { value: 5, width: 8 }));
         }
@@ -48,7 +48,7 @@ fn lowers_module_parameters_as_literals() {
     // `result <= result + OFFSET;`
     assert_eq!(else2.len(), 1);
     match &else2[0] {
-        Stmt::NonBlockingAssign { target, value } => {
+        Stmt::NonBlockingAssign { target, value, .. } => {
             assert_eq!(*target, result);
             match value {
                 Expr::Add(lhs, rhs) => {

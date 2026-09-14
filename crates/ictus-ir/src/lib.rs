@@ -14,9 +14,14 @@
 //! but no `always_comb` yet, `if`/`else`/`else if` and
 //! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
 //! assignment, constant and variable bit-select, constant part-select,
-//! concatenation, and the ternary operator, all on reads only (no indexed
-//! part-select `x[base +: width]`, not as an assignment target). Each of
-//! those is a documented gap to widen incrementally, not a final design.
+//! concatenation, and the ternary operator on reads (no indexed
+//! part-select `x[base +: width]`), plus a constant bit-select/part-select
+//! as a non-blocking-assignment *target* (`x[7:0] <= v;`) -- a variable
+//! index or indexed range as a target isn't supported, and neither is a
+//! select as a *continuous*-assignment target (`assign x[7:0] = v;`; only
+//! `<=` supports a partial write, since it alone has a commit phase to do
+//! the read-modify-write in). Each of those is a documented gap to widen
+//! incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -64,10 +69,11 @@ pub enum Expr {
     LogicalOr(Box<Expr>, Box<Expr>),
     /// Bit-select (`x[3]`, `msb == lsb`) or part-select (`x[7:0]`), with a
     /// *constant* index/bounds fixed at lowering time -- for a
-    /// runtime-computed index (`x[i]`), see `DynamicBitSelect` below.
-    /// Doesn't support a select as an *assignment target*
-    /// (`x[3:0] <= v;`); the frontend rejects that rather than silently
-    /// lowering it as a full-width write. Unlike most other operators
+    /// runtime-computed index (`x[i]`), see `DynamicBitSelect` below. This
+    /// is the read-side expression form; a select as a non-blocking
+    /// *assignment target* (`x[3:0] <= v;`) is represented separately, as
+    /// `Stmt::NonBlockingAssign`'s `target_range` field, not as an `Expr`
+    /// at all -- see that field's doc comment. Unlike most other operators
     /// here, this one masks its own result immediately (to
     /// `msb - lsb + 1` bits) in the kernel rather than relying on masking
     /// happening later at signal-write time, since its width is exactly
@@ -76,7 +82,8 @@ pub enum Expr {
     /// Bit-select with a runtime-computed index (`x[i]`), always 1 bit
     /// wide. No indexed *part*-select (`x[base +: width]`, a fixed width
     /// at a variable base) yet -- only single-bit -- and, like `Select`,
-    /// not supported as an assignment target. An index that's out of
+    /// not supported as an assignment target (a target's write range must
+    /// be known at lowering time, not computed per-cycle). An index that's out of
     /// range for `base`'s width (including simply `>= 64`) returns 0
     /// rather than panicking or propagating 'x' -- this kernel is 2-state
     /// only (decisions.md D6) and has no 'x' to propagate; 0 is a
@@ -107,7 +114,15 @@ pub enum Expr {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    NonBlockingAssign { target: SignalId, value: Expr },
+    NonBlockingAssign {
+        target: SignalId,
+        /// When `Some((msb, lsb))`, only that bit range of `target` is
+        /// written (a constant bit-select/part-select target, e.g.
+        /// `x[7:0] <= value;`); the rest of the signal is left unchanged.
+        /// `None` means the whole signal is replaced.
+        target_range: Option<(u32, u32)>,
+        value: Expr,
+    },
     If {
         cond: Expr,
         then_branch: Vec<Stmt>,

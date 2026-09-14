@@ -65,16 +65,21 @@ internal `wire`/`reg` declarations naming one or more signals each,
 module parameters resolved to constants at lowering time,
 constant/variable bit-select, constant part-select, concatenation, and
 the ternary operator on reads (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`,
-`c ? a : b`), the operators `+ & | ^ == != < <= > >= && !`,
+`c ? a : b`), plus a *constant* bit-select/part-select as a non-blocking
+assignment target (`x[7:0] <= v;`, with correct read-modify-write
+semantics in the kernel — the rest of the signal's bits are left
+untouched, and multiple partial writes to the same signal in one clock
+edge combine correctly), the operators `+ & | ^ == != < <= > >= && !`,
 decimal/hex/binary literals) parses, lowers to `ictus-ir`, and runs
 correctly on a tree-walking interpreter — checked with cycle-for-cycle
 differential tests against Icarus Verilog, including an ongoing real
 attempt at lowering the actual phase 0 picorv32 benchmark design (not
 just hand-written fixtures), which is how most of the gaps just closed
-were found. Bit-select as a write target (confirmed needed, next up —
-needs read-modify-write semantics in the kernel), array/memory signals
-(picorv32's register file needs these), module instantiation, and
-Cranelift JIT codegen are all still ahead of where this stands today.
+were found. Concatenation-of-selects as a write target
+(`{a[7:5], b[2:0]} <= v;`), the `$signed(...)` system function,
+array/memory signals (picorv32's register file needs these), module
+instantiation, and Cranelift JIT codegen are all still ahead of where
+this stands today.
 
 ## Workspace layout
 

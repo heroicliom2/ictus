@@ -69,12 +69,13 @@ differential matches against Icarus Verilog:
 
 - `select_test.v` (constant bit-select `data[15]` and part-select
   `data[7:0]`/`data[15:8]`, read side only) --
-  `ictus-frontend-verilog/tests/select.rs` (which, like the `casez` test,
-  also confirms a bit-select used as an *assignment target*
-  (`result[3:0] <= v;`) is actively rejected rather than silently lowered
-  as a full-width write -- v1's `Signal` model has no notion of a partial
-  write, so silently dropping the select would write the wrong bits with
-  no error) and `ictus-cli/tests/differential_select.rs`.
+  `ictus-frontend-verilog/tests/select.rs` and
+  `ictus-cli/tests/differential_select.rs`. (`select.rs` also covers a
+  constant bit-select/part-select used as an *assignment target* --
+  `select_target_test.v` -- and confirms a *variable*-indexed select
+  target is still rejected; see "Bit-select/part-select as an assignment
+  target" below for the fuller story and why the two cases need different
+  treatment.)
 
 - `casez_test.v` (wildcard-bit matching: `4'b1???`, `4'b01??`, mixed with
   a plain exact-match item in the same `casez`) --
@@ -188,26 +189,81 @@ parameter reference in the fixture resolved to the correct literal value
 several cycles against Icarus Verilog, including the wraparound behavior
 the two parameters together produce.
 
-**Next confirmed blocker**: bit-select/part-select as an *assignment
-target* (`mem_rdata_q[...] <= ...` -- picorv32 does this). Meaningfully
-bigger than the read-side support that already exists: a partial-width
-write needs read-modify-write semantics in the kernel (write just the
-selected bits, leave the rest of the signal's current value alone), not
-just frontend parsing -- currently `reject_select_target` explicitly
-rejects this rather than silently truncating to a full-width write. Not
-yet attempted.
+**Bit-select/part-select as an assignment target** (`mem_rdata_q[14:12]
+<= 3'b000;` -- picorv32 does this constantly for its instruction-decode
+registers): done, for the common case. This was meaningfully bigger than
+the read-side support already in place, because a partial-width write
+needs *read-modify-write* semantics -- write just the selected bits,
+leave the rest of the signal's current stored value alone -- which the
+kernel had no representation for at all (`Stmt::NonBlockingAssign` was
+always a full-width replace).
+
+- `ictus_ir::Stmt::NonBlockingAssign` grew a `target_range: Option<(u32,
+  u32)>` field -- `None` for a plain full-width target (the overwhelming
+  common case, unchanged), `Some((msb, lsb))` for a constant
+  bit-select/part-select target.
+- `ictus_kernel`'s `tick()` commit loop now branches on that field: for
+  `Some((msb, lsb))`, it clears just those bits of the signal's *current*
+  stored value and ORs in the new bits shifted into position, instead of
+  replacing the whole word. Multiple partial writes to the same signal in
+  one tick (picorv32 does this too -- disjoint field writes to the same
+  register in one `always` block) are applied in declaration order via
+  direct mutation of the live value array, which is correct (not a race
+  with the non-blocking-read rule above) because every right-hand side
+  across the whole tick is already evaluated, against the pre-tick
+  snapshot, before this commit loop starts mutating anything -- see the
+  commit loop's own comment in `ictus-kernel/src/lib.rs`.
+- The frontend's old `reject_select_target` (which unconditionally
+  errored on *any* select target) became `lower_select_target_range`,
+  which extracts `(msb, lsb)` for a constant bit-select/part-select target
+  instead. A **variable**-indexed target (`x[i] <= v;`) and an indexed
+  part-select target (`x[base +: width] <= v;`) are still rejected --
+  correctly: the kernel's write range has to be known at lowering time,
+  not recomputed per cycle, so supporting those would need a genuinely
+  different (and not yet designed) kernel representation, not just a
+  frontend change. A select as a *continuous*-assignment target (`assign
+  x[7:0] = v;`) is also still rejected, deliberately: `ictus_ir::Assign`
+  has no `target_range` equivalent, since continuous assignment has no
+  commit phase to do a read-modify-write in the way `tick()` does for
+  `<=` -- doing this properly would mean reworking
+  `settle_combinational`'s single-pass-replace design, out of scope here.
+- Verified per this project's usual practice: `select_target_test.v`
+  (`ictus-frontend-verilog/tests/select.rs` for the structural shape,
+  `ictus-cli/tests/differential_select_target.rs` against Icarus Verilog)
+  drives two *disjoint* partial writes to the same register in one clock
+  edge -- one field self-incrementing and wrapping at its own (narrower)
+  width, the other loading from an input -- specifically to exercise the
+  same-signal-multiple-partial-writes case, not just a single isolated
+  partial write. `ictus-kernel`'s own unit tests additionally check the
+  read-modify-write and same-tick-combination behavior in isolation from
+  the frontend (`partial_writes_to_disjoint_ranges_combine_in_one_tick`,
+  `partial_write_wraps_within_its_own_width_not_the_full_signal`).
+
+**Still explicitly deferred**, found via the same picorv32 grep that
+found the above (not yet attempted):
+- Concatenation-of-selects as an assignment target (`{mem_rdata_q[31:25],
+  mem_rdata_q[11:7]} <= {...};` -- a handful of occurrences in picorv32).
+  Harder than a plain select target: it's a *combination* of the
+  concatenation-target-rejection logic and the new select-target-range
+  logic, splitting one right-hand-side value across multiple disjoint
+  writes in one statement, which neither existing code path does today.
+- The `$signed(...)` system function (seen right next to the
+  bit-select-target sites in picorv32, e.g. `mem_rdata_q[31:20] <=
+  $signed({...});`) -- an unrelated gap (a read-side system-function call,
+  not a target-side construct), just discovered at the same time.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
 `always_comb`, module parameters (defaults must be constant literals, no
-overriding at instantiation), constant/variable bit-select, constant
-part-select, concatenation, and ternary on reads only (no indexed
-part-select, not as a write target), no array/memory signals (`reg
-[31:0] mem [0:31]` -- this is what picorv32's register file actually
-needs, and is a distinct, likely-larger gap from bit-select on a single
-signal), no module instantiation. Cranelift codegen and actually getting
-picorv32 fully through the pipeline are both still ahead of where this
-stands today.
+overriding at instantiation), constant/variable bit-select and constant
+part-select on reads (no indexed part-select), concatenation and ternary
+on reads only, a constant bit-select/part-select as a non-blocking
+(`<=`) assignment target but not a continuous (`assign`) one and not with
+a variable index, no array/memory signals (`reg [31:0] mem [0:31]` --
+this is what picorv32's register file actually needs, and is a distinct,
+likely-larger gap from bit-select on a single signal), no module
+instantiation. Cranelift codegen and actually getting picorv32 fully
+through the pipeline are both still ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

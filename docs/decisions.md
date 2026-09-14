@@ -334,3 +334,77 @@ their operand type ever changes from the current `Primary` restriction
 that structurally prevents this class of bug today), treat it as its own
 new finding to verify empirically the same way, not an assumed
 extension of this one.
+
+## D14 — Partial-write commit: direct sequential mutation, not a staged map
+
+**Decision**: a non-blocking assignment to a constant bit-select/
+part-select target (`x[7:0] <= v;`, `ictus_ir::Stmt::NonBlockingAssign`'s
+new `target_range: Option<(u32, u32)>` field) is committed in
+`ictus_kernel::Simulation::tick()` as a read-modify-write directly against
+the live `values` array, applied in the same order the pending writes were
+collected in -- *not* staged into a separate map/buffer and merged in
+afterward. This matters when more than one non-blocking assignment in the
+same tick targets the same signal (picorv32 does this: disjoint field
+writes to one register in a single `always` block, e.g. one statement
+setting `mem_rdata_q[14:12]` and another setting `mem_rdata_q[31:20]` in
+the same edge) -- direct sequential mutation lets a later partial write
+correctly build on top of an earlier one from the same tick, matching real
+hardware's "these are separate always-block statements, later one wins for
+any bits it touches" behavior for same-signal, disjoint (or overlapping)
+partial writes.
+
+**Why this doesn't break the non-blocking-read rule**: Verilog's `<=`
+semantics require every right-hand side in a clock edge to see the state
+as it was *before* the edge, regardless of statement order -- normally the
+reason a "stage all writes, then apply" two-phase design is necessary at
+all. That rule is preserved here because the *evaluation* phase
+(`eval_stmts`, which reads `self.values` to compute every RHS) already
+runs to completion, producing a `Vec` of pending `(SignalId,
+Option<(u32,u32)>, u64)` updates, before the commit loop below it ever
+touches `self.values`. The commit loop's sequential mutation only matters
+for how multiple writes *to the same signal* interact with each other
+after evaluation is done -- it never feeds back into any RHS evaluation,
+because evaluation is already finished by the time it runs. A staged-map
+approach would need extra logic (merge-by-signal, applied in original
+order) to get the identical result; direct sequential mutation gets it for
+free from the loop's natural ordering.
+
+**Alternatives considered**: stage partial writes into a `HashMap<SignalId,
+u64>` (starting from each touched signal's pre-tick value) and merge bit
+ranges into it before a single final write per signal -- rejected as
+unnecessary complexity once it was clear direct mutation produces the
+identical result (see above), for the cost of an extra data structure and
+a less obvious "why is this correct" argument than "evaluation finishes
+before commit starts, so commit-time order is free to matter." Making a
+same-signal multiple-partial-write conflict an error instead of
+"last write's bits win" -- rejected because it's legal, common Verilog
+(picorv32 relies on it) with well-defined real-hardware semantics; erroring
+on legal source would violate this project's own "never silently
+mis-lower, but don't reject what real Verilog allows either" stance.
+
+**Scope boundary drawn at the same time**: only `Stmt::NonBlockingAssign`
+(`<=`) carries `target_range` -- `ictus_ir::Assign` (continuous `assign`)
+deliberately does not. Continuous assignment has no commit phase at all
+(`settle_combinational` is a single pass that evaluates and writes each
+`assign` immediately, every call), so there's no natural place to do a
+read-modify-write without reworking that pass's single-replace design;
+`assign x[7:0] = v;` is still rejected by the frontend rather than
+half-supported. Likewise, only a *constant* bit-select/part-select target
+is supported -- a variable-indexed target (`x[i] <= v;`) or indexed-range
+target (`x[base +: width] <= v;`) is rejected, because the write range has
+to be known at lowering time to live in the IR as a plain `(u32, u32)`;
+supporting either would need the kernel to carry and evaluate an index
+expression at commit time instead, a different (larger) design not yet
+needed by any real gap found so far.
+
+**Why discovered / confirmed, not assumed**: found the same way as D13 --
+lowering `bench/designs/picorv32/picorv32.v` and grepping its actual
+`mem_rdata_q[...]` usage, which showed both the common case (single
+constant part-select target per statement) and the specific
+multiple-partial-writes-per-tick pattern this decision is about. Verified
+with a dedicated fixture (`select_target_test.v`, two disjoint partial
+writes to one register in the same edge, one of them wrapping at its own
+narrower width) checked cycle-for-cycle against Icarus Verilog
+(`ictus-cli/tests/differential_select_target.rs`), plus `ictus_kernel`
+unit tests isolating the same-tick-combination and per-range-masking
+behavior from the frontend entirely.

@@ -39,6 +39,7 @@ fn lowers_inherited_direction_multi_name_decl_and_ternary() {
     let Stmt::NonBlockingAssign {
         target,
         value: outer,
+        ..
     } = &module.clocked_processes[0].body[1]
     else {
         panic!("expected the second statement to be `result <= ...`");
