@@ -9,22 +9,23 @@
 //! (wildcard bits only on a case *item*'s own literal -- see
 //! `lower_case`/`lower_case_value`), non-blocking assignment, internal
 //! `wire`/`reg` declarations (in addition to ports), constant
-//! bit-select/part-select on the *read* side only (`x[3]`, `x[7:0]`; not
-//! `x[i]`, not as an assignment target -- see `lower_select` and
-//! `reject_select_target`), and expressions built from literals
-//! (decimal/binary/hex; not octal, not X/Z-valued outside a case item),
-//! signal references, unary `!`, and the binary operators
-//! `+ & | ^ == != < <= > >= && ||`. Anything else in the source is either
-//! ignored (other module items) or produces an error, deliberately --
-//! silently mis-lowering an unsupported construct would make this
-//! project's own differential testing (docs/architecture.md, Validation
-//! strategy) meaningless. Also lowers single-assignment continuous
-//! `assign target = expr;` statements (net-targeted only -- see
-//! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as later
-//! phases need more of the language -- variable-indexed select,
-//! concatenation, `always_comb`, and module instantiation are the
-//! next-highest-value gaps toward running a real design like phase 0's
-//! picorv32 benchmark.
+//! bit-select/part-select and concatenation on the *read* side only
+//! (`x[3]`, `x[7:0]`, `{a,b}`; not `x[i]`, not as an assignment target --
+//! see `lower_select`/`lower_concatenation` and
+//! `reject_select_target`/the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue`
+//! checks in the two assignment-lowering functions), and expressions
+//! built from literals (decimal/binary/hex; not octal, not X/Z-valued
+//! outside a case item), signal references, unary `!`, and the binary
+//! operators `+ & | ^ == != < <= > >= && ||`. Anything else in the source
+//! is either ignored (other module items) or produces an error,
+//! deliberately -- silently mis-lowering an unsupported construct would
+//! make this project's own differential testing (docs/architecture.md,
+//! Validation strategy) meaningless. Also lowers single-assignment
+//! continuous `assign target = expr;` statements (net-targeted only --
+//! see `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
+//! later phases need more of the language -- variable-indexed select,
+//! `always_comb`, and module instantiation are the next-highest-value
+//! gaps toward running a real design like phase 0's picorv32 benchmark.
 
 use ictus_ir::{Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
 use std::path::Path;
@@ -437,6 +438,19 @@ fn lower_nonblocking_assign(
     tree: &SyntaxTree,
     module: &Module,
 ) -> Result<Stmt, String> {
+    // A concatenation target (`{a, b} <= x;`) is its own `VariableLvalue`
+    // variant (`Lvalue`, wrapping a brace-list of lvalues), not just an
+    // identifier with an unusual `Select` -- checked separately, and
+    // first, because the identifier-based checks below would otherwise
+    // deep-search *past* this and silently match `a` alone, discarding
+    // `b` and the split-assignment semantics entirely.
+    if let sv_parser::VariableLvalue::Lvalue(_) = &assign.nodes.0 {
+        return Err(
+            "assignment target is a concatenation (`{a, b} <= ...`), which v1 doesn't support as a write target"
+                .to_string(),
+        );
+    }
+
     let lhs_ident = unwrap_node!(&assign.nodes.0, SimpleIdentifier)
         .ok_or("non-blocking assignment target is not a simple identifier")?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assignment target unreadable")?;
@@ -453,14 +467,15 @@ fn lower_nonblocking_assign(
 /// Lowers `assign target = expr;` (the `Net`-targeted form -- `assign`ing
 /// to a `reg`/variable via `ContinuousAssignVariable` is legal SV but
 /// rare and not lowered in v1). Only handles a single plain-identifier
-/// target: `assign a = x, b = y;` (comma-joined multiple assignments) and
-/// bit-select/concatenation targets (`assign {a,b} = x;`) aren't
-/// supported -- `NetAssignment` is found via a subtree search rather than
-/// hand-decoding `ListOfNetAssignments`' `List<Symbol, NetAssignment>`
-/// wrapper, so a comma-joined statement would silently only lower its
-/// first assignment; that's an acceptable v1 gap since it's an unusual
-/// style, not a silent-wrong-*value* bug like the ones this frontend's
-/// tests specifically guard against.
+/// target: `assign a = x, b = y;` (comma-joined multiple assignments)
+/// isn't supported -- `NetAssignment` is found via a subtree search
+/// rather than hand-decoding `ListOfNetAssignments`' `List<Symbol,
+/// NetAssignment>` wrapper, so a comma-joined statement would silently
+/// only lower its first assignment; that's an acceptable v1 gap since
+/// it's an unusual style, not a silent-wrong-*value* bug like the ones
+/// this frontend's tests specifically guard against. Bit-select and
+/// concatenation targets (`assign {a,b} = x;`) are explicitly rejected,
+/// not just undocumented gaps -- see the `NetLvalue::Lvalue` check below.
 fn lower_continuous_assign(
     net: &ContinuousAssignNet,
     tree: &SyntaxTree,
@@ -472,9 +487,18 @@ fn lower_continuous_assign(
         unreachable!("unwrap_node! guarantees the requested variant");
     };
 
-    let lhs_ident = unwrap_node!(&assignment.nodes.0, SimpleIdentifier).ok_or(
-        "assign target is not a simple identifier (bit-select/concatenation targets are not supported in v1)",
-    )?;
+    // Same reasoning as lower_nonblocking_assign's identical check: a
+    // concatenation target is its own NetLvalue variant, not something
+    // the identifier/Select checks below would otherwise catch.
+    if let sv_parser::NetLvalue::Lvalue(_) = &assignment.nodes.0 {
+        return Err(
+            "assign target is a concatenation (`assign {a, b} = ...`), which v1 doesn't support as a write target"
+                .to_string(),
+        );
+    }
+
+    let lhs_ident = unwrap_node!(&assignment.nodes.0, SimpleIdentifier)
+        .ok_or("assign target is not a simple identifier")?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assign target unreadable")?;
     reject_select_target(&assignment.nodes.0, target_name)?;
     let target = module
@@ -559,6 +583,14 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Modul
                 Err("min:typ:max expressions are not supported in v1".to_string())
             }
         },
+        P::Concatenation(concat) => {
+            if concat.nodes.1.is_some() {
+                return Err(
+                    "indexing into a concatenation (`{a,b}[3:0]`) is not supported in v1".to_string(),
+                );
+            }
+            lower_concatenation(&concat.nodes.0, tree, module)
+        }
         other => Err(format!("primary expression form not supported in v1: {other:?}")),
     }
 }
@@ -627,6 +659,47 @@ fn lower_constant_index(expr: &sv_parser::ConstantExpression, tree: &SyntaxTree)
     match lower_number(number, tree)? {
         Expr::Literal { value, .. } => Ok(value as u32),
         _ => unreachable!("lower_number always returns Expr::Literal"),
+    }
+}
+
+fn lower_concatenation(
+    concat: &sv_parser::Concatenation,
+    tree: &SyntaxTree,
+    module: &Module,
+) -> Result<Expr, String> {
+    let exprs = concat.nodes.0.nodes.1.contents();
+    if exprs.is_empty() {
+        return Err("an empty concatenation `{}` is not supported in v1".to_string());
+    }
+
+    let mut parts = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        let lowered = lower_expr(e, tree, module)?;
+        let width = expr_width(&lowered, module)?;
+        parts.push((lowered, width));
+    }
+    Ok(Expr::Concat(parts))
+}
+
+/// Computes a statically-known bit width for an already-lowered
+/// expression -- needed to pack concatenation operands into their correct
+/// bit positions (see `Expr::Concat`'s doc comment in `ictus_ir`). Only
+/// expression forms with an exactly-known width are accepted:
+/// arithmetic/comparison results don't have a width this frontend can
+/// determine without real type inference (Verilog's own width-inference
+/// rules for something like `a + b` are more involved than this frontend
+/// implements), so those are rejected here rather than guessed at.
+pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
+    match expr {
+        Expr::Literal { width, .. } => Ok(*width),
+        Expr::Ref(id) => Ok(module.signals[*id].width),
+        Expr::Select { msb, lsb, .. } => Ok(msb - lsb + 1),
+        Expr::Concat(parts) => Ok(parts.iter().map(|(_, w)| w).sum()),
+        other => Err(format!(
+            "concatenation operand's width can't be determined in v1 (only literals, signal \
+             references, bit-select/part-select, and nested concatenation are supported as \
+             operands): {other:?}"
+        )),
     }
 }
 

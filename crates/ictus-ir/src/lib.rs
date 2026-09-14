@@ -8,12 +8,12 @@
 //! interpreter-first sequencing this supports): a single flat module, no
 //! instances/hierarchy, no parameters/generate blocks, any number of
 //! clocked (`always @(posedge clk)`) processes and continuous `assign`s
-//! but no `always_comb` yet, `if`/`else` (no `else if`) and
+//! but no `always_comb` yet, `if`/`else`/`else if` and
 //! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
-//! assignment, constant bit-select/part-select on reads only (not
-//! concatenation, not a variable/signal-indexed select, not as an
-//! assignment target). Each of those is a documented gap to widen
-//! incrementally, not a final design.
+//! assignment, constant bit-select/part-select and concatenation on reads
+//! only (not a variable/signal-indexed select, not as an assignment
+//! target). Each of those is a documented gap to widen incrementally, not
+//! a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -69,6 +69,18 @@ pub enum Expr {
     /// the kernel rather than relying on masking happening later at
     /// signal-write time, since its width is exactly known.
     Select { base: Box<Expr>, msb: u32, lsb: u32 },
+    /// Concatenation (`{a, b, c}`), MSB-first (`a` occupies the highest
+    /// bits of the result) -- matching Verilog's own left-to-right order.
+    /// Each part carries its own bit width, computed by the frontend at
+    /// lowering time (see `ictus_frontend_verilog::expr_width`) rather
+    /// than re-derived by the kernel on every evaluation; this also means
+    /// only expression forms the frontend can determine a static width
+    /// for (literals, signal references, select, nested concatenation)
+    /// can appear as a concatenation operand -- arithmetic/comparison
+    /// results are rejected there rather than guessed at. Like `Select`,
+    /// this masks each part to its own declared width immediately during
+    /// evaluation, not deferred to signal-write time.
+    Concat(Vec<(Expr, u32)>),
 }
 
 #[derive(Debug, Clone)]

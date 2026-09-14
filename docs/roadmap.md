@@ -96,13 +96,34 @@ differential matches against Icarus Verilog:
   one's `else` branch, built by folding the chain from the last rung
   backward onto the final `else`.
 
+- `concat_test.v` (`{hi, lo}` and a 3-part `{1'b1, hi, lo}` mixing a
+  literal with signal references) -- `ictus-frontend-verilog/tests/concat.rs`
+  and `ictus-cli/tests/differential_concat.rs`. Concatenation operands
+  need each part's bit width known at lowering time to pack correctly
+  (`ictus_ir::Expr::Concat` carries `(Expr, u32)` pairs, not bare
+  `Expr`s) -- computed by a new `expr_width` helper that only accepts
+  operand forms with a statically-known width (literals, signal refs,
+  select, nested concatenation), rejecting anything else (arithmetic,
+  comparisons) rather than guessing at Verilog's real width-inference
+  rules. While implementing this, found and fixed a **pre-existing**
+  latent bug (not introduced by this change): a concatenation used as an
+  assignment target (`{a, b} <= x;` or `assign {a, b} = x;`) was not
+  actually being rejected the way the old doc comments claimed -- the
+  identifier search used to find the assignment target deep-searches past
+  the concatenation and finds `a` alone, so it would have silently
+  lowered the statement as a write to just `a`, discarding `b` and the
+  split-assignment semantics with no error at all. Fixed by explicitly
+  checking for the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue`
+  concatenation-target grammar variants before the identifier search
+  runs, in both `lower_nonblocking_assign` and `lower_continuous_assign`;
+  `concat.rs::rejects_concatenation_as_assignment_target` tests both.
+
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, constant bit-select/part-select on reads only (not `x[i]`,
-not as a write target, not concatenation `{a,b}`), no module
-instantiation. Cranelift codegen, phase 0's actual benchmark designs
-(picorv32 first), and the gaps above are all still ahead of where this
-stands today.
+`always_comb`, constant bit-select/part-select/concatenation on reads only
+(not `x[i]`, not as a write target), no module instantiation. Cranelift
+codegen, phase 0's actual benchmark designs (picorv32 first), and the
+gaps above are all still ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

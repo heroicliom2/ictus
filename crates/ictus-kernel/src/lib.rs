@@ -173,6 +173,13 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
         Expr::Select { base, msb, lsb } => {
             mask(eval_expr(base, values) >> lsb, msb - lsb + 1)
         }
+        Expr::Concat(parts) => {
+            let mut result = 0u64;
+            for (part, width) in parts {
+                result = (result << width) | mask(eval_expr(part, values), *width);
+            }
+            result
+        }
     }
 }
 
