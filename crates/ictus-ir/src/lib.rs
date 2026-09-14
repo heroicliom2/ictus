@@ -6,14 +6,16 @@
 //!
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
 //! interpreter-first sequencing this supports): a single flat module, no
-//! instances/hierarchy, no parameters/generate blocks, any number of
-//! clocked (`always @(posedge clk)`) processes and continuous `assign`s
-//! but no `always_comb` yet, `if`/`else`/`else if` and
-//! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
-//! assignment, constant bit-select/part-select and concatenation on reads
-//! only (not a variable/signal-indexed select, not as an assignment
-//! target). Each of those is a documented gap to widen incrementally, not
-//! a final design.
+//! instances/hierarchy, no parameters/generate blocks (so no array/memory
+//! signals either -- `reg [31:0] mem [0:31]`-style declarations aren't
+//! lowered, a distinct and likely-larger gap from bit-select on a single
+//! signal), any number of clocked (`always @(posedge clk)`) processes and
+//! continuous `assign`s but no `always_comb` yet, `if`/`else`/`else if`
+//! and `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
+//! assignment, constant and variable bit-select, constant part-select,
+//! and concatenation, all on reads only (no indexed part-select
+//! `x[base +: width]`, not as an assignment target). Each of those is a
+//! documented gap to widen incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -59,16 +61,29 @@ pub enum Expr {
     Ge(Box<Expr>, Box<Expr>),
     LogicalAnd(Box<Expr>, Box<Expr>),
     LogicalOr(Box<Expr>, Box<Expr>),
-    /// Bit-select (`x[3]`, `msb == lsb`) or part-select (`x[7:0]`).
-    /// `msb`/`lsb` are constants fixed at lowering time -- v1 doesn't
-    /// support a variable/signal-indexed select (`x[i]`), and doesn't
-    /// support a select as an *assignment target* (`x[3:0] <= v;`) either;
-    /// the frontend rejects both rather than silently lowering them as a
-    /// full-width reference/write. Unlike most other operators here, this
-    /// one masks its own result immediately (to `msb - lsb + 1` bits) in
-    /// the kernel rather than relying on masking happening later at
-    /// signal-write time, since its width is exactly known.
+    /// Bit-select (`x[3]`, `msb == lsb`) or part-select (`x[7:0]`), with a
+    /// *constant* index/bounds fixed at lowering time -- for a
+    /// runtime-computed index (`x[i]`), see `DynamicBitSelect` below.
+    /// Doesn't support a select as an *assignment target*
+    /// (`x[3:0] <= v;`); the frontend rejects that rather than silently
+    /// lowering it as a full-width write. Unlike most other operators
+    /// here, this one masks its own result immediately (to
+    /// `msb - lsb + 1` bits) in the kernel rather than relying on masking
+    /// happening later at signal-write time, since its width is exactly
+    /// known.
     Select { base: Box<Expr>, msb: u32, lsb: u32 },
+    /// Bit-select with a runtime-computed index (`x[i]`), always 1 bit
+    /// wide. No indexed *part*-select (`x[base +: width]`, a fixed width
+    /// at a variable base) yet -- only single-bit -- and, like `Select`,
+    /// not supported as an assignment target. An index that's out of
+    /// range for `base`'s width (including simply `>= 64`) returns 0
+    /// rather than panicking or propagating 'x' -- this kernel is 2-state
+    /// only (decisions.md D6) and has no 'x' to propagate; 0 is a
+    /// deliberate, documented choice, not an accident, but it does mean
+    /// this won't match a 4-state reference simulator's output for an
+    /// out-of-range index (see `ictus_kernel`'s test for this rather than
+    /// a differential one, for exactly that reason).
+    DynamicBitSelect { base: Box<Expr>, index: Box<Expr> },
     /// Concatenation (`{a, b, c}`), MSB-first (`a` occupies the highest
     /// bits of the result) -- matching Verilog's own left-to-right order.
     /// Each part carries its own bit width, computed by the frontend at

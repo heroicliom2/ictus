@@ -8,10 +8,11 @@
 //! see `lower_if` -- no new IR needed), `case`/`casez`/`casex`
 //! (wildcard bits only on a case *item*'s own literal -- see
 //! `lower_case`/`lower_case_value`), non-blocking assignment, internal
-//! `wire`/`reg` declarations (in addition to ports), constant
-//! bit-select/part-select and concatenation on the *read* side only
-//! (`x[3]`, `x[7:0]`, `{a,b}`; not `x[i]`, not as an assignment target --
-//! see `lower_select`/`lower_concatenation` and
+//! `wire`/`reg` declarations (in addition to ports), constant and
+//! variable bit-select, constant part-select, and concatenation, all on
+//! the *read* side only (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`; no indexed
+//! part-select `x[base +: width]`, not as an assignment target -- see
+//! `lower_select`/`lower_concatenation` and
 //! `reject_select_target`/the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue`
 //! checks in the two assignment-lowering functions), and expressions
 //! built from literals (decimal/binary/hex; not octal, not X/Z-valued
@@ -23,9 +24,10 @@
 //! Validation strategy) meaningless. Also lowers single-assignment
 //! continuous `assign target = expr;` statements (net-targeted only --
 //! see `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- variable-indexed select,
-//! `always_comb`, and module instantiation are the next-highest-value
-//! gaps toward running a real design like phase 0's picorv32 benchmark.
+//! later phases need more of the language -- array/memory signals
+//! (`reg [31:0] mem [0:31]`), `always_comb`, and module instantiation are
+//! the next-highest-value gaps toward running a real design like phase
+//! 0's picorv32 benchmark.
 
 use ictus_ir::{Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, Stmt};
 use std::path::Path;
@@ -595,12 +597,15 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Modul
     }
 }
 
-/// Applies a `Select` (`x[3]` or `x[7:0]`, or neither for a plain
-/// reference) to an already-lowered `base` expression. v1 requires every
-/// index/bound to be a constant, known at lowering time, not a
-/// variable/signal-indexed select (`x[i]`) -- and requires
-/// `PartSelectRange::ConstantRange` (`x[7:0]`) over `IndexedRange`
-/// (`x[base +: width]`), which isn't supported yet either.
+/// Applies a `Select` (`x[3]`, `x[i]`, `x[7:0]`, or neither for a plain
+/// reference) to an already-lowered `base` expression. Part-select bounds
+/// (`x[7:0]`) must still be constants known at lowering time --
+/// `PartSelectRange::ConstantRange` only, not `IndexedRange`
+/// (`x[base +: width]`, a variable base with fixed width), which isn't
+/// supported yet. A single bit-select's index (`x[3]` or `x[i]`) can now
+/// be anything: a constant literal lowers to `Expr::Select` as before,
+/// anything else (a signal reference, arithmetic, ...) lowers to
+/// `Expr::DynamicBitSelect` and is evaluated at simulation time.
 fn lower_select(
     select: &sv_parser::Select,
     base: Expr,
@@ -641,10 +646,10 @@ fn lower_select(
                     lsb: bit,
                 })
             }
-            _ => Err(
-                "bit-select index must be a plain numeric literal in v1 (variable/signal-indexed select is not supported)"
-                    .to_string(),
-            ),
+            index => Ok(Expr::DynamicBitSelect {
+                base: Box::new(base),
+                index: Box::new(index),
+            }),
         },
         _ => Err("multi-dimensional array indexing is not supported in v1".to_string()),
     }
@@ -694,6 +699,7 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         Expr::Literal { width, .. } => Ok(*width),
         Expr::Ref(id) => Ok(module.signals[*id].width),
         Expr::Select { msb, lsb, .. } => Ok(msb - lsb + 1),
+        Expr::DynamicBitSelect { .. } => Ok(1),
         Expr::Concat(parts) => Ok(parts.iter().map(|(_, w)| w).sum()),
         other => Err(format!(
             "concatenation operand's width can't be determined in v1 (only literals, signal \

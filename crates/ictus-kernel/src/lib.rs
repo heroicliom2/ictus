@@ -180,6 +180,19 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
             }
             result
         }
+        Expr::DynamicBitSelect { base, index } => {
+            let index = eval_expr(index, values);
+            // A `>= 64` shift on a u64 panics (it's undefined behavior
+            // for the underlying shift instruction) -- and any index
+            // beyond base's actual width is out of range regardless, so
+            // this also covers "in range for u64 but not for the real
+            // signal" the same way: 0, not a panic, not a guess.
+            if index >= 64 {
+                0
+            } else {
+                (eval_expr(base, values) >> index) & 1
+            }
+        }
     }
 }
 
@@ -284,5 +297,35 @@ mod tests {
         sim.set("resetn", 0);
         sim.tick();
         assert_eq!(sim.get("count"), 0);
+    }
+
+    #[test]
+    fn dynamic_bit_select_reads_correct_bit() {
+        // 0b1011_0010: bit0=0, bit1=1, bit3=0, bit4=1, bit7=1.
+        let base = Expr::Literal {
+            value: 0b1011_0010,
+            width: 8,
+        };
+        for (index, expected) in [(0u64, 0u64), (1, 1), (3, 0), (4, 1), (7, 1)] {
+            let expr = Expr::DynamicBitSelect {
+                base: Box::new(base.clone()),
+                index: Box::new(Expr::Literal { value: index, width: 3 }),
+            };
+            assert_eq!(eval_expr(&expr, &[]), expected, "bit {index} of 0b1011_0010");
+        }
+    }
+
+    /// An index this far out of range has no defined answer in a 2-state
+    /// kernel (see ictus_ir::Expr::DynamicBitSelect's doc comment) -- the
+    /// property actually worth guaranteeing is that it returns a value at
+    /// all rather than panicking, since `>> 64` on a u64 is undefined
+    /// behavior in Rust and this index is deliberately chosen to be `>= 64`.
+    #[test]
+    fn dynamic_bit_select_out_of_range_index_does_not_panic() {
+        let expr = Expr::DynamicBitSelect {
+            base: Box::new(Expr::Literal { value: 0xFF, width: 8 }),
+            index: Box::new(Expr::Literal { value: 100, width: 32 }),
+        };
+        assert_eq!(eval_expr(&expr, &[]), 0);
     }
 }

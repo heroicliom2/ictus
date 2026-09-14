@@ -118,12 +118,30 @@ differential matches against Icarus Verilog:
   runs, in both `lower_nonblocking_assign` and `lower_continuous_assign`;
   `concat.rs::rejects_concatenation_as_assignment_target` tests both.
 
+- `dynsel_test.v` (`data[idx]`, `idx` a signal rather than a literal) --
+  `ictus-frontend-verilog/tests/dynsel.rs` and
+  `ictus-cli/tests/differential_dynsel.rs` (holds `data` fixed and cycles
+  `idx` through all 8 bit positions, checked against Icarus). A new
+  `ictus_ir::Expr::DynamicBitSelect` handles the runtime-computed index;
+  an out-of-range index (including simply `>= 64`, which would otherwise
+  be undefined behavior for a `u64` shift) returns 0 rather than
+  panicking -- a deliberate, documented choice given the kernel is
+  2-state only and has no 'x' to propagate the way a 4-state reference
+  simulator would, tested directly in `ictus-kernel`'s own unit tests
+  rather than differentially for exactly that reason (it wouldn't, and
+  shouldn't be expected to, match Icarus's 'x' output for that case).
+  Indexed *part*-select (`x[base +: width]`, a fixed width at a variable
+  base) is still not supported -- only single-bit variable select.
+
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, constant bit-select/part-select/concatenation on reads only
-(not `x[i]`, not as a write target), no module instantiation. Cranelift
-codegen, phase 0's actual benchmark designs (picorv32 first), and the
-gaps above are all still ahead of where this stands today.
+`always_comb`, constant/variable bit-select, constant part-select, and
+concatenation on reads only (no indexed part-select, not as a write
+target), no array/memory signals (`reg [31:0] mem [0:31]` -- this is what
+picorv32's register file actually needs, and is a distinct, likely-larger
+gap from bit-select on a single signal), no module instantiation.
+Cranelift codegen, phase 0's actual benchmark designs (picorv32 first),
+and the gaps above are all still ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

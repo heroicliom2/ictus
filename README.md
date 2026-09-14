@@ -61,13 +61,14 @@ Phase 1 in progress (see docs/roadmap.md). A narrow Verilog subset (single
 module, any number of clocked `always @(posedge clk)` blocks and
 continuous `assign`s, `if`/`else`/`else if`, `case`/`casez`/`casex` with
 wildcard bits, non-blocking assignment, internal `wire`/`reg`
-declarations, constant bit-select/part-select/concatenation on reads
-(`x[3]`, `x[7:0]`, `{a,b}`), the operators `+ & | ^ == != < <= > >= && !`,
-decimal/hex/binary literals) parses, lowers to `ictus-ir`, and runs
-correctly on a tree-walking interpreter — checked with cycle-for-cycle
-differential tests against Icarus Verilog. Cranelift JIT codegen,
-variable-indexed select, and the phase 0 benchmark designs (picorv32
-first) are all still ahead of where this stands today.
+declarations, constant/variable bit-select, constant part-select, and
+concatenation on reads (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`), the operators
+`+ & | ^ == != < <= > >= && !`, decimal/hex/binary literals) parses,
+lowers to `ictus-ir`, and runs correctly on a tree-walking interpreter —
+checked with cycle-for-cycle differential tests against Icarus Verilog.
+Cranelift JIT codegen, array/memory signals (picorv32's register file
+needs these), and the rest of the phase 0 benchmark designs are all still
+ahead of where this stands today.
 
 ## Workspace layout
 
