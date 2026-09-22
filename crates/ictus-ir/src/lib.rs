@@ -21,7 +21,11 @@
 //! `lower_multiple_concatenation`), the ternary operator, and
 //! `$signed(...)` (see `Expr::Signed`'s doc comment -- only well enough
 //! to sign-extend a value into a wider assignment target, not as an
-//! operand of an ordering comparison) on reads (no indexed part-select
+//! operand of an ordering comparison), logical `!`, bitwise complement
+//! `~`, and the reduction operators `& | ^ ~& ~| ~^`/`^~` (see
+//! `Expr::BitwiseNot`/`ReduceAnd`/`ReduceOr`/`ReduceXor`'s doc comments --
+//! the NAND/NOR/XNOR forms compose `BitwiseNot` with a reduction rather
+//! than getting their own variants) on reads (no indexed part-select
 //! `x[base +: width]`), plus
 //! a constant bit-select/part-select
 //! as a non-blocking-assignment *target* (`x[7:0] <= v;`) -- a variable
@@ -62,14 +66,37 @@ pub struct Signal {
 pub enum Expr {
     Literal { value: u64, width: u32 },
     Ref(SignalId),
-    /// Logical negation (`!`) -- result is always 0 or 1. Bitwise `~` is
-    /// not supported yet: doing it correctly needs each sub-expression's
-    /// width tracked so the complement gets masked at the point of
-    /// negation, not just when the final result is written to a signal
-    /// (see docs/decisions.md and this crate's kernel counterpart for why
-    /// write-time-only masking is fine for the operators below but not for
-    /// `~`).
+    /// Logical negation (`!`) -- result is always 0 or 1.
     Not(Box<Expr>),
+    /// Bitwise complement (`~x`) -- inverts *every* bit, unlike `Not`
+    /// (logical `!`), which collapses the whole operand to a single 0/1.
+    /// Carries the operand's own natural width (the same value
+    /// `ictus_frontend_verilog::expr_width` would compute for it) because,
+    /// unlike the binary bitwise operators below, complementing needs to
+    /// know exactly where to stop flipping bits: `!x` on an 8-bit `x` must
+    /// mask its result to 8 bits immediately, not leave the high 56 bits
+    /// of the underlying `u64` set and rely on masking happening later at
+    /// signal-write time the way `And`/`Or`/`Xor`/`Add` safely can (those
+    /// never *introduce* a 1 bit above the operands' own width, so
+    /// write-time masking alone is already correct for them; complementing
+    /// unset-but-out-of-range bits would, if not masked immediately).
+    BitwiseNot(Box<Expr>, u32),
+    /// Reduction AND (`&x`) -- folds every bit of a (width `u32`) operand
+    /// down to a single bit: 1 only if *every* bit is 1. `~&x` (reduction
+    /// NAND) is this composed with `BitwiseNot` at lowering time (see
+    /// `ictus-frontend-verilog::lower_expr`'s `E::Unary` arm), not a
+    /// separate variant -- there's nothing it needs beyond that
+    /// composition.
+    ReduceAnd(Box<Expr>, u32),
+    /// Reduction OR (`|x`) -- 1 if *any* bit of a (width `u32`) operand is
+    /// set. `~|x` (reduction NOR) composes with `BitwiseNot`, the same way
+    /// `~&x` composes with `ReduceAnd` above.
+    ReduceOr(Box<Expr>, u32),
+    /// Reduction XOR (`^x`, parity) -- 1 if an *odd* number of bits in a
+    /// (width `u32`) operand are 1. `~^x`/`^~x` (reduction XNOR) composes
+    /// with `BitwiseNot`, the same way `~&x` composes with `ReduceAnd`
+    /// above.
+    ReduceXor(Box<Expr>, u32),
     Add(Box<Expr>, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),

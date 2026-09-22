@@ -82,11 +82,14 @@ also supported, split into one write per part at lowering time. The
 value into a wider assignment target (not yet as an operand of a signed
 comparison). A call to a *provably-empty* task (`some_task;`) is
 supported as a true no-op — picorv32's own `` `assert(...) `` macro
-relies on exactly this. Unary bitwise/reduction operators (`~`, `&`,
-`|`, `^`, `~&`, `~|`, `~^`/`^~` — only logical `!` is supported so far),
-array/memory signals (picorv32's register file needs these), module
-instantiation, and Cranelift JIT codegen are all still ahead of where
-this stands today.
+relies on exactly this. Unary bitwise complement (`~`) and the reduction
+operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) are also supported now.
+`localparam` (a separate grammar production from `parameter`, needing
+cross-parameter references, the ternary operator, and multiplication in
+its value expression — picorv32's register-index-width computation needs
+all three), array/memory signals (picorv32's register file needs these),
+module instantiation, and Cranelift JIT codegen are all still ahead of
+where this stands today.
 
 ## Workspace layout
 

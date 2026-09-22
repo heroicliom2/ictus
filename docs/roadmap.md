@@ -409,32 +409,108 @@ replicating a 16-/8-bit field to build a wider write-data word
   a non-constant count (a signal, not a literal) and a count of `0`, both
   confirmed rejected with a clear, specific error.
 
-**Next confirmed blocker**: unary bitwise/reduction operators. Re-running
-the picorv32 diagnostic after the replication fix hits `~&` (reduction
-NAND) as the next unsupported unary operator -- `lower_expr`'s
-`E::Unary` arm only recognizes logical `!` today. Verilog's unary
-operators on a vector operand include plain bitwise `~` (complement) and
-six *reduction* operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) that fold
-an entire multi-bit operand down to a single bit -- a materially
-different operation from `~`, not a variant of it, and not yet attempted.
+**Unary bitwise/reduction operators**: done. Re-running the picorv32
+diagnostic after the replication fix hit `~&` (reduction NAND) as the
+next unsupported unary operator -- `lower_expr`'s `E::Unary` arm only
+recognized logical `!` before this. Verilog's unary operators on a
+vector operand also include plain bitwise `~` (complement) and six
+*reduction* operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) that fold an
+entire multi-bit operand down to a single bit -- a materially different
+operation from `~`, not a variant of it, so all of them were implemented
+together as one coherent unit rather than chasing them one at a time.
+
+- Four new `Expr` variants: `BitwiseNot(Box<Expr>, u32)`, `ReduceAnd`,
+  `ReduceOr`, `ReduceXor` (each `(Box<Expr>, u32)`), all carrying the
+  *operand's* width -- needed at evaluation time (to know where to stop
+  complementing bits, or how many bits to fold over), computed via the
+  existing `expr_width` helper at lowering time, same pattern `Expr::
+  Signed` already established. Reduction NAND/NOR/XNOR (`~& ~| ~^`/`^~`)
+  get **no dedicated variant**: they're lowered as the corresponding
+  reduction wrapped in a 1-bit `BitwiseNot` (`~&x` becomes
+  `BitwiseNot(ReduceAnd(x, width), 1)`), reusing `BitwiseNot`'s own
+  correct-by-construction bit-complement-and-mask behavior on a
+  known-1-bit value instead of adding three more near-identical variants.
+- `ictus_kernel::eval_expr` masks `BitwiseNot`'s complement to its
+  declared width immediately (`mask(!eval_expr(inner), width)`) rather
+  than leaving the high bits of the underlying `u64` set and relying on
+  masking happening later at signal-write time the way `And`/`Or`/`Xor`/
+  `Add` safely can (those operators never introduce a stray 1 bit above
+  the operands' own width; complementing does). `ReduceAnd`/`Or`/`Xor`
+  mask the operand first, then fold: all-ones-compare, nonzero-check, and
+  `count_ones() % 2` respectively.
+- Verified per this project's usual practice: one fixture exercising the
+  whole family on the same 4-bit input (`!x ~x &x |x ^x ~&x ~|x ~^x`),
+  with `~&x` written in the exact style picorv32 uses
+  (`~&mem_rdata_latched[1:0]`) -- checked structurally
+  (`ictus-frontend-verilog/tests/unary_ops.rs`, confirming both the
+  correct `Expr` shape for each operator and, for the composed NAND/NOR/
+  XNOR forms, the `BitwiseNot`-wrapping-a-reduction shape specifically)
+  and differentially against Icarus Verilog across five input values
+  chosen to exercise all-zeros, all-ones, and both odd/even bit-parity
+  cases (`ictus-cli/tests/differential_unary_ops.rs`). `ictus_kernel`'s
+  own unit tests additionally isolate the masking and folding behavior
+  from the frontend.
+
+**Next confirmed blocker**: `localparam`, and with it, general
+compile-time constant-expression evaluation -- a materially bigger lift
+than the last several increments, not a natural one-line extension of
+what exists. Re-running the picorv32 diagnostic after the unary-operator
+fix hits `regindex_bits`, an unresolved identifier, because
+`lower_parameters` only ever walks `RefNode::ParameterDeclarationParam`
+(`#(parameter ...)`) -- `localparam` is a *separate* grammar production
+this frontend has never looked for at all. Worse, the specific value
+expression that broke it needs three things at once, none supported by
+`lower_constant_param_value`'s narrow constant-expression walk (built
+only to pull a single `Number` out of a `parameter`'s default):
+
+```verilog
+localparam integer regindex_bits =
+    (ENABLE_REGS_16_31 ? 5 : 4) + ENABLE_IRQ*ENABLE_IRQ_QREGS;
+```
+
+- **Cross-parameter references**: `lower_parameters`'s own doc comment
+  already flags this as an explicit, known-but-unverified gap ("a
+  parameter default referencing another parameter isn't supported...not
+  needed by picorv32's own parameters" -- that assumption just broke:
+  `regindex_bits` references three other parameters directly).
+- **The ternary operator** inside a constant expression.
+- **Multiplication** (`*`) -- not an operator `apply_binary_op` handles
+  at all yet, constant-context or otherwise; the first arithmetic
+  operator beyond `+` this frontend would need.
+
+Solving this properly likely means `lower_constant_param_value` (or a
+successor) needs to route through something much closer to the general
+`lower_expr` -- with parameters already resolved to `Expr::Literal`
+available for reference the way `lower_primary` already checks
+`module.parameters` -- rather than staying a special-purpose
+single-`Number` extractor, plus a real decision about how `localparam`
+fits into `Ctx`/`lower_parameters`'s existing structure (same table as
+`parameter`, since both resolve to plain constants the kernel never
+sees? a separate pass?) and whether/how multiplication generalizes
+beyond just constant-folding into the *general* expression grammar
+`lower_expr` handles for signal-valued (non-constant) arithmetic too.
+Worth a real decision (and likely a decisions.md entry) before picking
+an approach, not a default -- not yet attempted.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, module parameters (defaults must be constant literals, no
-overriding at instantiation), constant/variable bit-select and constant
-part-select, concatenation (plain and replication) and ternary on reads
-only, a constant bit-select/part-select -- or a concatenation of such --
-as a non-blocking (`<=`) assignment target but not a continuous
-(`assign`) one and not with a variable index, `$signed(...)` to
-sign-extend a value into a wider assignment target but not as an operand
-of an ordering comparison (and no other system function), a call to a
-provably-empty task but no other task/function calls, logical `!` but no
-unary bitwise/reduction operators, no array/memory signals (`reg [31:0]
-mem [0:31]` -- this is what picorv32's register file actually needs, and
-is a distinct, likely-larger gap from bit-select on a single signal), no
-module instantiation. Cranelift codegen and actually getting picorv32
-fully through the pipeline are both still ahead of where this stands
-today.
+`always_comb`, module `parameter`s (not `localparam`; defaults must be
+constant literals, no overriding at instantiation, no cross-parameter
+references, no operators beyond what a bare literal needs), constant/
+variable bit-select and constant part-select, concatenation (plain and
+replication) and ternary on reads only, a constant bit-select/part-select
+-- or a concatenation of such -- as a non-blocking (`<=`) assignment
+target but not a continuous (`assign`) one and not with a variable
+index, `$signed(...)` to sign-extend a value into a wider assignment
+target but not as an operand of an ordering comparison (and no other
+system function), a call to a provably-empty task but no other
+task/function calls, logical `!`, bitwise `~`, and the reduction
+operators, but no multiplication or any other arithmetic operator beyond
+`+`, no array/memory signals (`reg [31:0] mem [0:31]` -- this is what
+picorv32's register file actually needs, and is a distinct, likely-larger
+gap from bit-select on a single signal), no module instantiation.
+Cranelift codegen and actually getting picorv32 fully through the
+pipeline are both still ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

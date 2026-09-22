@@ -182,8 +182,18 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
         Expr::Ref(id) => values[*id],
         // Verilog `!` is logical negation (result is 0 or 1), not a
         // bitwise complement across the operand's width -- that's `~`,
-        // which this frontend doesn't lower yet.
+        // handled by `BitwiseNot` below.
         Expr::Not(inner) => bool_val(eval_expr(inner, values) == 0),
+        Expr::BitwiseNot(inner, width) => mask(!eval_expr(inner, values), *width),
+        Expr::ReduceAnd(inner, width) => {
+            let value = mask(eval_expr(inner, values), *width);
+            bool_val(value == mask(u64::MAX, *width))
+        }
+        Expr::ReduceOr(inner, width) => bool_val(mask(eval_expr(inner, values), *width) != 0),
+        Expr::ReduceXor(inner, width) => {
+            let value = mask(eval_expr(inner, values), *width);
+            bool_val(value.count_ones() % 2 == 1)
+        }
         Expr::Add(lhs, rhs) => eval_expr(lhs, values).wrapping_add(eval_expr(rhs, values)),
         Expr::And(lhs, rhs) => eval_expr(lhs, values) & eval_expr(rhs, values),
         Expr::Or(lhs, rhs) => eval_expr(lhs, values) | eval_expr(rhs, values),
@@ -365,6 +375,42 @@ mod tests {
         sim.set("resetn", 0);
         sim.tick();
         assert_eq!(sim.get("count"), 0);
+    }
+
+    /// `~x` masks its complement to exactly `x`'s own declared width,
+    /// rather than leaving the high bits of the underlying `u64` set --
+    /// the reason `BitwiseNot` carries a width at all instead of relying
+    /// on masking happening later at signal-write time (see its doc
+    /// comment in `ictus_ir`).
+    #[test]
+    fn bitwise_not_masks_to_its_own_width() {
+        let expr = Expr::BitwiseNot(Box::new(Expr::Literal { value: 0b0101, width: 4 }), 4);
+        assert_eq!(eval_expr(&expr, &[]), 0b1010);
+    }
+
+    #[test]
+    fn reduction_operators_fold_correctly() {
+        let all_ones = Expr::Literal { value: 0b1111, width: 4 };
+        let has_a_zero = Expr::Literal { value: 0b1011, width: 4 };
+        let all_zeros = Expr::Literal { value: 0b0000, width: 4 };
+        let odd_parity = Expr::Literal { value: 0b0111, width: 4 }; // 3 ones
+        let even_parity = Expr::Literal { value: 0b0101, width: 4 }; // 2 ones
+
+        assert_eq!(eval_expr(&Expr::ReduceAnd(Box::new(all_ones.clone()), 4), &[]), 1);
+        assert_eq!(eval_expr(&Expr::ReduceAnd(Box::new(has_a_zero), 4), &[]), 0);
+
+        assert_eq!(eval_expr(&Expr::ReduceOr(Box::new(all_zeros.clone()), 4), &[]), 0);
+        assert_eq!(eval_expr(&Expr::ReduceOr(Box::new(all_ones.clone()), 4), &[]), 1);
+
+        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(odd_parity), 4), &[]), 1);
+        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(even_parity), 4), &[]), 0);
+        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(all_zeros), 4), &[]), 0);
+
+        // Reduction NAND/NOR/XNOR are BitwiseNot(ReduceX(...), 1) at the
+        // frontend level -- confirm that composition evaluates correctly
+        // here too, not just that the frontend builds the right tree.
+        let nand = Expr::BitwiseNot(Box::new(Expr::ReduceAnd(Box::new(all_ones), 4)), 1);
+        assert_eq!(eval_expr(&nand, &[]), 0, "NAND of all-ones is 0");
     }
 
     /// Two non-blocking assignments to *disjoint* bit ranges of the same

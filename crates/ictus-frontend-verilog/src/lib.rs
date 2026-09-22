@@ -36,8 +36,13 @@
 //! `<=` has a commit phase to do the read-modify-write in -- see the
 //! `NetLvalue::Lvalue` check in `lower_continuous_assign`. And expressions
 //! built from literals (decimal/binary/hex; not octal, not X/Z-valued
-//! outside a case item), signal references, unary `!`, the binary
-//! operators `+ & | ^ == != < <= > >= && ||`, and the `$signed(...)`
+//! outside a case item), signal references, unary logical `!`, bitwise
+//! complement `~`, and the reduction operators `& | ^ ~& ~| ~^`/`^~` (see
+//! `lower_expr`'s `E::Unary` arm and `ictus_ir::Expr::BitwiseNot`/
+//! `ReduceAnd`/`ReduceOr`/`ReduceXor`'s doc comments -- NAND/NOR/XNOR
+//! compose `BitwiseNot` with a reduction at lowering time rather than
+//! getting their own IR), the binary operators
+//! `+ & | ^ == != < <= > >= && ||`, and the `$signed(...)`
 //! system function (see `lower_system_function_call` and
 //! `ictus_ir::Expr::Signed`'s doc comment -- v1 only implements this well
 //! enough to sign-extend a value into a wider assignment target, which is
@@ -67,14 +72,19 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- unary bitwise/reduction
-//! operators (`~`, and the reduction forms `& | ^ ~& ~| ~^`/`^~`; only
-//! logical `!` is lowered today -- see `lower_expr`'s `E::Unary` arm,
-//! which is what picorv32 hits next, right after the replication-
-//! concatenation support above), array/memory signals (`reg [31:0] mem
-//! [0:31]`), `always_comb`, and module instantiation are the
-//! next-highest-value gaps toward running a real design like phase 0's
-//! picorv32 benchmark.
+//! later phases need more of the language -- `localparam` (a separate
+//! grammar production from `parameter`, not lowered at all yet -- see
+//! `lower_parameters`, which only walks `RefNode::ParameterDeclarationParam`),
+//! with a value expression that may need cross-parameter references, the
+//! ternary operator, and multiplication (none of which
+//! `lower_constant_param_value`'s restricted constant-expression walk
+//! handles -- this is what picorv32 hits next, in `localparam integer
+//! regindex_bits = (ENABLE_REGS_16_31 ? 5 : 4) +
+//! ENABLE_IRQ*ENABLE_IRQ_QREGS;`, right after the unary-operator support
+//! above -- a materially bigger lift than the last several increments,
+//! not attempted yet), array/memory signals (`reg [31:0] mem [0:31]`),
+//! `always_comb`, and module instantiation are the next-highest-value
+//! gaps toward running a real design like phase 0's picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -977,6 +987,47 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
             let operand = lower_primary(&unary.nodes.2, tree, module)?;
             match op_text {
                 "!" => Ok(Expr::Not(Box::new(operand))),
+                "~" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::BitwiseNot(Box::new(operand), width))
+                }
+                "&" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::ReduceAnd(Box::new(operand), width))
+                }
+                "|" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::ReduceOr(Box::new(operand), width))
+                }
+                "^" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::ReduceXor(Box::new(operand), width))
+                }
+                // Reduction NAND/NOR/XNOR are just the corresponding
+                // reduction op composed with a 1-bit BitwiseNot -- no
+                // dedicated Expr variant needed (see their doc comments in
+                // ictus_ir).
+                "~&" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::BitwiseNot(
+                        Box::new(Expr::ReduceAnd(Box::new(operand), width)),
+                        1,
+                    ))
+                }
+                "~|" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::BitwiseNot(
+                        Box::new(Expr::ReduceOr(Box::new(operand), width)),
+                        1,
+                    ))
+                }
+                "~^" | "^~" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::BitwiseNot(
+                        Box::new(Expr::ReduceXor(Box::new(operand), width)),
+                        1,
+                    ))
+                }
                 other => Err(format!("unsupported unary operator '{other}'")),
             }
         }
@@ -1355,6 +1406,13 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         // regardless of signedness; only an assignment-like context
         // (outside this function's concern) triggers sign extension.
         Expr::Signed(_, width) => Ok(*width),
+        // `BitwiseNot`'s stored width *is* its own result's width (`~x`
+        // preserves `x`'s width). A reduction operator's stored width is
+        // its *operand's* width (needed for evaluation, see
+        // `ictus_kernel::eval_expr`) -- the reduction's own result is
+        // always exactly 1 bit, regardless of what it reduced.
+        Expr::BitwiseNot(_, width) => Ok(*width),
+        Expr::ReduceAnd(..) | Expr::ReduceOr(..) | Expr::ReduceXor(..) => Ok(1),
         other => Err(format!(
             "concatenation operand's width can't be determined in v1 (only literals, signal \
              references, bit-select/part-select, nested concatenation, and ternary are \
