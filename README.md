@@ -63,9 +63,10 @@ module, ports that may inherit direction in a list, any number of clocked
 if`, `case`/`casez`/`casex` with wildcard bits, non-blocking assignment,
 internal `wire`/`reg` declarations naming one or more signals each,
 module parameters resolved to constants at lowering time,
-constant/variable bit-select, constant part-select, concatenation, and
-the ternary operator on reads (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`,
-`c ? a : b`), plus a *constant* bit-select/part-select as a non-blocking
+constant/variable bit-select, constant part-select, concatenation
+(including replication, `{N{a,b}}`), and the ternary operator on reads
+(`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`, `{4{a,b}}`, `c ? a : b`), plus a
+*constant* bit-select/part-select as a non-blocking
 assignment target (`x[7:0] <= v;`, with correct read-modify-write
 semantics in the kernel — the rest of the signal's bits are left
 untouched, and multiple partial writes to the same signal in one clock
@@ -81,10 +82,11 @@ also supported, split into one write per part at lowering time. The
 value into a wider assignment target (not yet as an operand of a signed
 comparison). A call to a *provably-empty* task (`some_task;`) is
 supported as a true no-op — picorv32's own `` `assert(...) `` macro
-relies on exactly this. Replication/multiple concatenation
-(`{4{1'b0}}`), array/memory signals (picorv32's register file needs
-these), module instantiation, and Cranelift JIT codegen are all still
-ahead of where this stands today.
+relies on exactly this. Unary bitwise/reduction operators (`~`, `&`,
+`|`, `^`, `~&`, `~|`, `~^`/`^~` — only logical `!` is supported so far),
+array/memory signals (picorv32's register file needs these), module
+instantiation, and Cranelift JIT codegen are all still ahead of where
+this stands today.
 
 ## Workspace layout
 

@@ -15,9 +15,14 @@
 //! resolved to plain `Expr::Literal`s at lowering time and substituted
 //! directly into every reference -- see `lower_parameters`; a parameter
 //! is not a signal and never appears in `ictus_ir::Module` at all),
-//! constant and variable bit-select, constant part-select, concatenation,
-//! and the ternary operator on the *read* side (`x[3]`, `x[i]`, `x[7:0]`,
-//! `{a,b}`, `c ? a : b`; no indexed part-select `x[base +: width]`), plus
+//! constant and variable bit-select, constant part-select, concatenation
+//! (plain `{a,b}` and replication/multiple concatenation `{N{a,b}}` --
+//! see `lower_multiple_concatenation`, which needs no new IR: the count
+//! must fold to a compile-time constant, same restriction a bit-select/
+//! part-select bound already has, and the result is just the inner
+//! concatenation's own parts physically repeated `N` times), and the
+//! ternary operator on the *read* side (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`,
+//! `{4{a,b}}`, `c ? a : b`; no indexed part-select `x[base +: width]`), plus
 //! on the *assignment-target* side: a *constant* bit-select/part-select as
 //! a non-blocking-assignment target (`x[7:0] <= v;`, picorv32's
 //! `mem_rdata_q[...] <= ...` style -- see `lower_select_target_range`),
@@ -62,12 +67,12 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- replication/multiple
-//! concatenation (`{4{1'b0}}`, i.e. `{N{expr}}`; see
-//! `sv_parser::Primary::MultipleConcatenation`, which `lower_primary`
-//! doesn't handle yet -- this is what picorv32 hits next, right after the
-//! task-call-statement support above), array/memory signals (`reg [31:0]
-//! mem [0:31]`), `always_comb`, and module instantiation are the
+//! later phases need more of the language -- unary bitwise/reduction
+//! operators (`~`, and the reduction forms `& | ^ ~& ~| ~^`/`^~`; only
+//! logical `!` is lowered today -- see `lower_expr`'s `E::Unary` arm,
+//! which is what picorv32 hits next, right after the replication-
+//! concatenation support above), array/memory signals (`reg [31:0] mem
+//! [0:31]`), `always_comb`, and module instantiation are the
 //! next-highest-value gaps toward running a real design like phase 0's
 //! picorv32 benchmark.
 
@@ -1123,6 +1128,15 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) 
             }
             lower_concatenation(&concat.nodes.0, tree, module)
         }
+        P::MultipleConcatenation(mc) => {
+            if mc.nodes.1.is_some() {
+                return Err(
+                    "indexing into a replication concatenation (`{4{a}}[3:0]`) is not supported in v1"
+                        .to_string(),
+                );
+            }
+            lower_multiple_concatenation(&mc.nodes.0, tree, module)
+        }
         P::FunctionSubroutineCall(call) => lower_system_function_call(call, tree, module),
         other => Err(format!("primary expression form not supported in v1: {other:?}")),
     }
@@ -1264,6 +1278,57 @@ fn lower_concatenation(
         parts.push((lowered, width));
     }
     Ok(Expr::Concat(parts))
+}
+
+/// Lowers a replication/multiple concatenation (`{4{a}}`, `{2{a,b}}` --
+/// Verilog's `{N{...}}` syntax, distinct from the plain `{a,b}`
+/// concatenation `lower_concatenation` handles): the inner `{...}` is
+/// lowered exactly like any other concatenation, and the count `N` --
+/// which must reduce to a compile-time constant, same restriction as a
+/// bit-select/part-select bound (see `lower_constant_index`) -- says how
+/// many times to repeat its parts. No new IR is needed: since the count
+/// is known at lowering time, the result is just a flat `Expr::Concat`
+/// whose part list is the inner concatenation's own parts, physically
+/// repeated (each repetition an independent clone -- there's nothing
+/// shared to alias) `N` times in a row, exactly as if the source had
+/// written that many literal copies of `{...}` back to back. A count of
+/// `0` is legal Verilog (a deliberate zero-width contribution, typically
+/// used inside a *larger* concatenation) but not supported in v1 --
+/// `Expr::Concat` can't represent an empty part list any more than a
+/// plain `{}` can (see `lower_concatenation`'s identical restriction).
+fn lower_multiple_concatenation(
+    mc: &sv_parser::MultipleConcatenation,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Expr, String> {
+    let (count_expr, concat) = &mc.nodes.0.nodes.1;
+
+    let count = match lower_expr(count_expr, tree, module)? {
+        Expr::Literal { value, .. } => value,
+        _ => {
+            return Err(
+                "a replication count (`{N{...}}`) must be a compile-time constant in v1"
+                    .to_string(),
+            )
+        }
+    };
+    if count == 0 {
+        return Err(
+            "a replication count of 0 (`{0{...}}`) is not supported in v1 (Expr::Concat can't \
+             represent an empty part list)"
+                .to_string(),
+        );
+    }
+
+    let Expr::Concat(parts) = lower_concatenation(concat, tree, module)? else {
+        unreachable!("lower_concatenation always returns Expr::Concat");
+    };
+
+    let mut replicated = Vec::with_capacity(parts.len() * count as usize);
+    for _ in 0..count {
+        replicated.extend(parts.iter().cloned());
+    }
+    Ok(Expr::Concat(replicated))
 }
 
 /// Computes a statically-known bit width for an already-lowered

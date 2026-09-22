@@ -14,10 +14,15 @@
 //! but no `always_comb` yet, `if`/`else`/`else if` and
 //! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
 //! assignment, constant and variable bit-select, constant part-select,
-//! concatenation, the ternary operator, and `$signed(...)` (see `Expr::
-//! Signed`'s doc comment -- only well enough to sign-extend a value into
-//! a wider assignment target, not as an operand of an ordering
-//! comparison) on reads (no indexed part-select `x[base +: width]`), plus
+//! concatenation (including replication/multiple concatenation,
+//! `{N{a,b}}` -- also just an `Expr::Concat`, its part list physically
+//! repeated `N` times by the frontend at lowering time rather than given
+//! its own IR representation; see `ictus-frontend-verilog`'s
+//! `lower_multiple_concatenation`), the ternary operator, and
+//! `$signed(...)` (see `Expr::Signed`'s doc comment -- only well enough
+//! to sign-extend a value into a wider assignment target, not as an
+//! operand of an ordering comparison) on reads (no indexed part-select
+//! `x[base +: width]`), plus
 //! a constant bit-select/part-select
 //! as a non-blocking-assignment *target* (`x[7:0] <= v;`) -- a variable
 //! index or indexed range as a target isn't supported, and neither is a

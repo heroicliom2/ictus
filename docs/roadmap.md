@@ -372,33 +372,69 @@ assertions are compiled out.
   confirming a task with a real (non-empty) body and a task call with an
   argument are both still rejected.
 
-**Next confirmed blocker**: replication/multiple concatenation
-(`{4{1'b0}}`, i.e. Verilog's `{N{expr}}` repeat-concatenation syntax --
-`sv_parser::Primary::MultipleConcatenation`, distinct from the plain
-`{a,b}` concatenation already supported). Re-running the picorv32
-diagnostic after the task-call fix hits this as the very next parse
-error. Not yet attempted -- likely a natural extension of the existing
-`lower_concatenation`/`Expr::Concat` machinery (replicate one already-
-lowered, already-width-known operand `N` times, matching `expr_width`'s
-existing rules) rather than a new design fork the way task-call
-statements were.
+**Replication/multiple concatenation** (`{4{1'b0}}`, i.e. Verilog's
+`{N{expr}}` repeat-concatenation syntax -- `sv_parser::Primary::
+MultipleConcatenation`, distinct from the plain `{a,b}` concatenation
+already supported): done, confirming the guess in the previous version of
+this section -- a natural extension of the existing machinery, not a new
+design fork the way task-call statements were. picorv32 uses it three
+times, all real usage sites read directly rather than guessed at: a
+1-bit flag replicated to a byte-wide enable mask
+(`mem_wstrb <= mem_la_wstrb & {4{mem_la_write}};`) and two cases
+replicating a 16-/8-bit field to build a wider write-data word
+(`mem_la_wdata = {2{reg_op2[15:0]}};`).
+
+- New `lower_multiple_concatenation` needs no new IR: the replication
+  count must fold to a compile-time constant (`lower_expr`'s result must
+  be `Expr::Literal`, the same restriction a bit-select/part-select bound
+  already has -- a signal-dependent count is rejected, not deferred to
+  runtime, since `Expr::Concat`'s part list has to be a fixed size at
+  lowering time), and the result is the inner `{...}`'s own parts
+  (lowered exactly like any other concatenation via the existing
+  `lower_concatenation`), physically cloned and repeated `N` times in a
+  row into one flat `Expr::Concat` -- as if the source had written that
+  many literal copies of `{...}` back to back. A count of `0` (legal
+  Verilog for a deliberate zero-width contribution) is rejected in v1,
+  same reasoning as a plain empty `{}` already being rejected:
+  `Expr::Concat` can't represent an empty part list.
+- Verified per this project's usual practice: a fixture covering both
+  real shapes picorv32 uses -- a single-expression replication
+  (`{8{flag}}`, mirroring the `mem_wstrb`/`mem_la_write` style) *and*
+  replicating a multi-part inner concatenation (`{2{a, b}}`, mirroring
+  the `mem_la_wdata` style, and a genuinely different code path through
+  `lower_multiple_concatenation` than the single-expression case) --
+  checked structurally (`ictus-frontend-verilog/tests/replicate.rs`) and
+  differentially against Icarus Verilog
+  (`ictus-cli/tests/differential_replicate.rs`). Plus two negative tests:
+  a non-constant count (a signal, not a literal) and a count of `0`, both
+  confirmed rejected with a clear, specific error.
+
+**Next confirmed blocker**: unary bitwise/reduction operators. Re-running
+the picorv32 diagnostic after the replication fix hits `~&` (reduction
+NAND) as the next unsupported unary operator -- `lower_expr`'s
+`E::Unary` arm only recognizes logical `!` today. Verilog's unary
+operators on a vector operand include plain bitwise `~` (complement) and
+six *reduction* operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) that fold
+an entire multi-bit operand down to a single bit -- a materially
+different operation from `~`, not a variant of it, and not yet attempted.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
 `always_comb`, module parameters (defaults must be constant literals, no
 overriding at instantiation), constant/variable bit-select and constant
-part-select on reads (no indexed part-select), plain concatenation (not
-yet replication/`{N{expr}}`) and ternary on reads only, a constant
-bit-select/part-select -- or a concatenation of such -- as a non-blocking
-(`<=`) assignment target but not a continuous (`assign`) one and not with
-a variable index, `$signed(...)` to sign-extend a value into a wider
-assignment target but not as an operand of an ordering comparison (and no
-other system function), a call to a provably-empty task but no other
-task/function calls, no array/memory signals (`reg [31:0] mem [0:31]` --
-this is what picorv32's register file actually needs, and is a distinct,
-likely-larger gap from bit-select on a single signal), no module
-instantiation. Cranelift codegen and actually getting picorv32 fully
-through the pipeline are both still ahead of where this stands today.
+part-select, concatenation (plain and replication) and ternary on reads
+only, a constant bit-select/part-select -- or a concatenation of such --
+as a non-blocking (`<=`) assignment target but not a continuous
+(`assign`) one and not with a variable index, `$signed(...)` to
+sign-extend a value into a wider assignment target but not as an operand
+of an ordering comparison (and no other system function), a call to a
+provably-empty task but no other task/function calls, logical `!` but no
+unary bitwise/reduction operators, no array/memory signals (`reg [31:0]
+mem [0:31]` -- this is what picorv32's register file actually needs, and
+is a distinct, likely-larger gap from bit-select on a single signal), no
+module instantiation. Cranelift codegen and actually getting picorv32
+fully through the pipeline are both still ahead of where this stands
+today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.
