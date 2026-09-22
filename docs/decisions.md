@@ -562,3 +562,68 @@ different kind of gap entirely -- task-call statements (`` `assert(...) ``
 expands to a call to an empty no-op task in picorv32) -- not another
 expression-lowering feature, and is left as an open, deliberately
 undecided fork in `docs/roadmap.md` rather than guessed at.
+
+## D17 — Task calls: accept only a provably-empty *callee body*, not any zero-arg call
+
+**Decision**: a task-call statement (`some_task;`) is accepted, and
+lowered as a true no-op (zero `ictus_ir::Stmt`s), only when the *called
+task's own declared body* is provably empty -- every top-level statement
+in it is a no-op, checked recursively through `begin...end` blocks by a
+new `statement_is_noop` helper. This resolves the fork D16's closing
+paragraph deliberately left open rather than guessed at: the alternative
+was to accept *any* zero-argument task call as a no-op, regardless of
+what the called task's body actually contains. That more general rule
+was rejected. A task call with any arguments at all is rejected
+regardless of the callee's body, since v1 has no notion of task ports to
+bind arguments to in the first place.
+
+**Why the conservative choice, not the general one**: v1 doesn't model
+task execution at all -- no ports, no local variables, no statement
+bodies actually run. Accepting "any zero-argument call is a no-op"
+would be correct *by observation* for every real call site in picorv32
+today (there's exactly one: `` `assert(...) ``'s expansion to
+`empty_statement;`), but it would be a rule that happens to work for the
+input on hand, not one that's actually verified against the thing it
+claims -- a different design (or a later, unnoticed addition to
+picorv32's own `empty_statement`, or a different empty-seeming macro
+expansion) calling a task that actually sets a signal, waits on a clock
+edge, or has any other real behavior would have that behavior silently
+discarded, with no error, no warning, nothing -- exactly the
+silently-wrong-answer failure mode this project's entire differential-
+testing discipline exists to prevent (see
+[[ictus-development-practice]]). Checking the callee's actual declared
+body costs one extra AST scan (`lower_task_declarations`, structurally
+identical to the existing `lower_parameters` scan) and turns that same
+hypothetical into a loud, specific rejection (`call to task 'X' is not
+supported in v1 -- only a call to a task whose body is provably empty...`)
+instead of silence.
+
+**Why the recursive emptiness check, not a shallow one**: the first
+implementation attempt checked only `Vec<StatementOrNull>::is_empty()` at
+the task's own top level and failed on the *exact* real case this feature
+exists for -- picorv32's `empty_statement` task body is written as
+`begin end` (one `SeqBlock` statement, itself containing zero statements),
+not literally zero statements at the top level. `statement_is_noop`
+recurses into `begin...end` blocks (and also accepts a bare null
+statement, `;`, with no attributes) specifically to still correctly
+reject any *actual* statement no matter how deeply nested inside
+otherwise-empty blocks, rather than either failing on this real case (the
+shallow check) or accepting too much (e.g. treating a block as empty
+without actually checking its contents).
+
+**Why discovered / confirmed, not assumed**: found the same way as D13
+through D16 -- re-running the picorv32 diagnostic after D16 landed
+surfaced this as the next blocker; the real call site (`` `assert ``'s
+macro expansion, picorv32.v line 47, and the task declaration itself,
+line 214) was read directly, including noticing the `begin end` body
+shape that the shallow-emptiness-check first attempt missed (caught by
+actually re-running the diagnostic after that first attempt, not assumed
+correct). Verified with a fixture mirroring picorv32's own style
+directly, checked both structurally (the call contributes zero
+statements) and differentially against Icarus Verilog (surrounding
+counter logic is bit-for-bit unaffected by the call), plus two negative
+fixtures confirming a task with a real body and a task call with an
+argument are both still rejected. Re-running the diagnostic again after
+this fix confirms the next blocker is replication/multiple concatenation
+(`{N{expr}}`), a data-path expression feature rather than another
+statement-form gap.

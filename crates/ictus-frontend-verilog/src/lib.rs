@@ -39,7 +39,15 @@
 //! all picorv32 needs it for on the write side; using it as an operand of
 //! `< <= > >=` is rejected rather than silently doing an unsigned
 //! comparison, since a real signed *ordering* comparison isn't
-//! implemented -- see `apply_binary_op`'s guard). `lower_expr`'s
+//! implemented -- see `apply_binary_op`'s guard). Also lowers a
+//! statement-level call to a *provably-empty* task (`some_task;`, no
+//! arguments -- see `lower_task_call_statement` and
+//! `lower_task_declarations`) as a true no-op, since v1 doesn't model
+//! task execution at all; picorv32 relies on exactly this for its own
+//! `` `assert(...) `` macro, which expands to a call to a deliberately-empty
+//! task when assertions are compiled out. A call to any other task (a
+//! real body, arguments, a system task, a task not declared in this
+//! module) is rejected, not silently treated as a no-op. `lower_expr`'s
 //! `E::Binary` arm also corrects a real `sv-parser` precedence-handling
 //! gap: it
 //! mis-associates an *unparenthesized* ternary immediately following a
@@ -54,18 +62,19 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- blocking assignment (`=`
-//! inside an `always` block; only non-blocking `<=` is lowered today --
-//! see `lower_statement_item`'s catch-all error, which is what picorv32
-//! hits next after `$signed`), array/memory signals (`reg [31:0] mem
-//! [0:31]`), `always_comb`, and module instantiation are the
+//! later phases need more of the language -- replication/multiple
+//! concatenation (`{4{1'b0}}`, i.e. `{N{expr}}`; see
+//! `sv_parser::Primary::MultipleConcatenation`, which `lower_primary`
+//! doesn't handle yet -- this is what picorv32 hits next, right after the
+//! task-call-statement support above), array/memory signals (`reg [31:0]
+//! mem [0:31]`), `always_comb`, and module instantiation are the
 //! next-highest-value gaps toward running a real design like phase 0's
 //! picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use sv_parser::{
     parse_sv, unwrap_node, AlwaysConstruct, AnsiPortDeclaration, ConditionalStatement,
@@ -74,18 +83,22 @@ use sv_parser::{
     StatementOrNull, SyntaxTree,
 };
 
-/// Bundles the module being lowered with its resolved parameter table,
-/// threaded through expression lowering so `lower_primary` can resolve an
-/// identifier against either. Derefs to `Module` so every existing
-/// `module.signal_id(...)`/`module.signals[...]` call site throughout
-/// this file keeps working unchanged -- only `lower_primary` needs
-/// `.parameters` directly. Parameters themselves never appear in the
-/// final `ictus_ir::Module`: each reference is fully resolved to an
-/// `Expr::Literal` during lowering (see `lower_parameters`), so the IR
-/// and the kernel never need to know parameters exist at all.
+/// Bundles the module being lowered with its resolved parameter table and
+/// its set of provably-empty task names, threaded through statement/
+/// expression lowering so `lower_primary`/`lower_task_call_statement` can
+/// resolve an identifier against them. Derefs to `Module` so every
+/// existing `module.signal_id(...)`/`module.signals[...]` call site
+/// throughout this file keeps working unchanged -- only those two
+/// functions need the extra fields directly. Neither parameters nor
+/// tasks ever appear in the final `ictus_ir::Module`: a parameter
+/// reference is fully resolved to an `Expr::Literal` during lowering (see
+/// `lower_parameters`), and a call to an empty task lowers to no
+/// statements at all (see `lower_task_declarations`), so the IR and the
+/// kernel never need to know either existed.
 struct Ctx<'a> {
     module: &'a Module,
     parameters: &'a HashMap<String, (u64, u32)>,
+    empty_tasks: &'a HashSet<String>,
 }
 
 impl<'a> std::ops::Deref for Ctx<'a> {
@@ -128,6 +141,12 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     // order -- see lower_parameters.
     let parameters = lower_parameters(module_node, &tree)?;
 
+    // Scanned up front, same reasoning as parameters: a task-call
+    // statement (see lower_task_call_statement) needs to know whether the
+    // task it names has a provably-empty body before it can decide
+    // whether to accept the call as a no-op.
+    let empty_tasks = lower_task_declarations(module_node, &tree)?;
+
     // A port that omits its own `input`/`output` keyword (`input clk,
     // resetn,` -- resetn has no keyword of its own) inherits the
     // direction of the previous port in the same list, per IEEE 1800 --
@@ -166,6 +185,7 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     let ctx = Ctx {
         module: &module,
         parameters: &parameters,
+        empty_tasks: &empty_tasks,
     };
 
     let mut clocked_processes = Vec::new();
@@ -262,6 +282,72 @@ fn lower_constant_param_value(
     match lower_number(number, tree)? {
         Expr::Literal { value, .. } => Ok(value),
         _ => unreachable!("lower_number always returns Expr::Literal"),
+    }
+}
+
+/// Scans every `task ... endtask` declaration in the module and returns
+/// the names of the ones with a *provably empty* body -- every one of its
+/// top-level statements is a no-op per `statement_is_noop` (recursing
+/// into `begin...end` blocks, since picorv32's own `empty_statement` task
+/// is written as `begin end`, not literally zero top-level statements;
+/// local variable/port declarations inside the task don't affect this
+/// check either way, since declaring a local does nothing observable on
+/// its own). This is the only thing v1 ever learns about a task: it
+/// doesn't model task execution, ports, or local state at all, so a call
+/// is only ever accepted (as a no-op -- see `lower_task_call_statement`)
+/// when the task's body is provably empty; a task with any real statement
+/// in it, at any nesting depth, is left out of the returned set entirely;
+/// downstream, a call to a name that isn't in the set is rejected the
+/// same way whether that's because the task has a real body or because
+/// no such task exists.
+fn lower_task_declarations(
+    module_node: &sv_parser::ModuleDeclarationAnsi,
+    tree: &SyntaxTree,
+) -> Result<HashSet<String>, String> {
+    let mut empty_tasks = HashSet::new();
+
+    for node in module_node.into_iter() {
+        let RefNode::TaskDeclaration(task) = node else {
+            continue;
+        };
+
+        let (name_node, is_empty) = match &task.nodes.2 {
+            sv_parser::TaskBodyDeclaration::WithoutPort(body) => {
+                (&body.nodes.1, body.nodes.4.iter().all(statement_is_noop))
+            }
+            sv_parser::TaskBodyDeclaration::WithPort(body) => {
+                (&body.nodes.1, body.nodes.5.iter().all(statement_is_noop))
+            }
+        };
+        let ident = unwrap_node!(name_node, SimpleIdentifier).ok_or("task identifier unreadable")?;
+        let name = ident_str(ident, tree).ok_or("task identifier unreadable")?;
+
+        if is_empty {
+            empty_tasks.insert(name.to_string());
+        }
+    }
+
+    Ok(empty_tasks)
+}
+
+/// A statement counts as a no-op for `lower_task_declarations`'s
+/// emptiness check if it's a null statement (`;`, with no attributes --
+/// attributes can carry tool directives, so one is conservatively treated
+/// as *not* provably a no-op) or a `begin...end` block whose own
+/// statements are *all*, recursively, no-ops -- picorv32's own
+/// `empty_statement` task body is exactly `begin end`, an empty block,
+/// not literally zero statements at the task's top level, so checking
+/// only `Vec<StatementOrNull>::is_empty()` at that one level would miss
+/// it. Any other statement kind (even a single one, nested arbitrarily
+/// deep inside otherwise-empty blocks) makes the whole task not provably
+/// empty.
+fn statement_is_noop(stmt: &StatementOrNull) -> bool {
+    match stmt {
+        StatementOrNull::Attribute(attr) => attr.nodes.0.is_empty(),
+        StatementOrNull::Statement(s) => match &s.nodes.2 {
+            StatementItem::SeqBlock(seq) => seq.nodes.3.iter().all(statement_is_noop),
+            _ => false,
+        },
     }
 }
 
@@ -454,10 +540,66 @@ fn lower_statement_item(
         }
         StatementItem::ConditionalStatement(cond) => Ok(vec![lower_if(cond, tree, module)?]),
         StatementItem::CaseStatement(case) => Ok(vec![lower_case(case, tree, module)?]),
+        StatementItem::SubroutineCallStatement(call) => lower_task_call_statement(call, tree, module),
         _ => Err(
-            "statement form not supported in v1 (only begin/end blocks, if/else, case, and non-blocking assignment)"
+            "statement form not supported in v1 (only begin/end blocks, if/else, case, \
+             non-blocking assignment, and a call to a provably-empty task)"
                 .to_string(),
         ),
+    }
+}
+
+/// Lowers a task-call statement (`some_task;`) -- v1 doesn't model task
+/// execution at all (no ports, no local state, no statement bodies run),
+/// so the only call this can honestly accept is one to a task whose body
+/// is *provably empty* (see `lower_task_declarations`), lowered as zero
+/// statements (a true no-op) rather than guessed at. picorv32 relies on
+/// exactly this: its own `` `assert(...) `` macro expands, when
+/// assertions are compiled out, to a call to `empty_statement;`, a
+/// deliberately-empty task used as a no-op placeholder. A call to any
+/// *other* task -- one with a real body, or one not declared in this
+/// module at all (a system task, a task from another scope, `disable`,
+/// ...) -- is rejected rather than silently treated as a no-op, since
+/// that could just as easily discard real behavior in a different
+/// design; so could a call *with* arguments (even to an otherwise-empty
+/// task, since v1 has no notion of task ports to bind them to), so that's
+/// rejected too.
+fn lower_task_call_statement(
+    call: &sv_parser::SubroutineCallStatement,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Vec<Stmt>, String> {
+    let sv_parser::SubroutineCallStatement::SubroutineCall(inner) = call else {
+        return Err("this task/function call statement form is not supported in v1".to_string());
+    };
+    let (subroutine_call, _semicolon) = &**inner;
+    let sv_parser::SubroutineCall::TfCall(tf_call) = subroutine_call else {
+        return Err(
+            "only a plain task call is supported in v1 (no system task, method call, or randomize())"
+                .to_string(),
+        );
+    };
+
+    if tf_call.nodes.2.is_some() {
+        return Err(
+            "a task call with arguments is not supported in v1 (only a call to a \
+             provably-empty, zero-argument task)"
+                .to_string(),
+        );
+    }
+
+    let ident = unwrap_node!(&tf_call.nodes.0, SimpleIdentifier)
+        .ok_or("task call identifier unreadable")?;
+    let name = ident_str(ident, tree).ok_or("task call identifier unreadable")?;
+
+    if module.empty_tasks.contains(name) {
+        Ok(Vec::new())
+    } else {
+        Err(format!(
+            "call to task '{name}' is not supported in v1 -- only a call to a task whose body \
+             is provably empty (a no-op placeholder, e.g. picorv32's own `empty_statement`) is \
+             supported"
+        ))
     }
 }
 

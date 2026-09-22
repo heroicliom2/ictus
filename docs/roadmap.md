@@ -335,41 +335,70 @@ Verilog `signed` semantics:
   error, using a fixture shaped exactly like picorv32's own `alu_lts`
   line.
 
-**Next confirmed blocker**: task-call statements. Re-running the
-picorv32 diagnostic after the `$signed` fix hits a *different* kind of
-gap than the last three entries: `` `assert(assert_expr) `` is `` `define ``-d
-(picorv32.v line 47) to expand to a call to `empty_statement;`, a
-deliberately-empty task (line 214) used as a no-op placeholder when
-formal-verification assertions are compiled out -- and
-`lower_statement_item` has no case for a subroutine-call statement at
-all yet. Not yet attempted: unlike the three entries above, this isn't a
-data-path feature, so it doesn't obviously extend anything already
-built. A real fork worth resolving deliberately before implementing,
-not guessing at: does v1 gain enough of Verilog's task-call grammar to
-call *any* zero-argument task and simply run its (currently
-always-empty, in every real body this frontend can already lower) body
-as a no-op sequence of statements -- generalizable, but risks silently
-skipping real behavior in some *other* design's task that isn't empty --
-or does it special-case *only* a provably-empty task body (matching this
-exact case) as a no-op, more conservative but a narrower, single-purpose
-carve-out? Worth a real decision (and a decisions.md entry) before
-picking, not a default.
+**Task-call statements**: done, resolving the fork this section previously
+left open in favor of the conservative option -- a call is only accepted
+when the *called task's own body* is provably empty, not generalized to
+"any zero-argument task call is a no-op." picorv32's own `` `assert(assert_expr) ``
+is `` `define ``-d (picorv32.v line 47) to expand to a call to
+`empty_statement;`, a deliberately-empty task (line 214, written as
+`begin end`) used as a no-op placeholder when formal-verification
+assertions are compiled out.
+
+- New `lower_task_declarations` scans every `task ... endtask` in the
+  module up front (same pattern as `lower_parameters`) and records the
+  names of tasks whose body is *provably empty* -- every top-level
+  statement is a no-op via a new recursive `statement_is_noop` helper,
+  which treats a null statement (`;`) or a `begin...end` block whose own
+  statements are all, recursively, no-ops as empty. The recursion into
+  `begin...end` matters: picorv32's `empty_statement` body is literally
+  `begin end`, one block statement containing nothing, not zero
+  statements at the task's own top level -- checking only
+  `Vec<StatementOrNull>::is_empty()` at that one level would have missed
+  it and wrongly rejected the exact case this feature exists for.
+- New `lower_task_call_statement` (wired into `lower_statement_item`)
+  handles `some_task;` -- a call with any arguments at all is rejected
+  outright (v1 has no notion of task ports to bind them to), and a call
+  to a name not in the empty-task set is rejected with the same error
+  whether that's because the task has real statements in it or because no
+  such task exists. An accepted call lowers to `Vec::new()`: zero
+  `ictus_ir::Stmt`s, a true no-op, needing no new IR at all.
+- Verified per this project's usual practice: a fixture mirroring
+  picorv32's own style directly (`task_call_test.v`, an empty
+  `begin end` task called in the middle of a counter's clocked process)
+  checked both structurally (the call contributes zero statements --
+  `ictus-frontend-verilog/tests/task_call.rs`) and differentially against
+  Icarus Verilog (the counter's behavior is unaffected by the call --
+  `ictus-cli/tests/differential_task_call.rs`), plus two negative fixtures
+  confirming a task with a real (non-empty) body and a task call with an
+  argument are both still rejected.
+
+**Next confirmed blocker**: replication/multiple concatenation
+(`{4{1'b0}}`, i.e. Verilog's `{N{expr}}` repeat-concatenation syntax --
+`sv_parser::Primary::MultipleConcatenation`, distinct from the plain
+`{a,b}` concatenation already supported). Re-running the picorv32
+diagnostic after the task-call fix hits this as the very next parse
+error. Not yet attempted -- likely a natural extension of the existing
+`lower_concatenation`/`Expr::Concat` machinery (replicate one already-
+lowered, already-width-known operand `N` times, matching `expr_width`'s
+existing rules) rather than a new design fork the way task-call
+statements were.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
 `always_comb`, module parameters (defaults must be constant literals, no
 overriding at instantiation), constant/variable bit-select and constant
-part-select on reads (no indexed part-select), concatenation and ternary
-on reads only, a constant bit-select/part-select -- or a concatenation of
-such -- as a non-blocking (`<=`) assignment target but not a continuous
-(`assign`) one and not with a variable index, `$signed(...)` to
-sign-extend a value into a wider assignment target but not as an operand
-of an ordering comparison (and no other system function), no task/function
-calls, no array/memory signals (`reg [31:0] mem [0:31]` -- this is what
-picorv32's register file actually needs, and is a distinct, likely-larger
-gap from bit-select on a single signal), no module instantiation.
-Cranelift codegen and actually getting picorv32 fully through the
-pipeline are both still ahead of where this stands today.
+part-select on reads (no indexed part-select), plain concatenation (not
+yet replication/`{N{expr}}`) and ternary on reads only, a constant
+bit-select/part-select -- or a concatenation of such -- as a non-blocking
+(`<=`) assignment target but not a continuous (`assign`) one and not with
+a variable index, `$signed(...)` to sign-extend a value into a wider
+assignment target but not as an operand of an ordering comparison (and no
+other system function), a call to a provably-empty task but no other
+task/function calls, no array/memory signals (`reg [31:0] mem [0:31]` --
+this is what picorv32's register file actually needs, and is a distinct,
+likely-larger gap from bit-select on a single signal), no module
+instantiation. Cranelift codegen and actually getting picorv32 fully
+through the pipeline are both still ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

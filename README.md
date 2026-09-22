@@ -79,10 +79,12 @@ were found. A concatenation of such targets (`{a, b[3:0]} <= v;`) is
 also supported, split into one write per part at lowering time. The
 `$signed(...)` system function is supported well enough to sign-extend a
 value into a wider assignment target (not yet as an operand of a signed
-comparison). Task-call statements (`` `assert(...) `` expands to one in
-picorv32), array/memory signals (picorv32's register file needs these),
-module instantiation, and Cranelift JIT codegen are all still ahead of
-where this stands today.
+comparison). A call to a *provably-empty* task (`some_task;`) is
+supported as a true no-op — picorv32's own `` `assert(...) `` macro
+relies on exactly this. Replication/multiple concatenation
+(`{4{1'b0}}`), array/memory signals (picorv32's register file needs
+these), module instantiation, and Cranelift JIT codegen are all still
+ahead of where this stands today.
 
 ## Workspace layout
 

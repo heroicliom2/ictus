@@ -27,7 +27,11 @@
 //! (`{a, b[3:0]} <= v;`) needs no IR support of its own at all -- the
 //! frontend splits it into several plain `Stmt::NonBlockingAssign`s, one
 //! per part, at lowering time (see `ictus-frontend-verilog`'s
-//! `lower_concat_target_assign`). Each of those is a documented gap to
+//! `lower_concat_target_assign`). Likewise, a call to a *provably-empty*
+//! task (`some_task;`) needs no IR support either -- the frontend lowers
+//! it as zero statements, a true no-op (see
+//! `lower_task_call_statement`); a call to any other task is rejected
+//! rather than silently dropped. Each of those is a documented gap to
 //! widen incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
