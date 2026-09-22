@@ -451,66 +451,134 @@ together as one coherent unit rather than chasing them one at a time.
   own unit tests additionally isolate the masking and folding behavior
   from the frontend.
 
-**Next confirmed blocker**: `localparam`, and with it, general
-compile-time constant-expression evaluation -- a materially bigger lift
-than the last several increments, not a natural one-line extension of
-what exists. Re-running the picorv32 diagnostic after the unary-operator
-fix hits `regindex_bits`, an unresolved identifier, because
-`lower_parameters` only ever walks `RefNode::ParameterDeclarationParam`
-(`#(parameter ...)`) -- `localparam` is a *separate* grammar production
-this frontend has never looked for at all. Worse, the specific value
-expression that broke it needs three things at once, none supported by
-`lower_constant_param_value`'s narrow constant-expression walk (built
-only to pull a single `Number` out of a `parameter`'s default):
+**`localparam` and general compile-time constant-expression evaluation**:
+done -- the materially bigger lift the previous version of this section
+flagged, not a natural one-line extension of what existed, and it took a
+real design pass rather than a default. Closes `regindex_bits` and every
+other `localparam`/cross-parameter-reference gap found in picorv32 in one
+pass, not just the one line that first surfaced it:
 
 ```verilog
 localparam integer regindex_bits =
     (ENABLE_REGS_16_31 ? 5 : 4) + ENABLE_IRQ*ENABLE_IRQ_QREGS;
 ```
 
-- **Cross-parameter references**: `lower_parameters`'s own doc comment
-  already flags this as an explicit, known-but-unverified gap ("a
-  parameter default referencing another parameter isn't supported...not
-  needed by picorv32's own parameters" -- that assumption just broke:
-  `regindex_bits` references three other parameters directly).
-- **The ternary operator** inside a constant expression.
-- **Multiplication** (`*`) -- not an operator `apply_binary_op` handles
-  at all yet, constant-context or otherwise; the first arithmetic
-  operator beyond `+` this frontend would need.
+- `lower_parameters` now resolves `#(parameter ...)` *and* `localparam`
+  in one combined pass, into one shared name table -- both are just
+  named compile-time constants once instantiation-time overriding is out
+  of scope (as it already was), so there was no real reason to keep them
+  separate. Walking the whole module once, in source order, growing the
+  same table as it goes, is what makes cross-references work at all: a
+  `localparam` can reference an *earlier* `parameter` simply because the
+  `#(parameter ...)` port list is always visited first, by source order
+  -- a pragmatic "declaration precedes use" assumption, not a real
+  dependency solve, but correct for every real case found so far.
+- New `lower_constant_expr`/`lower_constant_primary` walk Verilog's
+  *constant*-expression grammar (`ConstantExpression`/`ConstantPrimary`
+  -- a genuinely separate parallel hierarchy from the general
+  `Expression`/`Primary` grammar, required wherever Verilog demands a
+  compile-time constant: parameter/localparam values, and packed-range
+  bounds) structurally for the first time, building an ordinary
+  `ictus_ir::Expr` via the *same* `apply_binary_op` the general grammar
+  uses -- one definition of what each operator means, not two. This is
+  also where multiplication (`Expr::Mul`) and subtraction (`Expr::Sub`)
+  were added as real operators, alongside the existing `+`, since the
+  general expression grammar needed `-` too (see below) and there was no
+  reason to make `*`/`-` constant-only.
+- New `try_const_fold(&Expr) -> Option<u64>` folds a closed (no signal
+  reference) `Expr` tree down to a plain value -- deliberately exhaustive
+  over every `Expr` variant (no wildcard arm), mirroring
+  `ictus_kernel::eval_expr`'s own logic (duplicated across the crate
+  boundary on purpose: constant folding is a frontend/elaboration-time
+  concern, evaluation is the kernel's runtime concern -- different
+  phases, so the overlap is expected, not a sign the crates should share
+  code). This one helper is reused everywhere a compile-time constant is
+  now required: a `parameter`/`localparam` default, a packed-range bound
+  (`lower_packed_range`, now threaded with the parameter table so
+  `reg [regindex_bits-1:0] decoded_rd, decoded_rs1;` resolves correctly),
+  a constant part-select bound (`lower_constant_index`, unified onto the
+  same walk instead of keeping its own separate, less capable one), and
+  -- the case that needed a genuine design decision, not just plumbing --
+  a bit-select *target*'s index lowered through the *general* expression
+  grammar (`lower_select_target_range`'s single-bit arm), which is how
+  `decoded_rs1[regindex_bits-1] <= 1;` resolves: `regindex_bits` becomes
+  `Expr::Literal` via `lower_primary`'s existing parameter fallback, so
+  the whole `Expr::Sub(Literal, Literal)` tree `lower_expr` builds for
+  the index is foldable, even though the same code path would just as
+  happily build `Expr::Sub(Ref(signal), Literal)` for a genuinely
+  non-constant index (correctly left as `None`, still rejected). The
+  read-side single-bit-select (`lower_select`) picked up the identical
+  upgrade for consistency, replacing its old "must literally already be
+  `Expr::Literal`" check with the same fold.
+- Confirmed by empirically debugging *through* sv-parser's own grammar,
+  not just picorv32's, along the way: a **bare parameter reference with
+  no parentheses at all** (picorv32's own `ENABLE_REGS_16_31`, 17
+  characters) can parse as `ConstantPrimary::ConstantFunctionCall`
+  instead of `::PsParameter` -- a real sv-parser grammar ambiguity (the
+  same *kind* of finding as D13's ternary-precedence bug, though not the
+  same bug). Confirmed there's no actual `function` anywhere in
+  picorv32.v, so a zero-argument "constant function call" is always
+  really just a parameter reference the parser classified differently;
+  handled by treating it exactly like `PsParameter` (a *non*-zero-argument
+  one is rejected -- that would be a genuine constant function call,
+  which v1 doesn't implement at all).
+- Also needed, once real picorv32 `localparam`s were actually run through
+  this: logical `||` (picorv32's `WITH_PCPI = ENABLE_PCPI || ENABLE_MUL
+  || ...;`) and concatenation (picorv32's `TRACE_BRANCH = {4'b 0001,
+  32'b 0};`) inside a constant expression -- both fall out of the same
+  `try_const_fold`/`lower_constant_primary` design already described
+  above, not separate features.
+- Verified per this project's usual practice, with a fixture chosen to
+  hit every real shape found (cross-parameter reference, ternary,
+  multiplication, logical OR, a packed-range bound referencing a
+  localparam, and a bit-select *target* index referencing one) --
+  checked structurally (`ictus-frontend-verilog/tests/localparam.rs`)
+  and, most importantly, differentially against Icarus Verilog
+  (`ictus-cli/tests/differential_localparam.rs`): Icarus independently
+  computes the same constant expressions from scratch, so an exact trace
+  match is strong evidence the arithmetic/ternary/cross-reference
+  resolution is bit-for-bit correct, not just "didn't error." A separate
+  fixture covers the concatenation-value case
+  (`localparam_concat_test.v`), and a negative test confirms a reference
+  to an undeclared parameter is rejected with a clear error rather than
+  silently treated as 0.
 
-Solving this properly likely means `lower_constant_param_value` (or a
-successor) needs to route through something much closer to the general
-`lower_expr` -- with parameters already resolved to `Expr::Literal`
-available for reference the way `lower_primary` already checks
-`module.parameters` -- rather than staying a special-purpose
-single-`Number` extractor, plus a real decision about how `localparam`
-fits into `Ctx`/`lower_parameters`'s existing structure (same table as
-`parameter`, since both resolve to plain constants the kernel never
-sees? a separate pass?) and whether/how multiplication generalizes
-beyond just constant-folding into the *general* expression grammar
-`lower_expr` handles for signal-valued (non-constant) arithmetic too.
-Worth a real decision (and likely a decisions.md entry) before picking
-an approach, not a default -- not yet attempted.
+**Next confirmed blocker**: a 4-state `x`/`z` digit in a literal *outside*
+a `case`/`casez`/`casex` item. Re-running the picorv32 diagnostic after
+the `localparam` fix hits `could not parse binary literal 'x'` --
+`lower_number`'s binary-literal parser only accepts `0`/`1` digits when
+the literal isn't inside a case item's own wildcard-aware parsing (see
+`lower_case_value`). Not yet attempted, and unlike the last several
+entries, this needs a real policy decision before implementation, not
+just more grammar coverage: this kernel is 2-state only (decisions.md
+D6) with no real `x`/`z` value to represent, so accepting an `x`/`z`
+digit in an ordinary read expression means choosing what it *means* here
+(reads as 0? as a don't-care that's silently resolved somehow? rejected
+in some contexts but not others?) -- a genuine design question, not a
+default.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, module `parameter`s (not `localparam`; defaults must be
-constant literals, no overriding at instantiation, no cross-parameter
-references, no operators beyond what a bare literal needs), constant/
-variable bit-select and constant part-select, concatenation (plain and
-replication) and ternary on reads only, a constant bit-select/part-select
--- or a concatenation of such -- as a non-blocking (`<=`) assignment
-target but not a continuous (`assign`) one and not with a variable
-index, `$signed(...)` to sign-extend a value into a wider assignment
-target but not as an operand of an ordering comparison (and no other
-system function), a call to a provably-empty task but no other
-task/function calls, logical `!`, bitwise `~`, and the reduction
-operators, but no multiplication or any other arithmetic operator beyond
-`+`, no array/memory signals (`reg [31:0] mem [0:31]` -- this is what
-picorv32's register file actually needs, and is a distinct, likely-larger
-gap from bit-select on a single signal), no module instantiation.
-Cranelift codegen and actually getting picorv32 fully through the
-pipeline are both still ahead of where this stands today.
+`always_comb`, `#(parameter ...)` *and* `localparam` sharing one
+resolution pass (value expressions may reference an earlier parameter/
+localparam, and use `+ - * & | ^ == != < <= > >= && ||`, the ternary
+operator, and concatenation; no overriding a `parameter` at
+instantiation), constant/variable bit-select and constant part-select,
+concatenation (plain and replication) and ternary on reads only, a
+constant bit-select/part-select -- or a concatenation of such -- as a
+non-blocking (`<=`) assignment target but not a continuous (`assign`)
+one and not with a variable index (though the index/bound *may*
+reference a parameter/localparam, per the constant-folding work above),
+`$signed(...)` to sign-extend a value into a wider assignment target but
+not as an operand of an ordering comparison (and no other system
+function), a call to a provably-empty task but no other task/function
+calls, logical `!`, bitwise `~`, and the reduction operators, no 4-state
+`x`/`z` literal outside a case item, no array/memory signals (`reg
+[31:0] mem [0:31]` -- this is what picorv32's register file actually
+needs, and is a distinct, likely-larger gap from bit-select on a single
+signal), no module instantiation. Cranelift codegen and actually getting
+picorv32 fully through the pipeline are both still ahead of where this
+stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

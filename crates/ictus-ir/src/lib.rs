@@ -6,14 +6,14 @@
 //!
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
 //! interpreter-first sequencing this supports): a single flat module, no
-//! instances/hierarchy, no module parameters (`#(parameter ...)`) and no
-//! generate blocks (so no array/memory signals either -- `reg [31:0] mem
-//! [0:31]`-style declarations aren't lowered, a distinct and
-//! likely-larger gap from bit-select on a single signal), any number of
-//! clocked (`always @(posedge clk)`) processes and continuous `assign`s
-//! but no `always_comb` yet, `if`/`else`/`else if` and
-//! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
-//! assignment, constant and variable bit-select, constant part-select,
+//! instances/hierarchy and no generate blocks (so no array/memory
+//! signals either -- `reg [31:0] mem [0:31]`-style declarations aren't
+//! lowered, a distinct and likely-larger gap from bit-select on a single
+//! signal), any number of clocked (`always @(posedge clk)`) processes
+//! and continuous `assign`s but no `always_comb` yet, `if`/`else`/
+//! `else if` and `case`/`casez`/`casex` (see `CaseValue`) alongside
+//! non-blocking assignment, `+ - * & | ^` and comparison/logical
+//! operators, constant and variable bit-select, constant part-select,
 //! concatenation (including replication/multiple concatenation,
 //! `{N{a,b}}` -- also just an `Expr::Concat`, its part list physically
 //! repeated `N` times by the frontend at lowering time rather than given
@@ -40,8 +40,16 @@
 //! task (`some_task;`) needs no IR support either -- the frontend lowers
 //! it as zero statements, a true no-op (see
 //! `lower_task_call_statement`); a call to any other task is rejected
-//! rather than silently dropped. Each of those is a documented gap to
-//! widen incrementally, not a final design.
+//! rather than silently dropped. Neither does `#(parameter ...)` or
+//! `localparam`: a reference is fully resolved to a plain `Expr::Literal`
+//! at lowering time (see `ictus-frontend-verilog`'s `lower_parameters`/
+//! `lower_constant_expr`), so `Module` has no notion of a parameter
+//! existing at all, and a default/value expression can reference an
+//! earlier parameter, use the ternary operator, and use arithmetic --
+//! including multiplication, which the general expression grammar
+//! supports too (`Expr::Mul`), not just the constant-expression one. Each
+//! of those is a documented gap to widen incrementally, not a final
+//! design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).
@@ -98,6 +106,8 @@ pub enum Expr {
     /// above.
     ReduceXor(Box<Expr>, u32),
     Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Xor(Box<Expr>, Box<Expr>),

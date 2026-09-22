@@ -195,6 +195,8 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
             bool_val(value.count_ones() % 2 == 1)
         }
         Expr::Add(lhs, rhs) => eval_expr(lhs, values).wrapping_add(eval_expr(rhs, values)),
+        Expr::Sub(lhs, rhs) => eval_expr(lhs, values).wrapping_sub(eval_expr(rhs, values)),
+        Expr::Mul(lhs, rhs) => eval_expr(lhs, values).wrapping_mul(eval_expr(rhs, values)),
         Expr::And(lhs, rhs) => eval_expr(lhs, values) & eval_expr(rhs, values),
         Expr::Or(lhs, rhs) => eval_expr(lhs, values) | eval_expr(rhs, values),
         Expr::Xor(lhs, rhs) => eval_expr(lhs, values) ^ eval_expr(rhs, values),

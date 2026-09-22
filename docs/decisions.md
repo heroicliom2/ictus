@@ -627,3 +627,120 @@ argument are both still rejected. Re-running the diagnostic again after
 this fix confirms the next blocker is replication/multiple concatenation
 (`{N{expr}}`), a data-path expression feature rather than another
 statement-form gap.
+
+## D18 — `localparam`/`parameter` share one table; constant grammar reuses `apply_binary_op`
+
+**Decision**: three linked choices, made together while closing
+`regindex_bits` (picorv32's `localparam integer regindex_bits =
+(ENABLE_REGS_16_31 ? 5 : 4) + ENABLE_IRQ*ENABLE_IRQ_QREGS;`, needing
+cross-parameter references, the ternary operator, and multiplication all
+at once):
+
+1. **`localparam` and `#(parameter ...)` resolve into one shared name
+   table**, via one combined pass (`lower_parameters` now matches both
+   `RefNode::ParameterDeclarationParam` and
+   `RefNode::LocalParameterDeclarationParam`, which turned out to have
+   identical `(Keyword, DataTypeOrImplicit, ListOfParamAssignments)`
+   shapes -- different Rust types since sv-parser generates one struct per
+   grammar production, but the same fields, factored into one shared
+   `resolve_param_assignments` helper). Not two separate tables/passes:
+   v1 doesn't support instantiation at all, so the one real difference
+   between `parameter` and `localparam` (overridable vs. never) doesn't
+   exist as a distinction to preserve yet -- both are simply named
+   compile-time constants. This is also *why* cross-parameter references
+   work at all: walking the whole module once in source order and
+   growing the same table as it goes means a `localparam` (declared in
+   the module body) sees every `#(parameter ...)` (declared in the
+   header, visited first by source order) already resolved by the time
+   its own default is evaluated. A pragmatic "declaration precedes use"
+   assumption, not a real dependency solve -- correct for every real case
+   found so far, not guaranteed by the Verilog grammar in general (a
+   pathological forward-reference would silently resolve wrong rather
+   than error, since `PsParameter`'s lookup just wouldn't find the name
+   yet and would report "unknown parameter" -- an honest failure, not a
+   silent wrong value, so still within this project's normal
+   correctness bar even though it's not a complete solve).
+2. **The constant-expression grammar walk (`lower_constant_expr`/
+   `lower_constant_primary`, new) builds the same `ictus_ir::Expr` the
+   general grammar (`lower_expr`) builds, reusing `apply_binary_op`
+   directly** rather than writing separate arithmetic for the constant
+   context. Verilog's constant-expression grammar
+   (`ConstantExpression`/`ConstantPrimary`/...) is a genuinely separate
+   parallel AST hierarchy from `Expression`/`Primary` (required wherever
+   the language demands a compile-time constant: parameter/localparam
+   values, packed-range bounds), so *some* separate walking code is
+   unavoidable -- but what each operator symbol *means* (`"+"` ->
+   `Expr::Add`, etc.) doesn't need a second definition. This is also why
+   multiplication (`Expr::Mul`) and subtraction (`Expr::Sub`) landed as
+   real, general operators usable by *both* grammars, not
+   constant-expression-only special cases: the general grammar needed
+   `-` too (a bit-select target index, `x[regindex_bits-1] <= v;`, is
+   lowered through `lower_expr`, not the constant grammar, even though
+   `regindex_bits-1` happens to be a compile-time constant), and there
+   was no reason to make `*` constant-only once `+`/`-`/`&`/`|`/... were
+   already shared.
+3. **A new `try_const_fold(&Expr) -> Option<u64>` is the one place that
+   decides "is this actually constant, and if so what is it"** --
+   deliberately exhaustive over every `Expr` variant (no wildcard arm),
+   used both by the constant-grammar walk (where folding is guaranteed to
+   succeed, since that grammar can never produce `Expr::Ref`) and,
+   separately, by the *general*-grammar call sites that still need a
+   compile-time constant: a bit-select target's index
+   (`lower_select_target_range`), a part-select bound
+   (`lower_constant_index`, unified onto this same helper instead of
+   keeping its own separate, less capable one), a packed-range bound
+   (`lower_packed_range`), and (for consistency, though not strictly
+   required by any real case) the read-side single-bit-select
+   (`lower_select`). Before this, several of these call sites each did
+   their own narrow "is this literally `Expr::Literal`" check, which is
+   *not* the same thing: `regindex_bits-1` lowers (via the ordinary,
+   general `lower_expr`/`lower_primary` path used for every expression,
+   not a special case) to `Expr::Sub(Expr::Literal, Expr::Literal)` --
+   constant, but not itself an `Expr::Literal` -- so the old narrow
+   checks would have wrongly rejected it as "variable-indexed," even
+   though nothing about it actually depends on a signal.
+
+**Why `try_const_fold` duplicates `ictus_kernel::eval_expr` instead of
+calling it**: the two functions do overlapping arithmetic on purpose --
+constant folding is a frontend/elaboration-time concern (fold now,
+substitute the result, the kernel never sees the original expression),
+evaluation is the kernel's runtime concern (re-run every simulated clock
+edge) -- different phases of the same project, and `ictus-frontend-verilog`
+has no dependency on `ictus-kernel` today (nor should gain one just for
+this: the kernel is downstream of the frontend/IR in the dependency
+graph, `ictus-cli` is what wires both together, and reaching back
+upstream would invert that). Making `eval_expr` `pub` and adding a
+frontend -> kernel dependency to avoid ~40 lines of duplicated match arms
+was considered and rejected as a worse trade than the duplication itself.
+
+**Why the `ConstantFunctionCall` handling isn't a hack**: found by
+actually running picorv32.v through this new code, not assumed --
+`ENABLE_REGS_16_31` (a bare parameter reference, no parentheses anywhere
+near it) parses as `ConstantPrimary::ConstantFunctionCall` rather than
+`::PsParameter`, a genuine `sv-parser` grammar ambiguity for a
+zero-argument identifier in constant-expression position (the same
+*kind* of finding as D13, a real parser quirk confirmed empirically, not
+the same bug). Since v1 never lowers a `function` declaration at all
+(confirmed: picorv32.v defines none), a zero-argument "constant function
+call" can only ever be a parameter reference the parser classified
+differently -- so it's handled exactly like `PsParameter` (a real,
+*non*-zero-argument constant function call is still rejected, correctly,
+as unsupported).
+
+**Why discovered / confirmed, not assumed**: found the same way as D13
+through D17 -- re-running the picorv32 diagnostic after D17 (task calls)
+surfaced `regindex_bits` first, then, once that specific line's three
+needs were met, the *same* diagnostic loop surfaced `ENABLE_REGS_16_31`'s
+parser-ambiguity, then `WITH_PCPI`'s `||`, then `TRACE_BRANCH`'s
+concatenation, each fixed and re-verified in turn rather than guessed at
+upfront. Verified with a fixture deliberately combining every real shape
+found in one place (cross-parameter reference, ternary, multiplication,
+a packed-range bound and a bit-select target index both referencing a
+localparam) and checked cycle-for-cycle against Icarus Verilog
+(`ictus-cli/tests/differential_localparam.rs`) -- Icarus independently
+computes the same constant arithmetic from scratch, so an exact trace
+match is meaningful evidence of correctness, not just "it didn't error."
+Re-running the diagnostic once more after this fix confirms the next
+blocker is unrelated to constants at all: a 4-state `x`/`z` digit in a
+literal outside a `case` item, which needs a real policy decision (what
+does `x` even mean in a 2-state kernel, D6) before implementation.

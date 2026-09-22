@@ -11,11 +11,18 @@
 //! own literal -- see `lower_case`/`lower_case_value`), non-blocking
 //! assignment, internal `wire`/`reg` declarations naming one or more
 //! signals per declaration (`reg a, b, c;` -- see `lower_internal_signal`)
-//! in addition to ports, module parameters (`#(parameter [7:0] X = 1)`,
-//! resolved to plain `Expr::Literal`s at lowering time and substituted
-//! directly into every reference -- see `lower_parameters`; a parameter
-//! is not a signal and never appears in `ictus_ir::Module` at all),
-//! constant and variable bit-select, constant part-select, concatenation
+//! in addition to ports, `#(parameter [7:0] X = 1)` *and* `localparam`
+//! (sharing one resolution pass and name table -- see `lower_parameters`;
+//! neither is a signal, and neither ever appears in `ictus_ir::Module` at
+//! all, since every reference is resolved to a plain `Expr::Literal`
+//! directly at lowering time), a default/value expression built from
+//! Verilog's separate *constant*-expression grammar (`lower_constant_expr`/
+//! `lower_constant_primary` -- literals, an earlier parameter/localparam
+//! reference, `+ - *`, the ternary operator, and concatenation; see
+//! `try_const_fold`, reused everywhere else in this file a compile-time
+//! constant is needed, for why this and the general expression grammar
+//! ultimately build the same `ictus_ir::Expr` shape), constant and
+//! variable bit-select, constant part-select, concatenation
 //! (plain `{a,b}` and replication/multiple concatenation `{N{a,b}}` --
 //! see `lower_multiple_concatenation`, which needs no new IR: the count
 //! must fold to a compile-time constant, same restriction a bit-select/
@@ -72,17 +79,13 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- `localparam` (a separate
-//! grammar production from `parameter`, not lowered at all yet -- see
-//! `lower_parameters`, which only walks `RefNode::ParameterDeclarationParam`),
-//! with a value expression that may need cross-parameter references, the
-//! ternary operator, and multiplication (none of which
-//! `lower_constant_param_value`'s restricted constant-expression walk
-//! handles -- this is what picorv32 hits next, in `localparam integer
-//! regindex_bits = (ENABLE_REGS_16_31 ? 5 : 4) +
-//! ENABLE_IRQ*ENABLE_IRQ_QREGS;`, right after the unary-operator support
-//! above -- a materially bigger lift than the last several increments,
-//! not attempted yet), array/memory signals (`reg [31:0] mem [0:31]`),
+//! later phases need more of the language -- a 4-state `x`/`z` digit in a
+//! literal *outside* a `case`/`casez`/`casex` item (`lower_number`'s
+//! binary-literal parser only accepts `0`/`1` today; this is what
+//! picorv32 hits next, right after the `localparam`/constant-expression
+//! support above -- a 2-state kernel (decisions.md D6) has no real 'x' to
+//! represent, so accepting this needs a real policy decision, e.g. "reads
+//! as 0", not a default), array/memory signals (`reg [31:0] mem [0:31]`),
 //! `always_comb`, and module instantiation are the next-highest-value
 //! gaps toward running a real design like phase 0's picorv32 benchmark.
 
@@ -170,19 +173,19 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     let mut last_direction: Option<Direction> = None;
     for port_node in module_node.into_iter() {
         if let RefNode::AnsiPortDeclaration(port) = port_node {
-            module.push_signal(lower_port(port, &tree, &mut last_direction)?);
+            module.push_signal(lower_port(port, &tree, &mut last_direction, &parameters)?);
         }
     }
 
     for decl_node in module_node.into_iter() {
         match decl_node {
             RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net)) => {
-                for signal in lower_internal_signal(&**net, &tree)? {
+                for signal in lower_internal_signal(&**net, &tree, &parameters)? {
                     module.push_signal(signal);
                 }
             }
             RefNode::DataDeclaration(DataDeclaration::Variable(var)) => {
-                for signal in lower_internal_signal(&**var, &tree)? {
+                for signal in lower_internal_signal(&**var, &tree, &parameters)? {
                     module.push_signal(signal);
                 }
             }
@@ -225,27 +228,27 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     Ok(module)
 }
 
-/// Parses the module's `#(parameter ...)` list into a name -> (value,
-/// width) table. Parameters are never simulated as signals -- every
-/// reference is fully resolved to an `Expr::Literal` right here at
-/// lowering time, substituted directly into the expression tree (see
-/// `lower_primary`), so `ictus_ir::Module` and the kernel never need to
-/// know parameters exist. A parameter's default value uses Verilog's
-/// separate *constant*-expression grammar (`ConstantParamExpression` ->
-/// `ConstantExpression`, the same restricted grammar already used for
-/// bit-select/part-select bounds -- see `lower_constant_index`), not the
-/// general `Expression` this frontend's normal `lower_expr` handles, so
-/// it's read directly here via the same "deep-search for the one Number"
-/// approach rather than going through `lower_expr`/`Ctx` at all. That
-/// grammar difference is also *why* a parameter default referencing
-/// another parameter isn't supported: `ConstantPrimary`'s identifier
-/// handling isn't wired up here since picorv32's own parameters never
-/// cross-reference each other, so there was nothing to verify this
-/// against yet -- a real gap if a future design needs it, not an
-/// oversight to silently work around. Only a default that reduces to a
-/// plain literal is supported; overriding a parameter at instantiation
-/// (module instantiation isn't supported at all yet) is a separate,
-/// larger gap.
+/// Parses every `#(parameter ...)` *and* `localparam ...` declaration in
+/// the module into one shared name -> (value, width) table -- v1 doesn't
+/// support instantiation at all, so the one real difference between the
+/// two (a `parameter` can be overridden at instantiation, a `localparam`
+/// never can) doesn't matter yet; both are simply named compile-time
+/// constants. Neither is ever simulated as a signal -- every reference is
+/// fully resolved to an `Expr::Literal` right here at lowering time,
+/// substituted directly into the expression tree (see `lower_primary`),
+/// so `ictus_ir::Module` and the kernel never need to know either exists.
+/// Walking the whole module in one pass, in source order, and growing the
+/// same table as it goes (rather than resolving parameters and
+/// localparams in two separate passes) is what makes cross-references
+/// work: a `localparam` can reference an earlier `parameter` (picorv32's
+/// `regindex_bits` references three of its own module parameters, e.g.
+/// `localparam integer regindex_bits = (ENABLE_REGS_16_31 ? 5 : 4) +
+/// ENABLE_IRQ*ENABLE_IRQ_QREGS;`) simply because, by source order, the
+/// `#(parameter ...)` port list is always visited before the module
+/// body's own `localparam`s are. This is a pragmatic "declaration
+/// precedes use" assumption, not a real dependency solve -- correct for
+/// every real case found so far, not guaranteed by the Verilog grammar
+/// itself in general.
 fn lower_parameters(
     module_node: &sv_parser::ModuleDeclarationAnsi,
     tree: &SyntaxTree,
@@ -253,50 +256,373 @@ fn lower_parameters(
     let mut parameters = HashMap::new();
 
     for node in module_node.into_iter() {
-        let RefNode::ParameterDeclarationParam(param_decl) = node else {
-            continue;
-        };
-
-        let width = match unwrap_node!(&param_decl.nodes.1, PackedDimensionRange) {
-            Some(range_node) => lower_packed_range(range_node, tree)?,
-            None => 32,
-        };
-
-        for assignment in param_decl.nodes.2.nodes.0.contents() {
-            let ident = unwrap_node!(&assignment.nodes.0, SimpleIdentifier)
-                .ok_or("parameter has no identifier")?;
-            let name = ident_str(ident, tree)
-                .ok_or("parameter identifier unreadable")?
-                .to_string();
-
-            let Some((_, default)) = &assignment.nodes.2 else {
-                return Err(format!(
-                    "parameter '{name}' has no default value (overriding a parameter at \
-                     instantiation is not supported in v1)"
-                ));
-            };
-            let value = lower_constant_param_value(default, tree)
-                .map_err(|e| format!("parameter '{name}' default: {e}"))?;
-
-            parameters.insert(name, (value, width));
+        match node {
+            RefNode::ParameterDeclarationParam(param_decl) => {
+                resolve_param_assignments(
+                    &param_decl.nodes.1,
+                    &param_decl.nodes.2,
+                    tree,
+                    &mut parameters,
+                )?;
+            }
+            RefNode::LocalParameterDeclarationParam(local_decl) => {
+                resolve_param_assignments(
+                    &local_decl.nodes.1,
+                    &local_decl.nodes.2,
+                    tree,
+                    &mut parameters,
+                )?;
+            }
+            _ => {}
         }
     }
 
     Ok(parameters)
 }
 
-fn lower_constant_param_value(
+/// Shared body for one `#(parameter ...)` or `localparam ...` declaration
+/// -- `ParameterDeclarationParam` and `LocalParameterDeclarationParam`
+/// have identical `(Keyword, DataTypeOrImplicit, ListOfParamAssignments)`
+/// shapes (different Rust types, since sv-parser generates a distinct
+/// struct per grammar production, but the same fields), so this takes
+/// just the two fields that actually matter rather than being duplicated
+/// per keyword.
+fn resolve_param_assignments(
+    data_type: &sv_parser::DataTypeOrImplicit,
+    assignments: &sv_parser::ListOfParamAssignments,
+    tree: &SyntaxTree,
+    parameters: &mut HashMap<String, (u64, u32)>,
+) -> Result<(), String> {
+    let width = match unwrap_node!(data_type, PackedDimensionRange) {
+        Some(range_node) => lower_packed_range(range_node, tree, parameters)?,
+        // No explicit range (`localparam integer regindex_bits = ...;`,
+        // or a bare `parameter X = ...;`) -- 32 bits either way: Verilog's
+        // default `integer`/untyped-parameter width.
+        None => 32,
+    };
+
+    for assignment in assignments.nodes.0.contents() {
+        let ident = unwrap_node!(&assignment.nodes.0, SimpleIdentifier)
+            .ok_or("parameter has no identifier")?;
+        let name = ident_str(ident, tree)
+            .ok_or("parameter identifier unreadable")?
+            .to_string();
+
+        let Some((_, default)) = &assignment.nodes.2 else {
+            return Err(format!(
+                "parameter '{name}' has no default value (overriding a parameter at \
+                 instantiation is not supported in v1)"
+            ));
+        };
+        let value = lower_constant_param_expression(default, tree, parameters)
+            .map_err(|e| format!("parameter '{name}' default: {e}"))?;
+
+        parameters.insert(name, (value, width));
+    }
+
+    Ok(())
+}
+
+/// Lowers a `parameter`/`localparam` default value -- Verilog's
+/// `ConstantParamExpression -> ConstantMintypmaxExpression -> ...`
+/// grammar, a genuinely separate parallel hierarchy from the general
+/// `Expression`/`Primary` `lower_expr`/`lower_primary` consume (also used
+/// for a packed-range bound, `[msb:lsb]` -- see `lower_packed_range`,
+/// which shares this same walk). Builds an ordinary `ictus_ir::Expr` via
+/// `lower_constant_expr` (reusing `apply_binary_op`, exactly like the
+/// general grammar does) and then folds it down to a plain `u64` with
+/// `try_const_fold` -- guaranteed to succeed, since `lower_constant_expr`
+/// can only ever produce a tree built from literals and already-resolved
+/// parameter references (never a signal), but going through the same
+/// fold helper used elsewhere keeps there being exactly one definition of
+/// "is this actually constant" in the whole crate.
+fn lower_constant_param_expression(
     expr: &sv_parser::ConstantParamExpression,
     tree: &SyntaxTree,
+    parameters: &HashMap<String, (u64, u32)>,
 ) -> Result<u64, String> {
-    let number_node =
-        unwrap_node!(expr, Number).ok_or("is not a plain numeric literal in v1")?;
-    let RefNode::Number(number) = number_node else {
-        unreachable!("unwrap_node! guarantees the requested variant");
+    let sv_parser::ConstantParamExpression::ConstantMintypmaxExpression(mtm) = expr else {
+        return Err("parameter/localparam default must be a constant expression in v1".to_string());
     };
-    match lower_number(number, tree)? {
-        Expr::Literal { value, .. } => Ok(value),
-        _ => unreachable!("lower_number always returns Expr::Literal"),
+    let expr = match &**mtm {
+        sv_parser::ConstantMintypmaxExpression::Unary(ce) => lower_constant_expr(ce, tree, parameters)?,
+        sv_parser::ConstantMintypmaxExpression::Ternary(_) => {
+            return Err("min:typ:max parameter/localparam values are not supported in v1".to_string())
+        }
+    };
+    try_const_fold(&expr)
+        .ok_or_else(|| "does not reduce to a compile-time constant".to_string())
+}
+
+/// Lowers Verilog's *constant*-expression grammar (`ConstantExpression`)
+/// -- required for parameter/localparam defaults and packed-range bounds,
+/// where only compile-time constants are legal -- into the same
+/// `ictus_ir::Expr` shape the general grammar (`lower_expr`) produces,
+/// reusing `apply_binary_op` so there's one definition of what each
+/// operator means, not two. Only the forms real designs have needed so
+/// far are handled: a literal, a reference to an *earlier* parameter/
+/// localparam (see `lower_constant_primary`), `+ - *`, and the ternary
+/// operator. Anything else (system functions, `inside`, ...) is rejected,
+/// not guessed at.
+fn lower_constant_expr(
+    expr: &sv_parser::ConstantExpression,
+    tree: &SyntaxTree,
+    parameters: &HashMap<String, (u64, u32)>,
+) -> Result<Expr, String> {
+    use sv_parser::ConstantExpression as CE;
+    match expr {
+        CE::ConstantPrimary(primary) => lower_constant_primary(primary, tree, parameters),
+        CE::Binary(binary) => {
+            let op_text =
+                symbol_text(&binary.nodes.1, tree).ok_or("binary operator unreadable")?;
+            let lhs = lower_constant_expr(&binary.nodes.0, tree, parameters)?;
+            let rhs = lower_constant_expr(&binary.nodes.3, tree, parameters)?;
+            apply_binary_op(op_text, lhs, rhs)
+        }
+        CE::Ternary(ternary) => {
+            let cond = lower_constant_expr(&ternary.nodes.0, tree, parameters)?;
+            let then_val = lower_constant_expr(&ternary.nodes.3, tree, parameters)?;
+            let else_val = lower_constant_expr(&ternary.nodes.5, tree, parameters)?;
+            Ok(Expr::Ternary {
+                cond: Box::new(cond),
+                then_val: Box::new(then_val),
+                else_val: Box::new(else_val),
+            })
+        }
+        other => Err(format!("constant expression form not supported in v1: {other:?}")),
+    }
+}
+
+/// The `ConstantPrimary` half of `lower_constant_expr` -- a literal, or a
+/// reference to an already-resolved parameter/localparam (looked up in
+/// the `parameters` table being built up by `lower_parameters`, so only
+/// an *earlier* declaration is visible -- see that function's doc
+/// comment). A select on the parameter reference itself (`FOO[3:0]`,
+/// legal Verilog syntax on a parameter but not used by any real case
+/// found so far) is rejected, not silently ignored.
+fn lookup_constant_parameter(
+    name: &str,
+    parameters: &HashMap<String, (u64, u32)>,
+) -> Result<Expr, String> {
+    let &(value, width) = parameters
+        .get(name)
+        .ok_or_else(|| format!("reference to unknown parameter '{name}' in a constant expression"))?;
+    Ok(Expr::Literal { value, width })
+}
+
+fn lower_constant_primary(
+    primary: &sv_parser::ConstantPrimary,
+    tree: &SyntaxTree,
+    parameters: &HashMap<String, (u64, u32)>,
+) -> Result<Expr, String> {
+    use sv_parser::ConstantPrimary as CP;
+    match primary {
+        CP::PrimaryLiteral(lit) => match &**lit {
+            sv_parser::PrimaryLiteral::Number(number) => lower_number(number, tree),
+            other => Err(format!(
+                "literal form not supported in a constant expression in v1: {other:?}"
+            )),
+        },
+        CP::PsParameter(p) => {
+            let select = &p.nodes.1;
+            let has_select = select.nodes.0.is_some()
+                || !select.nodes.1.nodes.0.is_empty()
+                || select.nodes.2.is_some();
+            if has_select {
+                return Err(
+                    "indexing into a parameter reference is not supported in a constant \
+                     expression in v1"
+                        .to_string(),
+                );
+            }
+            let ident = unwrap_node!(&p.nodes.0, SimpleIdentifier)
+                .ok_or("parameter reference identifier unreadable")?;
+            let name =
+                ident_str(ident, tree).ok_or("parameter reference identifier unreadable")?;
+            lookup_constant_parameter(name, parameters)
+        }
+        // sv-parser's constant-expression grammar can parse a *bare*
+        // identifier with no parentheses at all as a "constant function
+        // call" instead of `PsParameter` -- confirmed empirically:
+        // picorv32's own `ENABLE_REGS_16_31` (17 characters, no arguments
+        // anywhere near it) parses this way inside
+        // `localparam integer irqregs_offset = ENABLE_REGS_16_31 ? 32 : 16;`.
+        // v1 has no notion of a constant *function* at all (`function` is
+        // never lowered -- confirmed picorv32.v doesn't define one), so a
+        // zero-argument call here is really just a parameter reference the
+        // parser happened to classify differently, not a real function
+        // call; one *with* arguments would be a genuine constant function
+        // call this frontend can't evaluate, and is rejected.
+        CP::ConstantFunctionCall(call) => {
+            let sv_parser::SubroutineCall::TfCall(tf_call) = &call.nodes.0.nodes.0 else {
+                return Err(
+                    "this constant function/subroutine call form is not supported in v1"
+                        .to_string(),
+                );
+            };
+            if tf_call.nodes.2.is_some() {
+                return Err(
+                    "a constant function call with arguments is not supported in v1 (no \
+                     `function` is lowered at all in v1, so this can only be a parameter \
+                     reference sv-parser classified as a function call)"
+                        .to_string(),
+                );
+            }
+            let ident = unwrap_node!(&tf_call.nodes.0, SimpleIdentifier)
+                .ok_or("parameter reference identifier unreadable")?;
+            let name =
+                ident_str(ident, tree).ok_or("parameter reference identifier unreadable")?;
+            lookup_constant_parameter(name, parameters)
+        }
+        CP::MintypmaxExpression(paren) => match &paren.nodes.0.nodes.1 {
+            sv_parser::ConstantMintypmaxExpression::Unary(ce) => {
+                lower_constant_expr(ce, tree, parameters)
+            }
+            sv_parser::ConstantMintypmaxExpression::Ternary(_) => {
+                Err("min:typ:max expressions are not supported in v1".to_string())
+            }
+        },
+        CP::Concatenation(concat) => {
+            if concat.nodes.1.is_some() {
+                return Err(
+                    "indexing into a concatenation is not supported in a constant expression \
+                     in v1"
+                        .to_string(),
+                );
+            }
+            let exprs = concat.nodes.0.nodes.0.nodes.1.contents();
+            if exprs.is_empty() {
+                return Err("an empty concatenation `{}` is not supported in v1".to_string());
+            }
+            let mut parts = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                let lowered = lower_constant_expr(e, tree, parameters)?;
+                let width = constant_expr_width(&lowered)?;
+                parts.push((lowered, width));
+            }
+            Ok(Expr::Concat(parts))
+        }
+        other => Err(format!(
+            "constant primary form not supported in v1: {other:?}"
+        )),
+    }
+}
+
+/// Attempts to fold an already-lowered `Expr` down to a plain constant --
+/// used both by `lower_constant_param_expression` (where the result is
+/// guaranteed constant by construction, since the constant-expression
+/// grammar has no way to reference a signal at all) and, more
+/// significantly, by the handful of places that lower a value through the
+/// *general* expression grammar (`lower_expr`) but still require a
+/// compile-time constant -- most notably a bit-select target's index
+/// (`x[regindex_bits-1] <= v;`, picorv32's own real case: `regindex_bits`
+/// resolves to `Expr::Literal` via `lower_primary`'s parameter fallback,
+/// so the whole `Expr::Sub(Literal, Literal)` tree this folds is
+/// constant, even though it was built by the same general-purpose path
+/// that would just as happily build `Expr::Sub(Ref(signal), Literal)` for
+/// a genuinely non-constant index). `Expr::Ref` and `Expr::DynamicBitSelect`
+/// are the only two forms that return `None` -- a real signal value, or an
+/// index that depends on one, simply isn't known until simulation runs.
+/// Every other `Expr` variant is handled, deliberately exhaustively (no
+/// wildcard arm): this mirrors `ictus_kernel::eval_expr`'s own logic
+/// (duplicated rather than shared across the crate boundary -- constant
+/// folding is a frontend/elaboration-time concern, evaluation is the
+/// kernel's runtime concern; different phases, so some overlap is
+/// expected, not a sign the crates should be coupled), so if a new `Expr`
+/// variant is ever added, this fails to compile until someone decides
+/// whether it can be constant-folded, rather than silently defaulting to
+/// "not foldable."
+fn try_const_fold(expr: &Expr) -> Option<u64> {
+    let mask = |value: u64, width: u32| {
+        if width >= 64 {
+            value
+        } else {
+            value & ((1u64 << width) - 1)
+        }
+    };
+    let bool_val = |b: bool| u64::from(b);
+
+    match expr {
+        Expr::Literal { value, .. } => Some(*value),
+        Expr::Ref(_) | Expr::DynamicBitSelect { .. } => None,
+        Expr::Not(inner) => Some(bool_val(try_const_fold(inner)? == 0)),
+        Expr::BitwiseNot(inner, width) => Some(mask(!try_const_fold(inner)?, *width)),
+        Expr::ReduceAnd(inner, width) => {
+            let value = mask(try_const_fold(inner)?, *width);
+            Some(bool_val(value == mask(u64::MAX, *width)))
+        }
+        Expr::ReduceOr(inner, width) => Some(bool_val(mask(try_const_fold(inner)?, *width) != 0)),
+        Expr::ReduceXor(inner, width) => {
+            let value = mask(try_const_fold(inner)?, *width);
+            Some(bool_val(value.count_ones() % 2 == 1))
+        }
+        Expr::Add(lhs, rhs) => Some(try_const_fold(lhs)?.wrapping_add(try_const_fold(rhs)?)),
+        Expr::Sub(lhs, rhs) => Some(try_const_fold(lhs)?.wrapping_sub(try_const_fold(rhs)?)),
+        Expr::Mul(lhs, rhs) => Some(try_const_fold(lhs)?.wrapping_mul(try_const_fold(rhs)?)),
+        Expr::And(lhs, rhs) => Some(try_const_fold(lhs)? & try_const_fold(rhs)?),
+        Expr::Or(lhs, rhs) => Some(try_const_fold(lhs)? | try_const_fold(rhs)?),
+        Expr::Xor(lhs, rhs) => Some(try_const_fold(lhs)? ^ try_const_fold(rhs)?),
+        Expr::Eq(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? == try_const_fold(rhs)?)),
+        Expr::Ne(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? != try_const_fold(rhs)?)),
+        Expr::Lt(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? < try_const_fold(rhs)?)),
+        Expr::Le(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? <= try_const_fold(rhs)?)),
+        Expr::Gt(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? > try_const_fold(rhs)?)),
+        Expr::Ge(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? >= try_const_fold(rhs)?)),
+        Expr::LogicalAnd(lhs, rhs) => {
+            Some(bool_val(try_const_fold(lhs)? != 0 && try_const_fold(rhs)? != 0))
+        }
+        Expr::LogicalOr(lhs, rhs) => {
+            Some(bool_val(try_const_fold(lhs)? != 0 || try_const_fold(rhs)? != 0))
+        }
+        Expr::Select { base, msb, lsb } => Some(mask(try_const_fold(base)? >> lsb, msb - lsb + 1)),
+        Expr::Concat(parts) => {
+            let mut result = 0u64;
+            for (part, width) in parts {
+                result = (result << width) | mask(try_const_fold(part)?, *width);
+            }
+            Some(result)
+        }
+        Expr::Ternary { cond, then_val, else_val } => {
+            if try_const_fold(cond)? != 0 {
+                try_const_fold(then_val)
+            } else {
+                try_const_fold(else_val)
+            }
+        }
+        Expr::Signed(inner, width) => {
+            let width = *width;
+            let value = try_const_fold(inner)?;
+            if width == 0 || width >= 64 {
+                Some(value)
+            } else {
+                let value = mask(value, width);
+                if (value >> (width - 1)) & 1 == 1 {
+                    Some(value | (u64::MAX << width))
+                } else {
+                    Some(value)
+                }
+            }
+        }
+    }
+}
+
+/// Like `expr_width`, but for an `Expr` built entirely by
+/// `lower_constant_expr`/`lower_constant_primary` -- which never produce
+/// `Expr::Ref` (a constant expression can only reference an
+/// already-resolved parameter, which always becomes `Expr::Literal`), so
+/// no `Module` is ever needed here to look up a signal's width the way
+/// `expr_width` needs one for the general case.
+fn constant_expr_width(expr: &Expr) -> Result<u32, String> {
+    match expr {
+        Expr::Literal { width, .. } => Ok(*width),
+        Expr::Concat(parts) => Ok(parts.iter().map(|(_, w)| w).sum()),
+        Expr::Ternary { then_val, else_val, .. } => {
+            Ok(constant_expr_width(then_val)?.max(constant_expr_width(else_val)?))
+        }
+        other => Err(format!(
+            "concatenation operand's width can't be determined in a constant expression in v1: \
+             {other:?}"
+        )),
     }
 }
 
@@ -375,17 +701,11 @@ fn ident_str<'a>(node: RefNode<'a>, tree: &'a SyntaxTree) -> Option<&'a str> {
     tree.get_str(locate)
 }
 
-fn unsigned_number_str<'a>(node: RefNode<'a>, tree: &'a SyntaxTree) -> Option<&'a str> {
-    match node {
-        RefNode::UnsignedNumber(x) => tree.get_str(&x.nodes.0),
-        _ => None,
-    }
-}
-
 fn lower_port(
     port: &AnsiPortDeclaration,
     tree: &SyntaxTree,
     last_direction: &mut Option<Direction>,
+    parameters: &HashMap<String, (u64, u32)>,
 ) -> Result<Signal, String> {
     let ident_node =
         unwrap_node!(port, PortIdentifier).ok_or("port declaration has no identifier")?;
@@ -412,7 +732,7 @@ fn lower_port(
     *last_direction = Some(direction);
 
     let width = match unwrap_node!(port, PackedDimensionRange) {
-        Some(range_node) => lower_packed_range(range_node, tree)?,
+        Some(range_node) => lower_packed_range(range_node, tree, parameters)?,
         None => 1,
     };
 
@@ -439,12 +759,16 @@ fn lower_port(
 /// `SimpleIdentifier` anywhere in the subtree could (e.g. `reg x = Y;`
 /// would wrongly also match `Y`). All declared names in one declaration
 /// share the same width.
-fn lower_internal_signal<'a, T>(decl: &'a T, tree: &'a SyntaxTree) -> Result<Vec<Signal>, String>
+fn lower_internal_signal<'a, T>(
+    decl: &'a T,
+    tree: &'a SyntaxTree,
+    parameters: &HashMap<String, (u64, u32)>,
+) -> Result<Vec<Signal>, String>
 where
     &'a T: IntoIterator<Item = RefNode<'a>>,
 {
     let width = match unwrap_node!(decl, PackedDimensionRange) {
-        Some(range_node) => lower_packed_range(range_node, tree)?,
+        Some(range_node) => lower_packed_range(range_node, tree, parameters)?,
         None => 1,
     };
 
@@ -479,16 +803,33 @@ where
         .collect())
 }
 
-fn lower_packed_range(range_node: RefNode, tree: &SyntaxTree) -> Result<u32, String> {
-    let bounds: Vec<u32> = range_node
-        .into_iter()
-        .filter_map(|n| unsigned_number_str(n, tree))
-        .filter_map(|s| s.parse::<u32>().ok())
-        .collect();
-    match bounds.as_slice() {
-        [msb, lsb] => Ok(msb.abs_diff(*lsb) + 1),
-        _ => Err("packed range is not a simple `[N:M]` literal pair".to_string()),
-    }
+/// A packed-dimension bound (`[msb:lsb]`, e.g. a port/`reg`/`wire`
+/// declaration's width, or a `parameter`/`localparam`'s own declared
+/// width) is Verilog's constant-expression grammar -- both bounds go
+/// through the same `lower_constant_expr` walk (and `parameters` table)
+/// a `parameter`/`localparam` default value does, so a bound may
+/// reference a parameter (picorv32's `reg [regindex_bits-1:0] decoded_rd,
+/// decoded_rs1;`, `regindex_bits` itself a `localparam`) and not just a
+/// plain literal.
+fn lower_packed_range(
+    range_node: RefNode,
+    tree: &SyntaxTree,
+    parameters: &HashMap<String, (u64, u32)>,
+) -> Result<u32, String> {
+    let RefNode::PackedDimensionRange(range) = range_node else {
+        return Err(
+            "packed dimension form not supported in v1 (only a plain `[msb:lsb]` range)"
+                .to_string(),
+        );
+    };
+    let constant_range = &range.nodes.0.nodes.1;
+    let msb = lower_constant_expr(&constant_range.nodes.0, tree, parameters)?;
+    let lsb = lower_constant_expr(&constant_range.nodes.2, tree, parameters)?;
+    let msb = try_const_fold(&msb)
+        .ok_or_else(|| "packed range bound does not reduce to a compile-time constant".to_string())?;
+    let lsb = try_const_fold(&lsb)
+        .ok_or_else(|| "packed range bound does not reduce to a compile-time constant".to_string())?;
+    Ok((msb as u32).abs_diff(lsb as u32) + 1)
 }
 
 fn lower_always(
@@ -1093,16 +1434,22 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
 /// addition, bitwise operators, and equality are bit-identical whether
 /// the operands are "meant" as signed or unsigned, as long as they're
 /// already extended to a common width, which `Expr::Signed`'s own
-/// evaluation (see `ictus_kernel::eval_expr`) guarantees. Ordering
-/// comparisons (`< <= > >=`) are different: real signed ordering needs a
-/// genuinely different comparison (treating the sign-extended bit pattern
-/// as a two's-complement negative number, not a huge positive one), which
-/// this kernel doesn't implement -- so a `Signed` operand there is
-/// rejected with a clear error instead of silently producing an *unsigned*
-/// comparison result that happens to look plausible. (`*`, `>>>`, and
-/// similar signed-sensitive operators aren't in this match at all yet --
-/// see the `other` arm below -- so they're already safely rejected on
-/// their own, before this function would ever need to reason about them.)
+/// evaluation (see `ictus_kernel::eval_expr`) guarantees. `-` and `*`
+/// (added alongside this guard) are safe the same way: two's-complement
+/// subtraction and multiplication are *also* bit-identical regardless of
+/// declared signedness, as long as only the low bits of a wrapping result
+/// are kept -- which is exactly what `wrapping_sub`/`wrapping_mul` on a
+/// full `u64` representation, truncated later by whatever narrower
+/// context actually needs it, already does. Ordering comparisons
+/// (`< <= > >=`) are different: real signed ordering needs a genuinely
+/// different comparison (treating the sign-extended bit pattern as a
+/// two's-complement negative number, not a huge positive one), which this
+/// kernel doesn't implement -- so a `Signed` operand there is rejected
+/// with a clear error instead of silently producing an *unsigned*
+/// comparison result that happens to look plausible. Division and
+/// arithmetic right shift (`>>>`) would have the identical problem if/when
+/// they're ever added -- neither is implemented yet at all, so they're
+/// already safely (if incidentally) rejected by the `other` arm below.
 fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> {
     let is_ordering_comparison = matches!(op_text, "<" | "<=" | ">" | ">=");
     if is_ordering_comparison && (matches!(lhs, Expr::Signed(..)) || matches!(rhs, Expr::Signed(..)))
@@ -1118,6 +1465,8 @@ fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> 
 
     match op_text {
         "+" => Ok(Expr::Add(Box::new(lhs), Box::new(rhs))),
+        "-" => Ok(Expr::Sub(Box::new(lhs), Box::new(rhs))),
+        "*" => Ok(Expr::Mul(Box::new(lhs), Box::new(rhs))),
         "&" => Ok(Expr::And(Box::new(lhs), Box::new(rhs))),
         "|" => Ok(Expr::Or(Box::new(lhs), Box::new(rhs))),
         "^" => Ok(Expr::Xor(Box::new(lhs), Box::new(rhs))),
@@ -1247,10 +1596,14 @@ fn lower_system_function_call(
 /// (`x[7:0]`) must still be constants known at lowering time --
 /// `PartSelectRange::ConstantRange` only, not `IndexedRange`
 /// (`x[base +: width]`, a variable base with fixed width), which isn't
-/// supported yet. A single bit-select's index (`x[3]` or `x[i]`) can now
-/// be anything: a constant literal lowers to `Expr::Select` as before,
-/// anything else (a signal reference, arithmetic, ...) lowers to
-/// `Expr::DynamicBitSelect` and is evaluated at simulation time.
+/// supported yet. A single bit-select's index (`x[3]` or `x[i]`) can be
+/// anything: an expression that folds to a constant at lowering time
+/// (via `try_const_fold` -- not just a bare literal like `3`, but
+/// anything built from literals and already-resolved parameter
+/// references, e.g. `regindex_bits-1`) lowers to `Expr::Select`, same as
+/// before; anything that doesn't fold (a genuine signal reference
+/// somewhere in the index) lowers to `Expr::DynamicBitSelect` and is
+/// evaluated fresh at simulation time instead.
 fn lower_select(
     select: &sv_parser::Select,
     base: Expr,
@@ -1261,8 +1614,8 @@ fn lower_select(
     if let Some(bracket) = &select.nodes.2 {
         return match &bracket.nodes.1 {
             sv_parser::PartSelectRange::ConstantRange(range) => {
-                let msb = lower_constant_index(&range.nodes.0, tree)?;
-                let lsb = lower_constant_index(&range.nodes.2, tree)?;
+                let msb = lower_constant_index(&range.nodes.0, tree, module.parameters)?;
+                let lsb = lower_constant_index(&range.nodes.2, tree, module.parameters)?;
                 if lsb > msb {
                     return Err(format!("part-select `[{msb}:{lsb}]` has lsb greater than msb"));
                 }
@@ -1282,34 +1635,45 @@ fn lower_select(
     // Bit-select: `x[3]` (or no select at all, if the bracket list is empty).
     match select.nodes.1.nodes.0.as_slice() {
         [] => Ok(base),
-        [only] => match lower_expr(&only.nodes.1, tree, module)? {
-            Expr::Literal { value, .. } => {
-                let bit = value as u32;
-                Ok(Expr::Select {
+        [only] => {
+            let index = lower_expr(&only.nodes.1, tree, module)?;
+            match try_const_fold(&index) {
+                Some(value) => {
+                    let bit = value as u32;
+                    Ok(Expr::Select {
+                        base: Box::new(base),
+                        msb: bit,
+                        lsb: bit,
+                    })
+                }
+                // Not foldable at lowering time (a genuine signal
+                // reference somewhere in the index expression) -- evaluated
+                // fresh each simulation cycle instead.
+                None => Ok(Expr::DynamicBitSelect {
                     base: Box::new(base),
-                    msb: bit,
-                    lsb: bit,
-                })
+                    index: Box::new(index),
+                }),
             }
-            index => Ok(Expr::DynamicBitSelect {
-                base: Box::new(base),
-                index: Box::new(index),
-            }),
-        },
+        }
         _ => Err("multi-dimensional array indexing is not supported in v1".to_string()),
     }
 }
 
-fn lower_constant_index(expr: &sv_parser::ConstantExpression, tree: &SyntaxTree) -> Result<u32, String> {
-    let number_node = unwrap_node!(expr, Number)
-        .ok_or("bit-select/part-select bound must be a plain numeric literal in v1")?;
-    let RefNode::Number(number) = number_node else {
-        unreachable!("unwrap_node! guarantees the requested variant");
-    };
-    match lower_number(number, tree)? {
-        Expr::Literal { value, .. } => Ok(value as u32),
-        _ => unreachable!("lower_number always returns Expr::Literal"),
-    }
+/// A bit-select/part-select bound (`x[7:0]`) is the same constant-
+/// expression grammar a `parameter`/`localparam` default or a
+/// packed-range bound uses -- see `lower_constant_expr`, which this
+/// reuses rather than keeping a separate, less capable evaluator.
+fn lower_constant_index(
+    expr: &sv_parser::ConstantExpression,
+    tree: &SyntaxTree,
+    parameters: &HashMap<String, (u64, u32)>,
+) -> Result<u32, String> {
+    let folded = lower_constant_expr(expr, tree, parameters)?;
+    try_const_fold(&folded)
+        .map(|value| value as u32)
+        .ok_or_else(|| {
+            "bit-select/part-select bound does not reduce to a compile-time constant".to_string()
+        })
 }
 
 fn lower_concatenation(
@@ -1427,11 +1791,14 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
 /// with no select at all, the overwhelmingly common case. `target` is
 /// searched for a `Select` node the same way its identifier already is.
 ///
-/// Only constant bounds are supported: a variable bit-select target
-/// (`x[i] <= v;`) or an indexed part-select (`x[base +: width] <= v;`)
-/// would need the kernel to compute the write range at simulation time
-/// rather than lowering time, which the kernel doesn't implement -- both
-/// are rejected here with a specific error rather than silently doing the
+/// Only constant bounds are supported: a *variable* bit-select target
+/// (`x[i] <= v;`, `i` a genuine signal -- checked via `try_const_fold`,
+/// the same helper `lower_select`'s read-side bit-select uses, so
+/// `x[regindex_bits-1] <= v;` is accepted the same way a read would be)
+/// or an indexed part-select (`x[base +: width] <= v;`) would need the
+/// kernel to compute the write range at simulation time rather than
+/// lowering time, which the kernel doesn't implement -- both are
+/// rejected here with a specific error rather than silently doing the
 /// wrong thing. Multi-dimensional indexing (array signals) is likewise
 /// rejected, matching `lower_select`'s read-side restriction.
 fn lower_select_target_range<'a, T>(
@@ -1451,8 +1818,8 @@ where
     if let Some(bracket) = &select.nodes.2 {
         return match &bracket.nodes.1 {
             sv_parser::PartSelectRange::ConstantRange(range) => {
-                let msb = lower_constant_index(&range.nodes.0, tree)?;
-                let lsb = lower_constant_index(&range.nodes.2, tree)?;
+                let msb = lower_constant_index(&range.nodes.0, tree, module.parameters)?;
+                let lsb = lower_constant_index(&range.nodes.2, tree, module.parameters)?;
                 if lsb > msb {
                     return Err(format!(
                         "assignment target '{target_name}' has a part-select `[{msb}:{lsb}]` with lsb greater than msb"
@@ -1469,15 +1836,18 @@ where
     // Bit-select: `x[3]` (or no select at all, if the bracket list is empty).
     match select.nodes.1.nodes.0.as_slice() {
         [] => Ok(None),
-        [only] => match lower_expr(&only.nodes.1, tree, module)? {
-            Expr::Literal { value, .. } => {
-                let bit = value as u32;
-                Ok(Some((bit, bit)))
+        [only] => {
+            let index = lower_expr(&only.nodes.1, tree, module)?;
+            match try_const_fold(&index) {
+                Some(value) => {
+                    let bit = value as u32;
+                    Ok(Some((bit, bit)))
+                }
+                None => Err(format!(
+                    "assignment target '{target_name}' uses a variable-indexed bit-select (`x[i] <= v;`), which v1 doesn't support as a write target"
+                )),
             }
-            _ => Err(format!(
-                "assignment target '{target_name}' uses a variable-indexed bit-select (`x[i] <= v;`), which v1 doesn't support as a write target"
-            )),
-        },
+        }
         _ => Err(format!(
             "assignment target '{target_name}' uses multi-dimensional indexing, which v1 doesn't support"
         )),
