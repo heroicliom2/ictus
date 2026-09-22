@@ -234,6 +234,31 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
                 eval_expr(else_val, values)
             }
         }
+        Expr::Signed(inner, width) => {
+            let width = *width;
+            let value = eval_expr(inner, values);
+            // `width >= 64` (or, defensively, `== 0`) has no room to
+            // extend into -- and shifting a u64 by 64 or more is
+            // undefined behavior for the underlying shift instruction --
+            // so the value is already whatever it is, full stop.
+            if width == 0 || width >= 64 {
+                value
+            } else {
+                let value = mask(value, width);
+                let sign_bit_set = (value >> (width - 1)) & 1 == 1;
+                if sign_bit_set {
+                    // Replicate the sign bit into every bit above
+                    // `width` -- real two's-complement sign extension.
+                    // Everything downstream (Select's own masking, or
+                    // the kernel's commit-time write mask) then keeps
+                    // only however many of these bits its own narrower
+                    // context actually needs.
+                    value | (u64::MAX << width)
+                } else {
+                    value
+                }
+            }
+        }
     }
 }
 
@@ -452,6 +477,41 @@ mod tests {
             0xF0,
             "low nibble must wrap 0xF -> 0x0 without touching the high nibble"
         );
+    }
+
+    /// A positive value (sign bit clear) is unaffected by `$signed` --
+    /// its bit pattern already reads correctly as either signed or
+    /// unsigned.
+    #[test]
+    fn signed_leaves_a_positive_value_unchanged() {
+        // 6-bit 0b011111 = 31, sign bit (bit 5) clear.
+        let expr = Expr::Signed(
+            Box::new(Expr::Literal { value: 0b011111, width: 6 }),
+            6,
+        );
+        assert_eq!(eval_expr(&expr, &[]), 31);
+    }
+
+    /// A negative value (sign bit set) gets its sign bit replicated
+    /// upward through every bit above its own declared width -- real
+    /// two's-complement sign extension, not the implicit zero-extension
+    /// every other expression gets. `0b100000` is -32 in 6-bit two's
+    /// complement; sign-extended into (conceptually) a wider context it
+    /// must read as all-1s above bit 5, e.g. as 12 bits: 0xFE0.
+    #[test]
+    fn signed_replicates_the_sign_bit_for_a_negative_value() {
+        let expr = Expr::Signed(
+            Box::new(Expr::Literal { value: 0b100000, width: 6 }),
+            6,
+        );
+        let extended = eval_expr(&expr, &[]);
+        // Masking down to exactly 12 bits (as a commit-time write to a
+        // 12-bit target would) must show real sign extension, not a
+        // truncated positive number.
+        assert_eq!(mask(extended, 12), 0xFE0);
+        // And -1 in 6 bits (all 1s) sign-extends to all 1s in 12 bits.
+        let all_ones = Expr::Signed(Box::new(Expr::Literal { value: 0b111111, width: 6 }), 6);
+        assert_eq!(mask(eval_expr(&all_ones, &[]), 12), 0xFFF);
     }
 
     #[test]

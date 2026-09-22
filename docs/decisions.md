@@ -476,3 +476,89 @@ with a plain signal, right-hand side itself a concatenation) -- the
 latter checked cycle-for-cycle against Icarus Verilog via a nibble-swap
 design chosen specifically so the expected output is easy to hand-verify
 (`ictus-cli/tests/differential_concat_target_select.rs`).
+
+## D16 — `$signed(...)`: sign-extend-to-64-bits marker, not general signed types
+
+**Decision**: `$signed(expr)` lowers to a new `ictus_ir::Expr::Signed(Box<Expr>,
+u32)` -- `expr` itself, unmodified, tagged with its own natural bit width
+(computed by the already-existing `expr_width` helper). It is *not* a
+general "this value has signed type from here on, tracked through
+arbitrary further composition" mechanism the way real Verilog's `signed`
+attribute works (where signedness is a property of a net/variable or
+expression that propagates through arithmetic and comparison according to
+a real type system). Instead, evaluating a `Signed` node directly produces
+a specific 64-bit *value*: `expr`'s own bits, with the bit at position
+`width - 1` (its sign bit) replicated upward through every bit from
+`width` to 63 if set. Every consumer downstream -- a `Select`'s own
+masking, or the kernel's commit-time write mask for an assignment target
+-- then simply keeps however many of those bits its own narrower context
+needs. Because a fixed-width two's-complement bit pattern already *is*
+its own correct wider-context representation once sign-extended, this one
+mechanical evaluation rule reproduces correct Verilog sign-extension
+semantics for every real picorv32 use site (a plain `$signed(x)` RHS, and
+`$signed({a,b,...})` with a concatenation argument, both used as -- or,
+via `lower_concat_target_assign`, sliced across the parts of -- an
+assignment's right-hand side) with no width/context information threaded
+through lowering at all: `lower_system_function_call` only ever needs the
+*operand's own* width, never the eventual assignment target's.
+
+**Why this is deliberately narrower than "real" signedness, and where
+that stops being safe**: `+ & | ^ == != && || !` all happen to be
+correct on a `Signed` operand with zero special-casing, because
+two's-complement addition, bitwise operators, and equality are bit-for-bit
+identical whether the operands are "meant" as signed or unsigned, as long
+as they're already extended to a common width -- which evaluating
+`Signed` guarantees. Ordering comparisons (`< <= > >=`) are exactly where
+this stops being true: `0xFFFF...FFFF` (a sign-extended -1) is a
+numerically huge *unsigned* value but must compare as *less than* a small
+positive number under signed rules -- genuinely different behavior, not
+just a wider bit pattern. Since this kernel doesn't implement a true
+signed comparison (reinterpreting the pattern as `i64` and comparing),
+`apply_binary_op` explicitly rejects a `Signed` operand of `< <= > >=`
+with a clear error rather than silently falling back to the (wrong)
+unsigned comparison already implemented -- picked specifically because
+picorv32's own ALU does exactly this
+(`alu_lts <= $signed(reg_op1) < $signed(reg_op2);`), so the rejection is
+confirmed to fire on real source, not a hypothetical worry. Division and
+arithmetic right shift (`>>>`) would have the identical problem if/when
+they're ever added -- neither is implemented yet at all, so they're
+already safely (if incidentally) rejected by `apply_binary_op`'s
+catch-all.
+
+**Alternatives considered**: a real signed/unsigned *type* attached to
+every `Expr` (or threaded alongside width through `expr_width`) that
+every operator consults -- rejected as significant scope for a feature
+whose only confirmed real need, so far, is sign-extension into a wider
+write target; the value-level marker above gets that exact case right
+with a single new `Expr` variant and zero changes to any operator besides
+the one guard in `apply_binary_op`, and can still be widened into a real
+type system later if a real need for signed comparison/shift/multiply
+shows up (which it will -- picorv32's ALU needs exactly that -- see the
+roadmap's now-open gap list; this decision is deliberately not the final
+design for signedness, just the correct-and-honest v1 slice of it).
+Silently treating `$signed(...)` as a no-op (dropping the sign-extension
+behavior entirely, always zero-extending) -- rejected immediately as
+exactly the silent-wrong-answer failure mode this project's whole
+testing discipline exists to prevent; the differential tests specifically
+use sign-bit-set values (not just positive ones) to make sure a
+regression back to plain zero-extension would be caught.
+
+**Why discovered / confirmed, not assumed**: found the same way as D13
+through D15 -- re-running the picorv32 lowering diagnostic after D15
+landed surfaced `$signed(...)` as the next blocker, with real usage sites
+grepped and read directly (25 occurrences across the file, both the
+simple "$signed(plain reference or select)" and
+"$signed(concatenation)" forms, and the comparison form that motivated
+the `apply_binary_op` guard). Verified with fixtures mirroring both the
+plain-reference and concatenation-argument picorv32 styles, checked
+differentially against Icarus Verilog using both sign-bit-clear and
+several sign-bit-set input values specifically (a zero-extension
+regression would only be visible on the latter), plus `ictus_kernel` unit
+tests isolating the sign-extension bit manipulation itself, plus a
+negative test confirming the signed-comparison rejection fires on a
+fixture shaped exactly like picorv32's own `alu_lts` line. Re-running the
+diagnostic again after this fix confirms the next real blocker is a
+different kind of gap entirely -- task-call statements (`` `assert(...) ``
+expands to a call to an empty no-op task in picorv32) -- not another
+expression-lowering feature, and is left as an open, deliberately
+undecided fork in `docs/roadmap.md` rather than guessed at.

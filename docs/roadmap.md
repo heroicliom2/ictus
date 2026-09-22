@@ -284,14 +284,76 @@ effects to duplicate.
   still has no commit phase to split a value across multiple targets in,
   same reasoning as the plain-select case above).
 
-**Still explicitly deferred**, found via the same picorv32 grep that
-found the above (not yet attempted): the `$signed(...)` system function
-(seen right next to the bit-select-target sites in picorv32, e.g.
-`mem_rdata_q[31:20] <= $signed({...});`) -- an unrelated gap (a read-side
-system-function call, not a target-side construct), just discovered at
-the same time. Re-running the picorv32 diagnostic after the
-concatenation-target fix confirms this is now the very next parse error
-it hits.
+**The `$signed(...)` system function**: done, for the case picorv32
+actually needs -- sign-extending a narrower value into a wider assignment
+target (`decoded_imm <= $signed(mem_rdata_q[31:20]);`,
+`mem_rdata_q[31:20] <= $signed({mem_rdata_latched[12],
+mem_rdata_latched[6:2]});`). Scoped deliberately narrower than full
+Verilog `signed` semantics:
+
+- New `ictus_ir::Expr::Signed(Box<Expr>, u32)` marks its operand as
+  signed, carrying the operand's own natural width (computed by the
+  already-existing `expr_width` helper) so the kernel knows where the
+  sign bit is. It's a no-op on the operand's own bits -- evaluating it
+  just replicates that bit upward through every bit above its declared
+  width (real two's-complement sign extension) rather than the implicit
+  zero-extension every other expression gets; whatever narrower width
+  actually gets *used* downstream (a `Select`'s own masking, or the
+  kernel's commit-time write mask for the assignment target) then keeps
+  only however many of those bits it needs. This composes for free with
+  everything built in the previous two entries: no special-casing was
+  needed in `lower_concat_target_assign` for a concatenation target whose
+  right-hand side is `$signed(...)` (picorv32's
+  `{decoded_imm_j[...], ...} <= $signed({...});` style) -- it already just
+  clones and slices whatever `Expr` the right-hand side lowered to.
+- New `lower_system_function_call` (called from `lower_primary`) handles
+  `$signed(expr)` specifically and rejects every other system
+  function/task call. `+ & | ^ == != && || !` all accept a `Signed`
+  operand safely with no special-casing (two's-complement
+  addition/bitwise-ops/equality are bit-identical regardless of declared
+  signedness, once operands are extended to a common width) -- but a
+  `Signed` operand of an *ordering* comparison (`< <= > >=`) is rejected
+  by a new guard in `apply_binary_op`, since real signed ordering needs a
+  genuinely different comparison (not implemented) and silently falling
+  back to unsigned comparison on the sign-extended bit pattern would be
+  exactly the kind of silent-wrong-answer this project treats as the
+  worst failure mode -- picorv32's ALU does exactly this
+  (`alu_lts <= $signed(reg_op1) < $signed(reg_op2);`), so this rejection
+  is confirmed to fire on real source, not just a hypothetical.
+- Verified per this project's usual practice: a plain-reference fixture
+  (`signed_ext_test.v`) and one mirroring picorv32's own concatenation
+  style directly (`signed_concat_test.v`), both checked structurally
+  (`ictus-frontend-verilog/tests/signed.rs`) and differentially against
+  Icarus Verilog with values chosen to include both a sign-bit-clear and
+  several sign-bit-set cases (`ictus-cli/tests/differential_signed_ext.rs`,
+  `differential_signed_concat.rs`) -- a zero-extension bug would only be
+  visible on the sign-bit-set cases, so those are the ones that actually
+  exercise the feature, not just "does it lower without erroring."
+  `ictus_kernel`'s own unit tests isolate the sign-extension bit
+  manipulation from the frontend entirely. Plus a negative test
+  confirming the signed-ordering-comparison rejection fires with a clear
+  error, using a fixture shaped exactly like picorv32's own `alu_lts`
+  line.
+
+**Next confirmed blocker**: task-call statements. Re-running the
+picorv32 diagnostic after the `$signed` fix hits a *different* kind of
+gap than the last three entries: `` `assert(assert_expr) `` is `` `define ``-d
+(picorv32.v line 47) to expand to a call to `empty_statement;`, a
+deliberately-empty task (line 214) used as a no-op placeholder when
+formal-verification assertions are compiled out -- and
+`lower_statement_item` has no case for a subroutine-call statement at
+all yet. Not yet attempted: unlike the three entries above, this isn't a
+data-path feature, so it doesn't obviously extend anything already
+built. A real fork worth resolving deliberately before implementing,
+not guessing at: does v1 gain enough of Verilog's task-call grammar to
+call *any* zero-argument task and simply run its (currently
+always-empty, in every real body this frontend can already lower) body
+as a no-op sequence of statements -- generalizable, but risks silently
+skipping real behavior in some *other* design's task that isn't empty --
+or does it special-case *only* a provably-empty task body (matching this
+exact case) as a no-op, more conservative but a narrower, single-purpose
+carve-out? Worth a real decision (and a decisions.md entry) before
+picking, not a default.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
@@ -300,12 +362,14 @@ overriding at instantiation), constant/variable bit-select and constant
 part-select on reads (no indexed part-select), concatenation and ternary
 on reads only, a constant bit-select/part-select -- or a concatenation of
 such -- as a non-blocking (`<=`) assignment target but not a continuous
-(`assign`) one and not with a variable index, no `$signed(...)` or other
-system functions, no array/memory signals (`reg [31:0] mem [0:31]` --
-this is what picorv32's register file actually needs, and is a distinct,
-likely-larger gap from bit-select on a single signal), no module
-instantiation. Cranelift codegen and actually getting picorv32 fully
-through the pipeline are both still ahead of where this stands today.
+(`assign`) one and not with a variable index, `$signed(...)` to
+sign-extend a value into a wider assignment target but not as an operand
+of an ordering comparison (and no other system function), no task/function
+calls, no array/memory signals (`reg [31:0] mem [0:31]` -- this is what
+picorv32's register file actually needs, and is a distinct, likely-larger
+gap from bit-select on a single signal), no module instantiation.
+Cranelift codegen and actually getting picorv32 fully through the
+pipeline are both still ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

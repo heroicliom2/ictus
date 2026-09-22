@@ -14,8 +14,11 @@
 //! but no `always_comb` yet, `if`/`else`/`else if` and
 //! `case`/`casez`/`casex` (see `CaseValue`) alongside non-blocking
 //! assignment, constant and variable bit-select, constant part-select,
-//! concatenation, and the ternary operator on reads (no indexed
-//! part-select `x[base +: width]`), plus a constant bit-select/part-select
+//! concatenation, the ternary operator, and `$signed(...)` (see `Expr::
+//! Signed`'s doc comment -- only well enough to sign-extend a value into
+//! a wider assignment target, not as an operand of an ordering
+//! comparison) on reads (no indexed part-select `x[base +: width]`), plus
+//! a constant bit-select/part-select
 //! as a non-blocking-assignment *target* (`x[7:0] <= v;`) -- a variable
 //! index or indexed range as a target isn't supported, and neither is a
 //! select as a *continuous*-assignment target (`assign x[7:0] = v;`; only
@@ -114,6 +117,35 @@ pub enum Expr {
         then_val: Box<Expr>,
         else_val: Box<Expr>,
     },
+    /// Verilog's `$signed(inner)` -- marks `inner` (whose own natural
+    /// width, the same value `ictus_frontend_verilog::expr_width` would
+    /// compute for it, is carried here as the second field since a bare
+    /// `Expr` doesn't otherwise know its own width) as a *signed* value.
+    /// This is a no-op on `inner`'s own bits -- `$signed` doesn't resize
+    /// anything itself -- but it changes what happens when the value is
+    /// later used somewhere *wider* than `width`: instead of the implicit
+    /// zero-extension every other expression gets when written to a wider
+    /// target, the kernel replicates `inner`'s own most-significant bit
+    /// (its sign bit) up through the extra bits, i.e. real two's-complement
+    /// sign extension. See `ictus_kernel::eval_expr`'s `Signed` arm for
+    /// the actual bit manipulation, and this field's frontend counterpart
+    /// (`ictus_frontend_verilog::lower_primary`'s `$signed` handling, via
+    /// `lower_system_function_call`) for how `width` gets computed. v1
+    /// only ever produces this as (or within a concatenation forming) an
+    /// assignment's right-hand side -- extension-by-truncation at write
+    /// time is all that's needed there. Using `$signed(...)` as an
+    /// operand of a comparison (where true signed *ordering*, not just
+    /// extension, would be needed) is rejected by the frontend rather
+    /// than silently doing an unsigned comparison on the sign-extended
+    /// bit pattern -- see `lower_expr`'s `apply_binary_op` for that
+    /// guard. `+ & | ^ == != && || !` all happen to already be correct on
+    /// a `Signed` operand without any special-casing: two's-complement
+    /// addition/bitwise-ops/equality are bit-identical regardless of
+    /// whether the operands are "meant" as signed or unsigned, as long as
+    /// they're already extended to a common width -- only *ordering*
+    /// comparisons, and (once supported) division and arithmetic right
+    /// shift, actually need to know.
+    Signed(Box<Expr>, u32),
 }
 
 #[derive(Debug, Clone)]

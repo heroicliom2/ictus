@@ -77,9 +77,12 @@ attempt at lowering the actual phase 0 picorv32 benchmark design (not
 just hand-written fixtures), which is how most of the gaps just closed
 were found. A concatenation of such targets (`{a, b[3:0]} <= v;`) is
 also supported, split into one write per part at lowering time. The
-`$signed(...)` system function, array/memory signals (picorv32's
-register file needs these), module instantiation, and Cranelift JIT
-codegen are all still ahead of where this stands today.
+`$signed(...)` system function is supported well enough to sign-extend a
+value into a wider assignment target (not yet as an operand of a signed
+comparison). Task-call statements (`` `assert(...) `` expands to one in
+picorv32), array/memory signals (picorv32's register file needs these),
+module instantiation, and Cranelift JIT codegen are all still ahead of
+where this stands today.
 
 ## Workspace layout
 

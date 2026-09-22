@@ -31,9 +31,17 @@
 //! `<=` has a commit phase to do the read-modify-write in -- see the
 //! `NetLvalue::Lvalue` check in `lower_continuous_assign`. And expressions
 //! built from literals (decimal/binary/hex; not octal, not X/Z-valued
-//! outside a case item), signal references, unary `!`, and the binary
-//! operators `+ & | ^ == != < <= > >= && ||`. `lower_expr`'s `E::Binary`
-//! arm also corrects a real `sv-parser` precedence-handling gap: it
+//! outside a case item), signal references, unary `!`, the binary
+//! operators `+ & | ^ == != < <= > >= && ||`, and the `$signed(...)`
+//! system function (see `lower_system_function_call` and
+//! `ictus_ir::Expr::Signed`'s doc comment -- v1 only implements this well
+//! enough to sign-extend a value into a wider assignment target, which is
+//! all picorv32 needs it for on the write side; using it as an operand of
+//! `< <= > >=` is rejected rather than silently doing an unsigned
+//! comparison, since a real signed *ordering* comparison isn't
+//! implemented -- see `apply_binary_op`'s guard). `lower_expr`'s
+//! `E::Binary` arm also corrects a real `sv-parser` precedence-handling
+//! gap: it
 //! mis-associates an *unparenthesized* ternary immediately following a
 //! binary operator's right operand (`a > c ? a : c` structured as if it
 //! were `a > (c ? a : c)`, when real Verilog precedence makes `(a > c) ?
@@ -46,12 +54,13 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- the `$signed(...)` system
-//! function (seen right next to the bit-select-target sites in picorv32,
-//! e.g. `mem_rdata_q[31:20] <= $signed({...});`), array/memory signals
-//! (`reg [31:0] mem [0:31]`), `always_comb`, and module instantiation are
-//! the next-highest-value gaps toward running a real design like phase
-//! 0's picorv32 benchmark.
+//! later phases need more of the language -- blocking assignment (`=`
+//! inside an `always` block; only non-blocking `<=` is lowered today --
+//! see `lower_statement_item`'s catch-all error, which is what picorv32
+//! hits next after `$signed`), array/memory signals (`reg [31:0] mem
+//! [0:31]`), `always_comb`, and module instantiation are the
+//! next-highest-value gaps toward running a real design like phase 0's
+//! picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -879,7 +888,36 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
     }
 }
 
+/// Combines two already-lowered operands with a binary operator.
+///
+/// A `$signed(...)` operand (`Expr::Signed`) is safe to pass straight
+/// through to `+ & | ^ == != && ||` unmodified -- two's-complement
+/// addition, bitwise operators, and equality are bit-identical whether
+/// the operands are "meant" as signed or unsigned, as long as they're
+/// already extended to a common width, which `Expr::Signed`'s own
+/// evaluation (see `ictus_kernel::eval_expr`) guarantees. Ordering
+/// comparisons (`< <= > >=`) are different: real signed ordering needs a
+/// genuinely different comparison (treating the sign-extended bit pattern
+/// as a two's-complement negative number, not a huge positive one), which
+/// this kernel doesn't implement -- so a `Signed` operand there is
+/// rejected with a clear error instead of silently producing an *unsigned*
+/// comparison result that happens to look plausible. (`*`, `>>>`, and
+/// similar signed-sensitive operators aren't in this match at all yet --
+/// see the `other` arm below -- so they're already safely rejected on
+/// their own, before this function would ever need to reason about them.)
 fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> {
+    let is_ordering_comparison = matches!(op_text, "<" | "<=" | ">" | ">=");
+    if is_ordering_comparison && (matches!(lhs, Expr::Signed(..)) || matches!(rhs, Expr::Signed(..)))
+    {
+        return Err(
+            "a signed comparison ($signed(...) as an operand of <, <=, >, or >=) is not \
+             supported in v1 -- $signed(...) is only supported directly as (or within a \
+             concatenation forming) an assignment's right-hand side, where sign extension \
+             happens automatically at write time"
+                .to_string(),
+        );
+    }
+
     match op_text {
         "+" => Ok(Expr::Add(Box::new(lhs), Box::new(rhs))),
         "&" => Ok(Expr::And(Box::new(lhs), Box::new(rhs))),
@@ -943,8 +981,58 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) 
             }
             lower_concatenation(&concat.nodes.0, tree, module)
         }
+        P::FunctionSubroutineCall(call) => lower_system_function_call(call, tree, module),
         other => Err(format!("primary expression form not supported in v1: {other:?}")),
     }
+}
+
+/// Lowers a system function/task call -- v1 only supports `$signed(expr)`
+/// (see `ictus_ir::Expr::Signed`'s doc comment for its semantics and why
+/// v1 needs it: picorv32 uses it throughout for RISC-V immediate
+/// sign-extension, e.g. `decoded_imm <= $signed(mem_rdata_q[31:20]);`).
+/// Every other system function (`$unsigned`, `$display`, ...) and every
+/// other `SubroutineCall` form (a plain task/function call, a method
+/// call, `randomize()`) is rejected, not guessed at.
+fn lower_system_function_call(
+    call: &sv_parser::FunctionSubroutineCall,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Expr, String> {
+    let sv_parser::SubroutineCall::SystemTfCall(sys) = &call.nodes.0 else {
+        return Err(
+            "only the $signed system function is supported in v1 (no plain task/function \
+             calls, method calls, or randomize())"
+                .to_string(),
+        );
+    };
+    let sv_parser::SystemTfCall::ArgExpression(args) = &**sys else {
+        return Err(
+            "this system function form is not supported in v1 (only $signed(expr), a single \
+             plain-expression argument)"
+                .to_string(),
+        );
+    };
+
+    let name = tree
+        .get_str(&args.nodes.0.nodes.0)
+        .ok_or("system function name unreadable")?;
+    if name != "$signed" {
+        return Err(format!(
+            "system function '{name}' is not supported in v1 (only $signed is)"
+        ));
+    }
+
+    let arguments = args.nodes.1.nodes.1.0.contents();
+    if arguments.len() != 1 {
+        return Err("$signed(...) must take exactly one argument in v1".to_string());
+    }
+    let argument = arguments[0]
+        .as_ref()
+        .ok_or("$signed(...) argument is missing")?;
+
+    let inner = lower_expr(argument, tree, module)?;
+    let width = expr_width(&inner, module)?;
+    Ok(Expr::Signed(Box::new(inner), width))
 }
 
 /// Applies a `Select` (`x[3]`, `x[i]`, `x[7:0]`, or neither for a plain
@@ -1054,6 +1142,12 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         Expr::Ternary { then_val, else_val, .. } => {
             Ok(expr_width(then_val, module)?.max(expr_width(else_val, module)?))
         }
+        // `$signed(...)`'s own natural width, for concatenation-packing
+        // purposes, is exactly the width already recorded on it --
+        // concatenation uses each operand's *self-determined* width
+        // regardless of signedness; only an assignment-like context
+        // (outside this function's concern) triggers sign extension.
+        Expr::Signed(_, width) => Ok(*width),
         other => Err(format!(
             "concatenation operand's width can't be determined in v1 (only literals, signal \
              references, bit-select/part-select, nested concatenation, and ternary are \
