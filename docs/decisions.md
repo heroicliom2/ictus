@@ -408,3 +408,71 @@ narrower width) checked cycle-for-cycle against Icarus Verilog
 (`ictus-cli/tests/differential_select_target.rs`), plus `ictus_kernel`
 unit tests isolating the same-tick-combination and per-range-masking
 behavior from the frontend entirely.
+
+## D15 — Concatenation assignment target: split at lowering time, no new IR
+
+**Decision**: `{a, b[3:0]} <= value;` (a concatenation used as a
+non-blocking assignment target -- picorv32's own style:
+`{mem_rdata_q[31:25], mem_rdata_q[11:7]} <= {...};`) is lowered by
+splitting it into several plain `ictus_ir::Stmt::NonBlockingAssign`s, one
+per part, entirely inside `ictus-frontend-verilog::lower_concat_target_assign`
+-- not by adding a new `Stmt` variant that carries multiple targets. Each
+part's value expression is the (lowered-once) right-hand side, cloned and
+wrapped in an `Expr::Select` picking out that part's bit range -- also not
+new IR, since `Select` already exists for the read side. `ictus_ir` and
+`ictus_kernel` are completely unchanged by this feature: as far as either
+is concerned, `{carry, acc[7:4], acc[3:0]} <= v;` is indistinguishable
+from three hand-written statements `carry <= v[8:8]; acc[7:4] <= v[7:4];
+acc[3:0] <= v[3:0];` in the same `always` block (with `v` duplicated by
+reference into three separate expression trees, one per statement -- each
+gets its own clone, not a shared mutable node).
+
+**Why this is correct despite evaluating the right-hand side more than
+once**: unlike a hardware description with side-effecting reads (there
+are none in synthesizable RTL) or a software expression with function
+calls, `value`'s clones are pure -- re-evaluating the identical expression
+tree against the identical pre-tick snapshot several times in the same
+tick always produces the identical result each time. There is no risk of
+the clones disagreeing with each other or with a hypothetical
+single-evaluation version.
+
+**Alternatives considered**: a new `Stmt::ConcatAssign { parts:
+Vec<(SignalId, Option<(u32,u32)>)>, value: Expr }` IR variant that the
+kernel would split internally at commit time -- rejected as pure
+duplication of logic that already exists in two places (the
+value-slicing math is identical to what a single select target's
+`Expr::Select` already does; the multi-target application is identical to
+what `tick()`'s per-signal commit loop already does for two ordinary,
+unrelated `NonBlockingAssign`s in the same tick) for no behavioral
+benefit -- splitting at lowering time gets the same result while keeping
+the kernel's mental model exactly as simple as it was before this
+feature: "a list of independent partial or full-width writes to apply in
+order," never anything that needs to reason about a single right-hand
+side fanning out to several targets at once.
+
+**Scope boundary drawn at the same time**: a **nested** concatenation
+inside the target (`{a, {b, c}} <= v;`) is rejected outright, not
+supported by recursing this same splitting logic -- picorv32 doesn't use
+this style anywhere, so there was no real case to verify against, and
+"reject and wait for a real need" matches this project's standing
+practice ([[ictus-development-practice]]) of not guessing at unverified
+gaps. Only `<=` (non-blocking assignment) supports a concatenation
+target; `assign {a,b} = v;` (continuous) is still rejected for the same
+reason a single select is (D14's scope-boundary paragraph): `ictus_ir::Assign`
+has no commit phase to split a value across multiple targets in.
+
+**Why discovered / confirmed, not assumed**: found the same way as D13
+and D14 -- after D14 (single select as a non-blocking target) landed,
+re-running the picorv32 lowering diagnostic surfaced this as the very
+next blocker, with real usage sites at picorv32.v lines 449, 496, 502,
+and 537 grepped and read directly rather than guessed at (which showed
+both a same-signal-multiple-selects case and, on the same lines, a plain
+whole-signal part mixed in). Verified with two fixtures: a minimal one
+matching the exact shape the pre-existing
+silently-writes-only-the-first-part bug (fixed earlier this phase, before
+concatenation targets were rejected at all) would have hit, and one
+mirroring picorv32's own style directly (selects of the same signal mixed
+with a plain signal, right-hand side itself a concatenation) -- the
+latter checked cycle-for-cycle against Icarus Verilog via a nibble-swap
+design chosen specifically so the expected output is easy to hand-verify
+(`ictus-cli/tests/differential_concat_target_select.rs`).

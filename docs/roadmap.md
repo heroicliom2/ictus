@@ -239,27 +239,69 @@ always a full-width replace).
   the frontend (`partial_writes_to_disjoint_ranges_combine_in_one_tick`,
   `partial_write_wraps_within_its_own_width_not_the_full_signal`).
 
+**Concatenation-of-selects as an assignment target**
+(`{mem_rdata_q[31:25], mem_rdata_q[11:7]} <= {...};` -- picorv32 uses this
+for its instruction-decode registers): done. Rather than teaching the
+kernel yet another representation, this needed *no* new IR at all: a
+concatenation target is split, entirely at lowering time, into one plain
+`Stmt::NonBlockingAssign` per part -- each part gets the slice of the
+right-hand side that lines up with its position (the leftmost part is the
+most-significant bits, the same packing order a concatenation
+*expression* already uses on the read side). The slicing itself reuses
+`Expr::Select` (also not new): each part's value is the shared,
+lowered-once right-hand-side expression, cloned and wrapped in a
+`Select` for that part's bit range -- safe to evaluate more than once
+per tick since a non-blocking assignment's right-hand side has no side
+effects to duplicate.
+
+- New `lower_concat_target_assign` in `ictus-frontend-verilog` handles
+  the `VariableLvalue::Lvalue` (concatenation-target) case that
+  `lower_nonblocking_assign` used to reject outright; each part goes
+  through the same `lower_select_target_range` the plain single-select
+  case uses, so a part can be a whole signal (`target_range: None`) or a
+  constant bit-select/part-select (`Some((msb, lsb))`) -- picorv32 mixes
+  both in the same statement. A **nested** concatenation inside the
+  target (`{a, {b, c}} <= v;`) is rejected, not guessed at: splitting a
+  value across a nested group would need this same slicing logic applied
+  recursively, a real gap rather than a silent-wrong-answer risk.
+  `lower_nonblocking_assign` itself now returns `Vec<Stmt>` instead of a
+  single `Stmt`, since one source statement can lower to several.
+- Verified per this project's usual practice, with two fixtures: a simple
+  one (`concat_nonblocking_target_test.v`, both parts plain whole
+  signals -- this is the exact shape the pre-existing
+  silently-writes-only-the-first-part bug, fixed earlier this phase,
+  would have hit) and one mirroring picorv32's own style directly
+  (`concat_target_select_test.v`, parts that are constant selects of the
+  *same* signal mixed with a plain signal, right-hand side itself a
+  concatenation) -- both checked structurally
+  (`ictus-frontend-verilog/tests/concat.rs`) and, for the harder one,
+  differentially against Icarus Verilog
+  (`ictus-cli/tests/differential_concat_target_select.rs`, a nibble-swap
+  design chosen so the expected output is easy to hand-verify). Plus a
+  negative test confirming the nested-concatenation case is rejected with
+  a clear error, and confirming a concatenation is still rejected as a
+  *continuous*-assignment target (`assign {a,b} = v;` -- `ictus_ir::Assign`
+  still has no commit phase to split a value across multiple targets in,
+  same reasoning as the plain-select case above).
+
 **Still explicitly deferred**, found via the same picorv32 grep that
-found the above (not yet attempted):
-- Concatenation-of-selects as an assignment target (`{mem_rdata_q[31:25],
-  mem_rdata_q[11:7]} <= {...};` -- a handful of occurrences in picorv32).
-  Harder than a plain select target: it's a *combination* of the
-  concatenation-target-rejection logic and the new select-target-range
-  logic, splitting one right-hand-side value across multiple disjoint
-  writes in one statement, which neither existing code path does today.
-- The `$signed(...)` system function (seen right next to the
-  bit-select-target sites in picorv32, e.g. `mem_rdata_q[31:20] <=
-  $signed({...});`) -- an unrelated gap (a read-side system-function call,
-  not a target-side construct), just discovered at the same time.
+found the above (not yet attempted): the `$signed(...)` system function
+(seen right next to the bit-select-target sites in picorv32, e.g.
+`mem_rdata_q[31:20] <= $signed({...});`) -- an unrelated gap (a read-side
+system-function call, not a target-side construct), just discovered at
+the same time. Re-running the picorv32 diagnostic after the
+concatenation-target fix confirms this is now the very next parse error
+it hits.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
 `always_comb`, module parameters (defaults must be constant literals, no
 overriding at instantiation), constant/variable bit-select and constant
 part-select on reads (no indexed part-select), concatenation and ternary
-on reads only, a constant bit-select/part-select as a non-blocking
-(`<=`) assignment target but not a continuous (`assign`) one and not with
-a variable index, no array/memory signals (`reg [31:0] mem [0:31]` --
+on reads only, a constant bit-select/part-select -- or a concatenation of
+such -- as a non-blocking (`<=`) assignment target but not a continuous
+(`assign`) one and not with a variable index, no `$signed(...)` or other
+system functions, no array/memory signals (`reg [31:0] mem [0:31]` --
 this is what picorv32's register file actually needs, and is a distinct,
 likely-larger gap from bit-select on a single signal), no module
 instantiation. Cranelift codegen and actually getting picorv32 fully

@@ -17,15 +17,19 @@
 //! is not a signal and never appears in `ictus_ir::Module` at all),
 //! constant and variable bit-select, constant part-select, concatenation,
 //! and the ternary operator on the *read* side (`x[3]`, `x[i]`, `x[7:0]`,
-//! `{a,b}`, `c ? a : b`; no indexed part-select `x[base +: width]`; no
-//! concatenation as an assignment target -- see `lower_concatenation` and
-//! the `VariableLvalue::Lvalue`/`NetLvalue::Lvalue` checks in the two
-//! assignment-lowering functions), plus a *constant* bit-select/part-select
-//! as a non-blocking-assignment target (`x[7:0] <= v;`, picorv32's
-//! `mem_rdata_q[...] <= ...` style -- see `lower_select_target_range`;
-//! a variable index/indexed-range target, and any select as a
-//! *continuous*-assignment target, are still rejected, since only `<=`
-//! has a commit phase to do the read-modify-write in), and expressions
+//! `{a,b}`, `c ? a : b`; no indexed part-select `x[base +: width]`), plus
+//! on the *assignment-target* side: a *constant* bit-select/part-select as
+//! a non-blocking-assignment target (`x[7:0] <= v;`, picorv32's
+//! `mem_rdata_q[...] <= ...` style -- see `lower_select_target_range`),
+//! and a concatenation of such targets (`{a, b[3:0]} <= v;`, picorv32's
+//! `{mem_rdata_q[31:25], mem_rdata_q[11:7]} <= ...` style -- see
+//! `lower_concat_target_assign`, which splits it into one plain
+//! `Stmt::NonBlockingAssign` per part rather than needing new IR; a
+//! *nested* concatenation inside the target is rejected, not guessed at).
+//! A variable index/indexed-range target, and any select or concatenation
+//! as a *continuous*-assignment target, are still rejected, since only
+//! `<=` has a commit phase to do the read-modify-write in -- see the
+//! `NetLvalue::Lvalue` check in `lower_continuous_assign`. And expressions
 //! built from literals (decimal/binary/hex; not octal, not X/Z-valued
 //! outside a case item), signal references, unary `!`, and the binary
 //! operators `+ & | ^ == != < <= > >= && ||`. `lower_expr`'s `E::Binary`
@@ -42,13 +46,12 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- concatenation-of-selects as
-//! an assignment target (`{a[7:5], b[2:0]} <= v;`, seen a handful of
-//! times in picorv32), the `$signed(...)` system function (also seen
-//! there, on the read side), array/memory signals (`reg [31:0] mem
-//! [0:31]`), `always_comb`, and module instantiation are the
-//! next-highest-value gaps toward running a real design like phase 0's
-//! picorv32 benchmark.
+//! later phases need more of the language -- the `$signed(...)` system
+//! function (seen right next to the bit-select-target sites in picorv32,
+//! e.g. `mem_rdata_q[31:20] <= $signed({...});`), array/memory signals
+//! (`reg [31:0] mem [0:31]`), `always_comb`, and module instantiation are
+//! the next-highest-value gaps toward running a real design like phase
+//! 0's picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -438,7 +441,7 @@ fn lower_statement_item(
         StatementItem::SeqBlock(seq) => lower_seq_block(seq, tree, module),
         StatementItem::NonblockingAssignment(b) => {
             let (assign, _semicolon) = &**b;
-            Ok(vec![lower_nonblocking_assign(assign, tree, module)?])
+            lower_nonblocking_assign(assign, tree, module)
         }
         StatementItem::ConditionalStatement(cond) => Ok(vec![lower_if(cond, tree, module)?]),
         StatementItem::CaseStatement(case) => Ok(vec![lower_case(case, tree, module)?]),
@@ -632,18 +635,18 @@ fn lower_nonblocking_assign(
     assign: &NonblockingAssignment,
     tree: &SyntaxTree,
     module: &Ctx,
-) -> Result<Stmt, String> {
+) -> Result<Vec<Stmt>, String> {
     // A concatenation target (`{a, b} <= x;`) is its own `VariableLvalue`
     // variant (`Lvalue`, wrapping a brace-list of lvalues), not just an
     // identifier with an unusual `Select` -- checked separately, and
     // first, because the identifier-based checks below would otherwise
     // deep-search *past* this and silently match `a` alone, discarding
-    // `b` and the split-assignment semantics entirely.
-    if let sv_parser::VariableLvalue::Lvalue(_) = &assign.nodes.0 {
-        return Err(
-            "assignment target is a concatenation (`{a, b} <= ...`), which v1 doesn't support as a write target"
-                .to_string(),
-        );
+    // `b` and the split-assignment semantics entirely. Handled by
+    // `lower_concat_target_assign`, which splits it into one
+    // `Stmt::NonBlockingAssign` per part rather than needing new IR.
+    if let sv_parser::VariableLvalue::Lvalue(concat) = &assign.nodes.0 {
+        let value = lower_expr(&assign.nodes.3, tree, module)?;
+        return lower_concat_target_assign(concat, value, tree, module);
     }
 
     let lhs_ident = unwrap_node!(&assign.nodes.0, SimpleIdentifier)
@@ -658,11 +661,91 @@ fn lower_nonblocking_assign(
 
     let value = lower_expr(&assign.nodes.3, tree, module)?;
 
-    Ok(Stmt::NonBlockingAssign {
+    Ok(vec![Stmt::NonBlockingAssign {
         target,
         target_range,
         value,
-    })
+    }])
+}
+
+/// Lowers `{a, b[3:0], ...} <= value;` -- a concatenation used as a
+/// non-blocking assignment target (picorv32 does this for its
+/// instruction-decode registers, e.g. `{mem_rdata_q[31:25],
+/// mem_rdata_q[11:7]} <= {...};`) -- into one plain
+/// `Stmt::NonBlockingAssign` per part, each writing the slice of `value`
+/// that lines up with that part's position in the concatenation: the
+/// *leftmost* part gets the most-significant bits, exactly like a
+/// concatenation *expression* packs its parts (see `lower_concatenation`
+/// and `ictus_ir::Expr::Concat`'s doc comment) -- just run in reverse,
+/// unpacking instead of packing. No new IR needed: each part's slice is
+/// expressed by wrapping the (shared, cloned) `value` expression in an
+/// `Expr::Select` for that part's bit range -- correct because a
+/// non-blocking assignment's right-hand side has no side effects to
+/// worry about duplicating, just a value the kernel re-reads once per
+/// part at commit time. Each part must itself be a plain identifier, with
+/// an optional *constant* bit-select/part-select (reusing
+/// `lower_select_target_range`, the same restriction a non-concatenation
+/// select target has) -- a nested concatenation, streaming concatenation,
+/// or assignment-pattern part is rejected, not guessed at.
+/// (target signal, optional constant select range, this part's width).
+type ConcatTargetPart = (SignalId, Option<(u32, u32)>, u32);
+
+fn lower_concat_target_assign(
+    concat: &sv_parser::VariableLvalueLvalue,
+    value: Expr,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Vec<Stmt>, String> {
+    let parts = concat.nodes.0.nodes.1.contents();
+    if parts.is_empty() {
+        return Err(
+            "an empty concatenation `{}` is not supported in v1 as an assignment target"
+                .to_string(),
+        );
+    }
+
+    let mut resolved: Vec<ConcatTargetPart> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if !matches!(part, sv_parser::VariableLvalue::Identifier(_)) {
+            return Err(
+                "a concatenation assignment target may only contain plain signals or \
+                 constant bit-selects/part-selects in v1 -- nested concatenation, streaming \
+                 concatenation, and assignment-pattern parts are not supported"
+                    .to_string(),
+            );
+        }
+        let ident = unwrap_node!(part, SimpleIdentifier)
+            .ok_or("concatenation assignment target part is not a simple identifier")?;
+        let name =
+            ident_str(ident, tree).ok_or("concatenation assignment target part unreadable")?;
+        let target = module
+            .signal_id(name)
+            .ok_or_else(|| format!("assignment target '{name}' is not a known signal"))?;
+        let target_range = lower_select_target_range(part, name, tree, module)?;
+        check_target_range(target_range, target, name, module)?;
+        let width = target_range
+            .map(|(msb, lsb)| msb - lsb + 1)
+            .unwrap_or(module.signals[target].width);
+        resolved.push((target, target_range, width));
+    }
+
+    let mut shift: u32 = resolved.iter().map(|(_, _, width)| width).sum();
+    let mut stmts = Vec::with_capacity(resolved.len());
+    for (target, target_range, width) in resolved {
+        let msb = shift - 1;
+        let lsb = shift - width;
+        shift -= width;
+        stmts.push(Stmt::NonBlockingAssign {
+            target,
+            target_range,
+            value: Expr::Select {
+                base: Box::new(value.clone()),
+                msb,
+                lsb,
+            },
+        });
+    }
+    Ok(stmts)
 }
 
 /// Lowers `assign target = expr;` (the `Net`-targeted form -- `assign`ing

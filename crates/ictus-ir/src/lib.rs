@@ -20,8 +20,12 @@
 //! index or indexed range as a target isn't supported, and neither is a
 //! select as a *continuous*-assignment target (`assign x[7:0] = v;`; only
 //! `<=` supports a partial write, since it alone has a commit phase to do
-//! the read-modify-write in). Each of those is a documented gap to widen
-//! incrementally, not a final design.
+//! the read-modify-write in). A concatenation of such targets
+//! (`{a, b[3:0]} <= v;`) needs no IR support of its own at all -- the
+//! frontend splits it into several plain `Stmt::NonBlockingAssign`s, one
+//! per part, at lowering time (see `ictus-frontend-verilog`'s
+//! `lower_concat_target_assign`). Each of those is a documented gap to
+//! widen incrementally, not a final design.
 
 /// A signal's index into `Module::signals`. Cheap to copy; stable for the
 /// lifetime of a `Module` (signals are never removed after lowering).

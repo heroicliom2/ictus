@@ -75,11 +75,11 @@ correctly on a tree-walking interpreter — checked with cycle-for-cycle
 differential tests against Icarus Verilog, including an ongoing real
 attempt at lowering the actual phase 0 picorv32 benchmark design (not
 just hand-written fixtures), which is how most of the gaps just closed
-were found. Concatenation-of-selects as a write target
-(`{a[7:5], b[2:0]} <= v;`), the `$signed(...)` system function,
-array/memory signals (picorv32's register file needs these), module
-instantiation, and Cranelift JIT codegen are all still ahead of where
-this stands today.
+were found. A concatenation of such targets (`{a, b[3:0]} <= v;`) is
+also supported, split into one write per part at lowering time. The
+`$signed(...)` system function, array/memory signals (picorv32's
+register file needs these), module instantiation, and Cranelift JIT
+codegen are all still ahead of where this stands today.
 
 ## Workspace layout
 
