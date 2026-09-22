@@ -89,7 +89,10 @@ supported as a true no-op — picorv32's own `` `assert(...) `` macro
 relies on exactly this. Unary bitwise complement (`~`) and the reduction
 operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) are also supported now.
 A 4-state `x`/`z` digit in a literal outside a `case`/`casez`/`casex`
-item, array/memory signals (picorv32's register file needs these),
+item resolves to `0` (matching Verilator's own default X-handling
+policy), and a comparison/logical/reduction result (always exactly 1
+bit) can be used as a concatenation operand. Shift operators (`<<`,
+`>>`), array/memory signals (picorv32's register file needs these),
 module instantiation, and Cranelift JIT codegen are all still ahead of
 where this stands today.
 

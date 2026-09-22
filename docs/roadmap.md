@@ -543,19 +543,77 @@ localparam integer regindex_bits =
   to an undeclared parameter is rejected with a clear error rather than
   silently treated as 0.
 
-**Next confirmed blocker**: a 4-state `x`/`z` digit in a literal *outside*
-a `case`/`casez`/`casex` item. Re-running the picorv32 diagnostic after
-the `localparam` fix hits `could not parse binary literal 'x'` --
-`lower_number`'s binary-literal parser only accepts `0`/`1` digits when
-the literal isn't inside a case item's own wildcard-aware parsing (see
-`lower_case_value`). Not yet attempted, and unlike the last several
-entries, this needs a real policy decision before implementation, not
-just more grammar coverage: this kernel is 2-state only (decisions.md
-D6) with no real `x`/`z` value to represent, so accepting an `x`/`z`
-digit in an ordinary read expression means choosing what it *means* here
-(reads as 0? as a don't-care that's silently resolved somehow? rejected
-in some contexts but not others?) -- a genuine design question, not a
-default.
+**A 4-state `x`/`z` digit in a literal outside a `case`/`casez`/`casex`
+item**: done, resolving the policy question the previous version of this
+section deliberately left open rather than defaulted. picorv32 uses this
+constantly, in two distinct real styles: an all-`x` "don't care" output
+on a dead/inactive code path (`assign pcpi_mul_rd = 32'bx;`) and a
+"default to `x`, then override in every `case` arm" idiom
+(`decoded_imm <= 1'bx;` followed by a `case` that sets a real value for
+every instruction encoding that matters).
+
+- **Decision**: an `x`/`z` digit -- whole-value or mixed with real digits,
+  in any base -- resolves to the bit `0`. Matches Verilator's own default
+  X-handling policy (a real precedent for this exact choice, confirmed,
+  not assumed) and needs no change to this kernel's 2-state signal
+  *representation* (decisions.md D6 is about something larger and still
+  future -- real per-signal 4-state tracking -- this is a much smaller,
+  self-contained literal-*parsing* policy). New `parse_binary_literal_value`/
+  `parse_hex_literal_value` replace the old `u64::from_str_radix` calls
+  (which simply failed to parse an `x`/`z` character at all) with a
+  digit-by-digit walk -- deliberately *not* sharing code with
+  `lower_wildcard_binary` (case-item wildcard matching, which tracks a
+  `care_mask`, a different job). `DecimalNumber::BaseXNumber`/
+  `BaseZNumber` (a whole-value-only 4-state decimal literal, `8'dx`,
+  `8'dz`) got the same policy applied for consistency, replacing their
+  previous explicit rejection.
+- **Why this isn't (and can't be) verified with a general differential
+  test**: a genuinely-`x` result in a *real* 4-state simulator like
+  Icarus has no single comparable value at all, so comparing Ictus's
+  resolved-to-0 output against Icarus's reported `x` for the *same*
+  signal would either fail to parse as a number or just disagree by
+  design -- not a bug on either side, just two different, both-valid
+  answers to a question standard Verilog leaves open. Verified instead
+  with a structural test (`ictus-frontend-verilog/tests/xz_literal.rs`)
+  confirming the resolved value directly, *and* a differential test built
+  around the specific real idiom where this is actually safe to compare
+  end-to-end: the "default to `x`, then override in every case arm"
+  pattern, where the `x` default is provably never the value actually
+  observed in *either* simulator
+  (`ictus-cli/tests/differential_xz_default.rs`).
+
+**Comparison/logical/reduction results as concatenation operands**:
+also done, found immediately after the fix above (`{a[14:12]==3'b0, ...}`
+-style instruction-decode concatenations, common once picorv32 could be
+run further through the pipeline). `expr_width` previously only knew
+`Select`/`DynamicBitSelect`/`Signed`/`BitwiseNot`/reduction results'
+widths -- extended to also recognize `Not`/`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`/
+`LogicalAnd`/`LogicalOr` as always exactly 1 bit, which Verilog defines
+them to be (not an approximation the way `Add`/`Sub`/`Mul`'s width would
+be, so this is a safe, unambiguous addition, unlike guessing at general
+arithmetic width inference). Verified with a fixture concatenating four
+different comparison results, checked structurally
+(`ictus-frontend-verilog/tests/concat_compare.rs`) and differentially
+against Icarus Verilog across several `(a, b)` pairs chosen to exercise
+each comparison
+(`ictus-cli/tests/differential_concat_compare.rs`).
+
+**Next confirmed blocker**: shift operators (`<<`, `>>`, and their
+arithmetic-shift variants `<<<`, `>>>`). Re-running the picorv32
+diagnostic after the two fixes above hits `unsupported binary operator
+'<<'` -- `apply_binary_op`'s match has no shift arm at all yet. Not yet
+attempted. Likely more involved than a single new match arm: a *logical*
+shift (`<<`/`>>`) is straightforward (`wrapping_shl`/`wrapping_shr`-style,
+careful of a shift amount `>= 64` the same way `Expr::Signed`'s own
+evaluation already has to be), but the *arithmetic* right shift (`>>>`)
+needs to know whether its left operand is signed (real Verilog: `>>>`
+sign-extends for a signed operand, zero-fills for unsigned) -- the same
+signed/unsigned distinction `apply_binary_op`'s existing `Signed`-operand
+guard already has to reason about for ordering comparisons, so this may
+extend that guard rather than needing a wholly new mechanism, but that's
+a design question worth confirming against real picorv32 usage
+(`alu_shr <= $signed({...}) >>> reg_op2[4:0];`, seen during the
+`$signed(...)` work) before assuming, not a default.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
@@ -564,16 +622,18 @@ resolution pass (value expressions may reference an earlier parameter/
 localparam, and use `+ - * & | ^ == != < <= > >= && ||`, the ternary
 operator, and concatenation; no overriding a `parameter` at
 instantiation), constant/variable bit-select and constant part-select,
-concatenation (plain and replication) and ternary on reads only, a
-constant bit-select/part-select -- or a concatenation of such -- as a
-non-blocking (`<=`) assignment target but not a continuous (`assign`)
-one and not with a variable index (though the index/bound *may*
-reference a parameter/localparam, per the constant-folding work above),
-`$signed(...)` to sign-extend a value into a wider assignment target but
-not as an operand of an ordering comparison (and no other system
-function), a call to a provably-empty task but no other task/function
-calls, logical `!`, bitwise `~`, and the reduction operators, no 4-state
-`x`/`z` literal outside a case item, no array/memory signals (`reg
+concatenation (plain and replication) and ternary on reads only -- with
+comparison/logical/reduction results, not just literals/refs/selects,
+now valid concatenation operands -- a constant bit-select/part-select --
+or a concatenation of such -- as a non-blocking (`<=`) assignment target
+but not a continuous (`assign`) one and not with a variable index (though
+the index/bound *may* reference a parameter/localparam, per the
+constant-folding work), `$signed(...)` to sign-extend a value into a
+wider assignment target but not as an operand of an ordering comparison
+(and no other system function), a call to a provably-empty task but no
+other task/function calls, logical `!`, bitwise `~`, and the reduction
+operators, a 4-state `x`/`z` literal outside a case item (resolves to
+`0`) but no shift operators at all, no array/memory signals (`reg
 [31:0] mem [0:31]` -- this is what picorv32's register file actually
 needs, and is a distinct, likely-larger gap from bit-select on a single
 signal), no module instantiation. Cranelift codegen and actually getting

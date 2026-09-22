@@ -42,14 +42,17 @@
 //! as a *continuous*-assignment target, are still rejected, since only
 //! `<=` has a commit phase to do the read-modify-write in -- see the
 //! `NetLvalue::Lvalue` check in `lower_continuous_assign`. And expressions
-//! built from literals (decimal/binary/hex; not octal, not X/Z-valued
-//! outside a case item), signal references, unary logical `!`, bitwise
+//! built from literals (decimal/binary/hex, not octal; a 4-state `x`/`z`
+//! digit -- whole-value or mixed with real digits, any base, *outside* a
+//! `case`/`casez`/`casex` item's own wildcard matching -- resolves to the
+//! bit `0`, see `parse_binary_literal_value`/`parse_hex_literal_value`
+//! and decisions.md D19), signal references, unary logical `!`, bitwise
 //! complement `~`, and the reduction operators `& | ^ ~& ~| ~^`/`^~` (see
 //! `lower_expr`'s `E::Unary` arm and `ictus_ir::Expr::BitwiseNot`/
 //! `ReduceAnd`/`ReduceOr`/`ReduceXor`'s doc comments -- NAND/NOR/XNOR
 //! compose `BitwiseNot` with a reduction at lowering time rather than
 //! getting their own IR), the binary operators
-//! `+ & | ^ == != < <= > >= && ||`, and the `$signed(...)`
+//! `+ - * & | ^ == != < <= > >= && ||`, and the `$signed(...)`
 //! system function (see `lower_system_function_call` and
 //! `ictus_ir::Expr::Signed`'s doc comment -- v1 only implements this well
 //! enough to sign-extend a value into a wider assignment target, which is
@@ -79,15 +82,13 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- a 4-state `x`/`z` digit in a
-//! literal *outside* a `case`/`casez`/`casex` item (`lower_number`'s
-//! binary-literal parser only accepts `0`/`1` today; this is what
-//! picorv32 hits next, right after the `localparam`/constant-expression
-//! support above -- a 2-state kernel (decisions.md D6) has no real 'x' to
-//! represent, so accepting this needs a real policy decision, e.g. "reads
-//! as 0", not a default), array/memory signals (`reg [31:0] mem [0:31]`),
-//! `always_comb`, and module instantiation are the next-highest-value
-//! gaps toward running a real design like phase 0's picorv32 benchmark.
+//! later phases need more of the language -- shift operators (`<< >>`,
+//! and their arithmetic variants `<<< >>>`; not in `apply_binary_op`'s
+//! match at all yet, so this is what picorv32 hits next, right after the
+//! 4-state-literal and comparison-as-concatenation-operand fixes above),
+//! array/memory signals (`reg [31:0] mem [0:31]`), `always_comb`, and
+//! module instantiation are the next-highest-value gaps toward running a
+//! real design like phase 0's picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -1776,11 +1777,28 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         // `ictus_kernel::eval_expr`) -- the reduction's own result is
         // always exactly 1 bit, regardless of what it reduced.
         Expr::BitwiseNot(_, width) => Ok(*width),
-        Expr::ReduceAnd(..) | Expr::ReduceOr(..) | Expr::ReduceXor(..) => Ok(1),
+        // Every comparison, logical, and reduction operator is *defined*
+        // by Verilog to produce exactly 1 bit (0 or 1) -- not a guess or
+        // an approximation the way a general arithmetic result's width
+        // would be, so these are safe to allow as concatenation operands
+        // unlike `Add`/`Sub`/`Mul`/etc. below.
+        Expr::Not(_)
+        | Expr::Eq(..)
+        | Expr::Ne(..)
+        | Expr::Lt(..)
+        | Expr::Le(..)
+        | Expr::Gt(..)
+        | Expr::Ge(..)
+        | Expr::LogicalAnd(..)
+        | Expr::LogicalOr(..)
+        | Expr::ReduceAnd(..)
+        | Expr::ReduceOr(..)
+        | Expr::ReduceXor(..) => Ok(1),
         other => Err(format!(
             "concatenation operand's width can't be determined in v1 (only literals, signal \
-             references, bit-select/part-select, nested concatenation, and ternary are \
-             supported as operands): {other:?}"
+             references, bit-select/part-select, nested concatenation, ternary, and \
+             comparison/logical/reduction operators -- always exactly 1 bit -- are supported \
+             as operands): {other:?}"
         )),
     }
 }
@@ -1902,19 +1920,65 @@ fn lower_number(number: &Number, tree: &SyntaxTree) -> Result<Expr, String> {
         IntegralNumber::BinaryNumber(b) => {
             let width = lower_size(&b.nodes.0, tree)?;
             let text = locate_text(&b.nodes.2.nodes.0, tree)?;
-            let value = u64::from_str_radix(&strip_underscores(text), 2)
-                .map_err(|_| format!("could not parse binary literal '{text}'"))?;
+            let value = parse_binary_literal_value(&strip_underscores(text))?;
             Ok(Expr::Literal { value, width })
         }
         IntegralNumber::HexNumber(h) => {
             let width = lower_size(&h.nodes.0, tree)?;
             let text = locate_text(&h.nodes.2.nodes.0, tree)?;
-            let value = u64::from_str_radix(&strip_underscores(text), 16)
-                .map_err(|_| format!("could not parse hex literal '{text}'"))?;
+            let value = parse_hex_literal_value(&strip_underscores(text))?;
             Ok(Expr::Literal { value, width })
         }
         IntegralNumber::OctalNumber(_) => Err("octal literals are not supported in v1".to_string()),
     }
+}
+
+/// A 4-state `x`/`z` digit *outside* a `case`/`casez`/`casex` item's own
+/// wildcard matching (see `lower_wildcard_binary`, which this deliberately
+/// doesn't share code with -- that one tracks a `care_mask` for pattern
+/// matching, this one just needs a plain value) has no real meaning in
+/// this 2-state kernel (decisions.md D6) -- resolved to the bit `0`,
+/// matching Verilator's own default X-handling policy (a real precedent
+/// for exactly this choice, not a guess). See decisions.md D19 for the
+/// full reasoning and why this is a deliberate, narrow literal-parsing
+/// policy, not the (much larger, still-future) real 4-state signal
+/// tracking D6 describes.
+fn parse_binary_literal_value(digits: &str) -> Result<u64, String> {
+    let mut value: u64 = 0;
+    for ch in digits.chars() {
+        value <<= 1;
+        match ch {
+            '0' => {}
+            '1' => value |= 1,
+            'x' | 'X' | 'z' | 'Z' => {}
+            other => {
+                return Err(format!(
+                    "unexpected character '{other}' in binary literal '{digits}'"
+                ))
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Same policy as `parse_binary_literal_value` (see its doc comment), one
+/// hex digit at a time -- an `x`/`z` hex digit stands for four unknown
+/// bits at once, all resolved to `0`.
+fn parse_hex_literal_value(digits: &str) -> Result<u64, String> {
+    let mut value: u64 = 0;
+    for ch in digits.chars() {
+        value <<= 4;
+        match ch {
+            'x' | 'X' | 'z' | 'Z' => {}
+            _ => {
+                let digit = ch.to_digit(16).ok_or_else(|| {
+                    format!("unexpected character '{ch}' in hex literal '{digits}'")
+                })?;
+                value |= u64::from(digit);
+            }
+        }
+    }
+    Ok(value)
 }
 
 fn lower_decimal_number(decimal: &DecimalNumber, tree: &SyntaxTree) -> Result<Expr, String> {
@@ -1934,8 +1998,19 @@ fn lower_decimal_number(decimal: &DecimalNumber, tree: &SyntaxTree) -> Result<Ex
                 .map_err(|_| format!("could not parse decimal literal '{text}'"))?;
             Ok(Expr::Literal { value, width })
         }
-        DecimalNumber::BaseXNumber(_) | DecimalNumber::BaseZNumber(_) => {
-            Err("X/Z-valued literals are not supported (v1 is 2-state only)".to_string())
+        // A whole-value `x`/`z` decimal literal (`8'dx`/`8'dz` -- decimal
+        // 4-state values are all-or-nothing, unlike binary/hex which can
+        // mix `x`/`z` with real digits per-bit) -- same "resolves to 0"
+        // policy as parse_binary_literal_value/parse_hex_literal_value,
+        // just with no per-digit parsing needed since the whole value is
+        // already known to be all-`x`/all-`z`.
+        DecimalNumber::BaseXNumber(b) => {
+            let width = lower_size(&b.nodes.0, tree)?;
+            Ok(Expr::Literal { value: 0, width })
+        }
+        DecimalNumber::BaseZNumber(b) => {
+            let width = lower_size(&b.nodes.0, tree)?;
+            Ok(Expr::Literal { value: 0, width })
         }
     }
 }

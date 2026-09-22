@@ -744,3 +744,77 @@ Re-running the diagnostic once more after this fix confirms the next
 blocker is unrelated to constants at all: a 4-state `x`/`z` digit in a
 literal outside a `case` item, which needs a real policy decision (what
 does `x` even mean in a 2-state kernel, D6) before implementation.
+
+## D19 — A 4-state `x`/`z` literal digit (outside `case`) resolves to `0`
+
+**Decision**: a `x`/`z` digit in a numeric literal -- whole-value
+(`8'bx`, `8'hxx`, `8'dx`) or mixed with real digits (`4'b10x1`), in any
+base -- resolves to the bit `0` when it's lowered *outside* a
+`case`/`casez`/`casex` item's own wildcard matching (which already has
+separate, correct handling -- `lower_wildcard_binary`, tracking a
+`care_mask` for pattern matching, not a value). This is a narrow,
+self-contained literal-*parsing* policy, not the real per-signal 4-state
+*tracking* D6 describes as a genuine future capability (opt-in, per
+signal/module, tracking propagate-through-simulation unknown/high-Z
+state) -- nothing about D6's scope or sequencing changes here; this
+decision only says what a specific source character parses to as a
+constant, today, with the 2-state representation D6 already committed to
+for v1.
+
+**Why 0, specifically**: matches Verilator's own default X-handling
+policy -- a real precedent for exactly this choice in exactly this kind
+of tool (a 2-state-by-default simulator that still needs to accept real
+RTL containing `x`/`z` literals), not a guess invented for this project.
+picorv32 itself uses `x` literals in two distinct, common, legitimate
+styles that motivate accepting them at all rather than just rejecting
+them louder: an all-`x` "don't care" output on a dead/inactive code path
+(`assign pcpi_mul_rd = 32'bx;`, a PCPI co-processor output when that
+path isn't the active configuration) and a "default to `x`, then
+override in every `case` arm" idiom (`decoded_imm <= 1'bx;` immediately
+followed by a `case` covering every real instruction encoding) --
+extremely common, idiomatic synthesizable-Verilog style, not unusual
+source this project should expect to rewrite around.
+
+**Alternatives considered**: keep rejecting `x`/`z` outright (extending
+the existing `DecimalNumber::BaseXNumber`/`BaseZNumber` rejection to
+binary/hex too, just with a clearer error) -- rejected because it
+doesn't actually unblock anything; the whole point of running real
+designs (picorv32) is lowering the source as written, and this specific
+idiom is too common in real synthesizable RTL to treat as "the source
+needs to be rewritten." Some other resolved value (e.g. `1`, or
+alternating/random bits) -- rejected as having no comparable real-world
+precedent and no clearer justification than `0`; `0` at least matches
+what the closest prior-art tool (Verilator) actually does.
+
+**Why this can't be verified with a general differential test, and what
+that implies for how it's tested**: a genuinely-`x` result in a *real*
+4-state reference simulator (Icarus) has no single value to compare
+against at all -- it reports `x`, which doesn't parse as the plain
+integers this project's differential tests already compare, and even if
+it did, "Ictus says 0, Icarus says x" is not a disagreement about
+correctness, just two different (both individually consistent) answers
+to a question the Verilog LRM deliberately leaves implementation-defined
+for a 2-state tool. So the resolution policy itself is verified
+structurally (`ictus-frontend-verilog/tests/xz_literal.rs`, asserting
+the exact resolved `Expr::Literal` value), and a *separate* differential
+test is built specifically around the one shape where an `x`-containing
+design is still safe to compare end-to-end: the
+default-then-always-overridden idiom, where the final observed value is
+identical in both simulators regardless of how (or whether) the `x`
+default was ever resolved (`ictus-cli/tests/differential_xz_default.rs`,
+using a `case` that covers every possible selector value so the `x`
+default is provably never the sampled result in either simulator).
+
+**Why discovered / confirmed, not assumed**: found the same way as D13
+through D18 -- re-running the picorv32 diagnostic after D18 (localparam)
+landed surfaced this next; real usage sites (both the dead-code and
+default-then-override styles) were grepped and read directly rather than
+guessed at, and the "resolves to 0" policy was cross-checked against
+Verilator's documented default behavior before committing to it, not
+invented from scratch. Re-running the diagnostic again after this fix
+(and, immediately after it, a related but separate fix letting
+comparison/logical/reduction results -- always exactly 1 bit -- be used
+as concatenation operands, found the moment picorv32's own
+instruction-decode concatenations could be reached) confirms the next
+blocker is shift operators (`<< >>`, and the arithmetic variants
+`<<< >>>`), not implemented at all yet.

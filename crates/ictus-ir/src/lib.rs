@@ -13,7 +13,12 @@
 //! and continuous `assign`s but no `always_comb` yet, `if`/`else`/
 //! `else if` and `case`/`casez`/`casex` (see `CaseValue`) alongside
 //! non-blocking assignment, `+ - * & | ^` and comparison/logical
-//! operators, constant and variable bit-select, constant part-select,
+//! operators (a comparison/logical/reduction result is always exactly 1
+//! bit, by Verilog's own definition -- not an approximation the way a
+//! general arithmetic result's width would be, so unlike `Add`/`Sub`/
+//! `Mul` these are valid concatenation operands too; see
+//! `ictus-frontend-verilog`'s `expr_width`), constant and variable
+//! bit-select, constant part-select,
 //! concatenation (including replication/multiple concatenation,
 //! `{N{a,b}}` -- also just an `Expr::Concat`, its part list physically
 //! repeated `N` times by the frontend at lowering time rather than given
@@ -72,6 +77,14 @@ pub struct Signal {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
+    /// A 4-state `x`/`z` digit in the Verilog source this came from
+    /// (whole-value or mixed with real digits, in any base, outside a
+    /// `case`/`casez`/`casex` item's own wildcard matching) is already
+    /// resolved to the bit `0` by the time it reaches this variant -- see
+    /// `ictus-frontend-verilog`'s `parse_binary_literal_value`/
+    /// `parse_hex_literal_value` and docs/decisions.md D19. There's no
+    /// other representation for "unknown" in this 2-state kernel
+    /// (decisions.md D6) to preserve here even if this crate wanted to.
     Literal { value: u64, width: u32 },
     Ref(SignalId),
     /// Logical negation (`!`) -- result is always 0 or 1.
