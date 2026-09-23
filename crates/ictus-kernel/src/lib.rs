@@ -197,6 +197,35 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
         Expr::Add(lhs, rhs) => eval_expr(lhs, values).wrapping_add(eval_expr(rhs, values)),
         Expr::Sub(lhs, rhs) => eval_expr(lhs, values).wrapping_sub(eval_expr(rhs, values)),
         Expr::Mul(lhs, rhs) => eval_expr(lhs, values).wrapping_mul(eval_expr(rhs, values)),
+        // A shift amount of 64 or more shifts every bit out (0), rather
+        // than panicking the way a bare `<<`/`>>` on a u64 would or
+        // silently taking the amount modulo 64 the way `wrapping_shl`
+        // would -- neither of which is what Verilog means.
+        Expr::Shl(lhs, rhs) => {
+            let value = eval_expr(lhs, values);
+            match u32::try_from(eval_expr(rhs, values)) {
+                Ok(shift) => value.checked_shl(shift).unwrap_or(0),
+                Err(_) => 0,
+            }
+        }
+        Expr::Shr(lhs, rhs) => {
+            let value = eval_expr(lhs, values);
+            match u32::try_from(eval_expr(rhs, values)) {
+                Ok(shift) => value.checked_shr(shift).unwrap_or(0),
+                Err(_) => 0,
+            }
+        }
+        // Correct as a plain `i64` shift only because the frontend only
+        // ever builds this with an already-sign-extended `Signed` left
+        // operand -- see `ictus_ir::Expr::AShr`'s doc comment. Clamped to
+        // 63 rather than guarded at 0: shifting an `i64` right by 63
+        // already replicates the sign bit across every bit, so any larger
+        // amount means the same thing.
+        Expr::AShr(lhs, rhs) => {
+            let value = eval_expr(lhs, values) as i64;
+            let shift = u32::try_from(eval_expr(rhs, values)).unwrap_or(u32::MAX).min(63);
+            (value >> shift) as u64
+        }
         Expr::And(lhs, rhs) => eval_expr(lhs, values) & eval_expr(rhs, values),
         Expr::Or(lhs, rhs) => eval_expr(lhs, values) | eval_expr(rhs, values),
         Expr::Xor(lhs, rhs) => eval_expr(lhs, values) ^ eval_expr(rhs, values),
@@ -388,6 +417,55 @@ mod tests {
     fn bitwise_not_masks_to_its_own_width() {
         let expr = Expr::BitwiseNot(Box::new(Expr::Literal { value: 0b0101, width: 4 }), 4);
         assert_eq!(eval_expr(&expr, &[]), 0b1010);
+    }
+
+    /// A shift amount of 64 or more is the case a differential test can't
+    /// reach (a realistic design's shift-amount signal is only a few bits
+    /// wide), and the one where the obvious Rust spelling is wrong: a
+    /// bare `<<`/`>>` panics on shift-overflow, and `wrapping_shl` would
+    /// silently take the amount modulo 64 -- turning `x << 64` into
+    /// `x << 0`, i.e. `x` unchanged, when Verilog says every bit is
+    /// shifted out.
+    #[test]
+    fn logical_shifts_past_the_word_width_produce_zero() {
+        let value = Expr::Literal { value: 0xFF, width: 8 };
+        for amount in [64u64, 100, u64::MAX] {
+            let shift = Expr::Literal { value: amount, width: 32 };
+            let shl = Expr::Shl(Box::new(value.clone()), Box::new(shift.clone()));
+            let shr = Expr::Shr(Box::new(value.clone()), Box::new(shift));
+            assert_eq!(eval_expr(&shl, &[]), 0, "0xFF << {amount}");
+            assert_eq!(eval_expr(&shr, &[]), 0, "0xFF >> {amount}");
+        }
+    }
+
+    /// An arithmetic right shift past the word width replicates the sign
+    /// bit across the whole result rather than producing 0 -- shifting a
+    /// negative value right can never reach 0 in Verilog, however far it
+    /// goes.
+    #[test]
+    fn arithmetic_shift_past_the_word_width_replicates_the_sign_bit() {
+        // 8-bit 0x80 is -128; `Signed` extends it across all 64 bits, so
+        // an `i64` shift sees a genuinely negative value (see
+        // ictus_ir::Expr::AShr's doc comment for why that's the only case
+        // the frontend ever builds an AShr for).
+        let negative = Expr::Signed(Box::new(Expr::Literal { value: 0x80, width: 8 }), 8);
+        let positive = Expr::Signed(Box::new(Expr::Literal { value: 0x7F, width: 8 }), 8);
+        for amount in [64u64, 100, u64::MAX] {
+            let shift = Expr::Literal { value: amount, width: 32 };
+            let negative_shifted =
+                Expr::AShr(Box::new(negative.clone()), Box::new(shift.clone()));
+            let positive_shifted = Expr::AShr(Box::new(positive.clone()), Box::new(shift));
+            assert_eq!(
+                mask(eval_expr(&negative_shifted, &[]), 8),
+                0xFF,
+                "-128 >>> {amount} stays all sign bits"
+            );
+            assert_eq!(
+                eval_expr(&positive_shifted, &[]),
+                0,
+                "+127 >>> {amount} reaches 0"
+            );
+        }
     }
 
     #[test]

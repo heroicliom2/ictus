@@ -74,8 +74,8 @@ semantics in the kernel — the rest of the signal's bits are left
 untouched, and multiple partial writes to the same signal in one clock
 edge combine correctly — and the target index may itself reference a
 parameter/localparam), the operators
-`+ - * & | ^ == != < <= > >= && !`, decimal/hex/binary literals) parses,
-lowers to `ictus-ir`, and runs
+`+ - * << >> >>> & | ^ == != < <= > >= && !`, decimal/hex/binary
+literals) parses, lowers to `ictus-ir`, and runs
 correctly on a tree-walking interpreter — checked with cycle-for-cycle
 differential tests against Icarus Verilog, including an ongoing real
 attempt at lowering the actual phase 0 picorv32 benchmark design (not
@@ -91,10 +91,13 @@ operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) are also supported now.
 A 4-state `x`/`z` digit in a literal outside a `case`/`casez`/`casex`
 item resolves to `0` (matching Verilator's own default X-handling
 policy), and a comparison/logical/reduction result (always exactly 1
-bit) can be used as a concatenation operand. Shift operators (`<<`,
-`>>`), array/memory signals (picorv32's register file needs these),
-module instantiation, and Cranelift JIT codegen are all still ahead of
-where this stands today.
+bit) can be used as a concatenation operand. Shifts are supported
+including the arithmetic right shift (`$signed(x) >>> n`, which really
+does replicate the sign bit). A *signed ordering comparison*
+(`$signed(a) < $signed(b)`, which picorv32's ALU needs), array/memory
+signals (picorv32's register file needs these), module instantiation,
+and Cranelift JIT codegen are all still ahead of where this stands
+today.
 
 ## Workspace layout
 

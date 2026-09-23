@@ -818,3 +818,81 @@ as concatenation operands, found the moment picorv32's own
 instruction-decode concatenations could be reached) confirms the next
 blocker is shift operators (`<< >>`, and the arithmetic variants
 `<<< >>>`), not implemented at all yet.
+
+## D20 — `>>>` needs a `Signed` operand; `>>` of one is rejected
+
+**Decision**: the shift operators split three ways along the same
+signed/unsigned axis D16's guard already reasons about, rather than
+getting one uniform treatment:
+
+1. `<<` and `<<<` both lower to `Expr::Shl`, with a `Signed` operand
+   passing straight through. Shifting *left* has no sign behavior to
+   differ about -- Verilog's "arithmetic" left shift is bit-for-bit the
+   logical one -- so these join `+`/`-`/`*` in the category of operators
+   a sign-extended operand is simply safe for.
+2. `>>` lowers to `Expr::Shr`, but **rejects** a `Signed` left operand.
+   Verilog's `>>` zero-fills even for a signed value (that difference is
+   the entire reason `>>>` exists), and an `Expr::Signed` value arrives
+   already sign-extended across all 64 bits -- so a logical shift of it
+   would pull those extension bits down into the result in place of the
+   zeros the language specifies. Rejected rather than silently doing
+   that, exactly as an ordering comparison of a `Signed` operand is.
+3. `>>>` lowers to `Expr::AShr` **only** when its left operand is
+   `Signed`, and to an ordinary `Expr::Shr` otherwise. This is the one
+   operator where a `Signed` operand is actively *required* rather than
+   merely tolerated -- and the fallback isn't a guess or a degradation:
+   Verilog itself defines `>>>` on an *unsigned* operand as an ordinary
+   logical shift, so lowering it that way is the LRM's own rule.
+
+**Why `AShr` can be a plain `i64` shift**: only because of (3)'s
+restriction. An `Expr::Signed` operand has already been sign-extended
+across the full 64 bits (D16), so the bit an `i64` arithmetic shift
+replicates *is* the operand's real sign bit rather than whatever happened
+to land in bit 63. That's also why this doesn't need `AShr` to carry a
+width the way `Signed`/`BitwiseNot`/the reduction operators do -- the
+width information is already baked into the operand by the time it gets
+here. Sign-extending further than the source width and then truncating at
+write time gives the same low bits as sign-extending exactly to the
+context width and shifting there, which is what makes
+`$signed(x) >>> n` assigned into a *wider* target come out correct too
+(verified against Icarus, not assumed -- see
+`ictus-cli/tests/differential_shift.rs`'s 16-bit output column).
+
+**Alternatives considered**: evaluate `AShr` as an `i64` shift
+*unconditionally*, without requiring a `Signed` operand -- rejected as
+accidental correctness: it would happen to work for every realistic
+design only because signals narrower than 64 bits always leave bit 63
+clear, which is exactly the "works because of what we happen to feed it"
+reasoning this project treats as a latent bug rather than a design.
+Rejecting unsigned `>>>` outright instead of lowering it to `Shr` --
+rejected because it's well-defined legal Verilog, and refusing it would
+be inventing a restriction the language doesn't have. Giving `<<<` its
+own IR variant -- rejected as pure duplication, since it's defined to be
+identical to `<<`.
+
+**Out-of-range shift amounts**: a shift of 64 or more produces 0 for the
+logical shifts and a full sign-replication for the arithmetic one. Worth
+recording because the two obvious Rust spellings are both *wrong* here: a
+bare `<<`/`>>` on a `u64` panics on shift-overflow, and `wrapping_shl`
+silently takes the shift amount modulo 64 -- turning `x << 64` into
+`x << 0`, i.e. `x` unchanged, when Verilog says every bit is shifted out.
+`checked_shl`/`checked_shr` with an explicit `unwrap_or(0)`, and a clamp
+to 63 for the arithmetic shift, are what actually match the language.
+Covered by `ictus_kernel`'s own unit tests rather than differentially: a
+realistic design's shift-amount signal is only a few bits wide, so no
+differential fixture can reach the case at all.
+
+**Why discovered / confirmed, not assumed**: found the same way as D13
+through D19 -- re-running the picorv32 diagnostic after D19 surfaced
+`unsupported binary operator '<<'`, and every real usage site was grepped
+and read before designing (`reg_op1 << reg_op2[4:0]`, `reg_op1 >> 4`,
+`$signed(reg_op1) >>> 4`, `$signed({...}) >>> reg_op2[4:0]` -- notably,
+picorv32 writes `>>>` *only* ever with an explicit `$signed(...)` left
+operand, which is what made (3)'s split the obvious shape rather than a
+speculative one). The differential test deliberately picks values with
+the sign bit set for three of its four cases, so an arithmetic and a
+logical right shift give visibly different answers and a regression
+would fail rather than slip through. Re-running the diagnostic once more
+after this fix lands on D16's own signed-ordering-comparison guard
+(picorv32's `alu_lts <= $signed(reg_op1) < $signed(reg_op2);`) -- a
+deliberately-deferred gap finally reached, not a new discovery.

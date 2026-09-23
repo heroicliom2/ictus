@@ -598,29 +598,83 @@ against Icarus Verilog across several `(a, b)` pairs chosen to exercise
 each comparison
 (`ictus-cli/tests/differential_concat_compare.rs`).
 
-**Next confirmed blocker**: shift operators (`<<`, `>>`, and their
-arithmetic-shift variants `<<<`, `>>>`). Re-running the picorv32
-diagnostic after the two fixes above hits `unsupported binary operator
-'<<'` -- `apply_binary_op`'s match has no shift arm at all yet. Not yet
-attempted. Likely more involved than a single new match arm: a *logical*
-shift (`<<`/`>>`) is straightforward (`wrapping_shl`/`wrapping_shr`-style,
-careful of a shift amount `>= 64` the same way `Expr::Signed`'s own
-evaluation already has to be), but the *arithmetic* right shift (`>>>`)
-needs to know whether its left operand is signed (real Verilog: `>>>`
-sign-extends for a signed operand, zero-fills for unsigned) -- the same
-signed/unsigned distinction `apply_binary_op`'s existing `Signed`-operand
-guard already has to reason about for ordering comparisons, so this may
-extend that guard rather than needing a wholly new mechanism, but that's
-a design question worth confirming against real picorv32 usage
-(`alu_shr <= $signed({...}) >>> reg_op2[4:0];`, seen during the
-`$signed(...)` work) before assuming, not a default.
+**Shift operators** (`<<`, `>>`, `<<<`, `>>>`): done, and the guess in
+the previous version of this section held up -- it did extend
+`apply_binary_op`'s existing `Signed`-operand guard rather than needing a
+new mechanism. Three new `Expr` variants (`Shl`, `Shr`, `AShr`), and the
+whole design turns on the same signed/unsigned axis that guard already
+reasons about, splitting three ways:
+
+- `<<` and `<<<` are **sign-agnostic** -- shifting left has no sign
+  behavior to differ about, so both lower to the same `Expr::Shl` and a
+  `Signed` operand passes through untouched, exactly like `+`/`-`/`*`.
+- `>>` is a **logical** shift in Verilog even for a signed operand
+  (that difference is precisely why `>>>` exists) -- which an
+  `Expr::Signed` value can't represent, since it arrives already
+  sign-extended across all 64 bits and those extension bits would shift
+  down in place of the zeros Verilog specifies. So `$signed(x) >> n` is
+  *rejected*, same discipline as a signed ordering comparison. No real
+  design has needed it: picorv32 writes `>>` only on plain unsigned
+  operands.
+- `>>>` is the one that genuinely needs the distinction, and the one
+  place a `Signed` operand is actively *required* rather than merely
+  tolerated. With one, it lowers to `Expr::AShr`, evaluated as a plain
+  `i64` shift -- correct precisely *because* the operand arrives
+  sign-extended, so the bit an `i64` shift replicates is the operand's
+  real sign bit rather than whatever landed in bit 63. Without one,
+  Verilog itself defines `>>>` as an ordinary logical shift, so it
+  lowers to `Expr::Shr` -- the LRM's own rule, not an approximation.
+  (The `Signed` check is deliberately shallow, matching the existing
+  ordering-comparison guard: `($signed(a) + 1) >>> n` wouldn't be
+  detected. picorv32 always writes the direct `$signed(...) >>> n` form,
+  so no real case is affected; documented at the guard rather than
+  silently assumed away.)
+
+Out-of-range shift amounts needed care the obvious Rust spelling gets
+wrong: a bare `<<`/`>>` on a `u64` panics on shift-overflow, and
+`wrapping_shl` would silently take the amount modulo 64 -- turning
+`x << 64` into `x << 0`, i.e. `x` unchanged, when Verilog says every bit
+is shifted out. Logical shifts of 64 or more produce 0; an arithmetic one
+clamps to 63, which already replicates the sign bit across every bit.
+
+Verified per this project's usual practice, with values chosen so the
+sign bit is set in three of four cases -- so an arithmetic and a logical
+right shift give visibly different answers and a regression that lowered
+`>>>` as a logical shift would fail rather than slip through -- plus one
+sign-bit-clear control case where all three right shifts must agree.
+Checked structurally (`ictus-frontend-verilog/tests/shift.rs`, including
+that `>>>` on an unsigned operand really does lower to a logical `Shr`,
+and a negative test for the rejected `$signed(x) >> n`) and
+differentially against Icarus Verilog
+(`ictus-cli/tests/differential_shift.rs`), which also covers the same
+`$signed(x) >>> n` expression assigned into a *wider* target, where
+Verilog sign-extends to the context width first and the extra bits must
+come out as sign bits rather than zeros. The out-of-range shift amounts
+are covered by `ictus_kernel`'s own unit tests instead -- a realistic
+design's shift-amount signal is only a few bits wide, so no differential
+fixture can reach them.
+
+**Next confirmed blocker**: a real *signed ordering comparison*
+(`$signed(a) < $signed(b)`). Re-running the picorv32 diagnostic after the
+shift work hits the guard D16 deliberately put in place -- picorv32's own
+ALU writes `alu_lts <= $signed(reg_op1) < $signed(reg_op2);`, exactly the
+case that guard rejects rather than silently comparing the sign-extended
+bit patterns as unsigned (where a negative value reads as an enormous
+positive one). Not yet attempted, and the fix is probably small now that
+`Expr::Signed` and `Expr::AShr` have established the pattern: since a
+`Signed` operand is already sign-extended across all 64 bits, comparing
+two of them as `i64` should be correct the same way `AShr`'s `i64` shift
+is. The real question is what to do with the *mixed* cases (one operand
+signed, one not) and how to keep the shallow-`Signed`-check limitation
+honest -- worth confirming against picorv32's own usage before assuming
+symmetry, not defaulting.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
 `always_comb`, `#(parameter ...)` *and* `localparam` sharing one
 resolution pass (value expressions may reference an earlier parameter/
-localparam, and use `+ - * & | ^ == != < <= > >= && ||`, the ternary
-operator, and concatenation; no overriding a `parameter` at
+localparam, and use `+ - * << >> >>> & | ^ == != < <= > >= && ||`, the
+ternary operator, and concatenation; no overriding a `parameter` at
 instantiation), constant/variable bit-select and constant part-select,
 concatenation (plain and replication) and ternary on reads only -- with
 comparison/logical/reduction results, not just literals/refs/selects,
@@ -633,7 +687,9 @@ wider assignment target but not as an operand of an ordering comparison
 (and no other system function), a call to a provably-empty task but no
 other task/function calls, logical `!`, bitwise `~`, and the reduction
 operators, a 4-state `x`/`z` literal outside a case item (resolves to
-`0`) but no shift operators at all, no array/memory signals (`reg
+`0`), shifts including a real arithmetic right shift (`$signed(x) >>> n`)
+but *not* a logical right shift of a `$signed(...)` value, no
+array/memory signals (`reg
 [31:0] mem [0:31]` -- this is what picorv32's register file actually
 needs, and is a distinct, likely-larger gap from bit-select on a single
 signal), no module instantiation. Cranelift codegen and actually getting

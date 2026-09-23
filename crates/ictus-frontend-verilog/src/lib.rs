@@ -52,7 +52,11 @@
 //! `ReduceAnd`/`ReduceOr`/`ReduceXor`'s doc comments -- NAND/NOR/XNOR
 //! compose `BitwiseNot` with a reduction at lowering time rather than
 //! getting their own IR), the binary operators
-//! `+ - * & | ^ == != < <= > >= && ||`, and the `$signed(...)`
+//! `+ - * << >> >>> & | ^ == != < <= > >= && ||` (`>>>` lowers to a real
+//! arithmetic shift only for a `$signed(...)` left operand, which is the
+//! only case Verilog makes it differ from `>>`; `>>` of a `$signed(...)`
+//! value is rejected rather than shifting that value's sign-extension
+//! bits down -- see `apply_binary_op`), and the `$signed(...)`
 //! system function (see `lower_system_function_call` and
 //! `ictus_ir::Expr::Signed`'s doc comment -- v1 only implements this well
 //! enough to sign-extend a value into a wider assignment target, which is
@@ -82,13 +86,14 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- shift operators (`<< >>`,
-//! and their arithmetic variants `<<< >>>`; not in `apply_binary_op`'s
-//! match at all yet, so this is what picorv32 hits next, right after the
-//! 4-state-literal and comparison-as-concatenation-operand fixes above),
-//! array/memory signals (`reg [31:0] mem [0:31]`), `always_comb`, and
-//! module instantiation are the next-highest-value gaps toward running a
-//! real design like phase 0's picorv32 benchmark.
+//! later phases need more of the language -- a real *signed ordering
+//! comparison* (`$signed(a) < $signed(b)`, currently rejected by
+//! `apply_binary_op`'s guard rather than silently compared as unsigned;
+//! this is what picorv32 hits next, right after the shift-operator
+//! support above, in its ALU's `alu_lts`), array/memory signals (`reg
+//! [31:0] mem [0:31]`), `always_comb`, and module instantiation are the
+//! next-highest-value gaps toward running a real design like phase 0's
+//! picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -560,6 +565,25 @@ fn try_const_fold(expr: &Expr) -> Option<u64> {
         Expr::Add(lhs, rhs) => Some(try_const_fold(lhs)?.wrapping_add(try_const_fold(rhs)?)),
         Expr::Sub(lhs, rhs) => Some(try_const_fold(lhs)?.wrapping_sub(try_const_fold(rhs)?)),
         Expr::Mul(lhs, rhs) => Some(try_const_fold(lhs)?.wrapping_mul(try_const_fold(rhs)?)),
+        // Same out-of-range-shift rules as `ictus_kernel::eval_expr`'s own
+        // arms for these (64-or-more shifts everything out for a logical
+        // shift; an arithmetic one clamps to 63, which already replicates
+        // the sign bit everywhere).
+        Expr::Shl(lhs, rhs) => {
+            let value = try_const_fold(lhs)?;
+            let shift = u32::try_from(try_const_fold(rhs)?).ok()?;
+            Some(value.checked_shl(shift).unwrap_or(0))
+        }
+        Expr::Shr(lhs, rhs) => {
+            let value = try_const_fold(lhs)?;
+            let shift = u32::try_from(try_const_fold(rhs)?).ok()?;
+            Some(value.checked_shr(shift).unwrap_or(0))
+        }
+        Expr::AShr(lhs, rhs) => {
+            let value = try_const_fold(lhs)? as i64;
+            let shift = u32::try_from(try_const_fold(rhs)?).unwrap_or(u32::MAX).min(63);
+            Some((value >> shift) as u64)
+        }
         Expr::And(lhs, rhs) => Some(try_const_fold(lhs)? & try_const_fold(rhs)?),
         Expr::Or(lhs, rhs) => Some(try_const_fold(lhs)? | try_const_fold(rhs)?),
         Expr::Xor(lhs, rhs) => Some(try_const_fold(lhs)? ^ try_const_fold(rhs)?),
@@ -1447,10 +1471,23 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
 /// two's-complement negative number, not a huge positive one), which this
 /// kernel doesn't implement -- so a `Signed` operand there is rejected
 /// with a clear error instead of silently producing an *unsigned*
-/// comparison result that happens to look plausible. Division and
-/// arithmetic right shift (`>>>`) would have the identical problem if/when
-/// they're ever added -- neither is implemented yet at all, so they're
-/// already safely (if incidentally) rejected by the `other` arm below.
+/// comparison result that happens to look plausible.
+///
+/// The shift operators split three ways along the same axis. `<<`/`<<<`
+/// are sign-agnostic (shifting left has no sign behavior to differ
+/// about), so a `Signed` operand passes through like `+`/`-`/`*` do.
+/// `>>` is a *logical* shift in Verilog even for a signed operand, which
+/// a sign-extended `Expr::Signed` value can't represent (its extension
+/// bits would shift down in place of the zeros Verilog wants), so that
+/// combination is rejected like an ordering comparison. `>>>` is the one
+/// that genuinely needs the distinction, and it's the one place a
+/// `Signed` operand is actively *required* rather than tolerated: with
+/// one, it lowers to `Expr::AShr` (correct precisely because the operand
+/// arrives already sign-extended); without one, Verilog itself defines
+/// `>>>` as an ordinary logical shift, so it lowers to `Expr::Shr`.
+/// Division would still have the ordering-comparison problem if it were
+/// ever added -- it isn't implemented at all, so it stays safely (if
+/// incidentally) rejected by the `other` arm below.
 fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> {
     let is_ordering_comparison = matches!(op_text, "<" | "<=" | ">" | ">=");
     if is_ordering_comparison && (matches!(lhs, Expr::Signed(..)) || matches!(rhs, Expr::Signed(..)))
@@ -1464,10 +1501,47 @@ fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> 
         );
     }
 
+    // Verilog's `>>` zero-fills for a signed operand just as it does for
+    // an unsigned one (that difference is exactly what `>>>` exists for),
+    // but `Expr::Signed` evaluates to a value already sign-extended across
+    // all 64 bits -- so a logical shift of it would pull those extension
+    // bits down into the result instead of zeros. Rejected rather than
+    // silently producing that, the same way an ordering comparison of a
+    // `Signed` operand is above; no real design has needed it yet.
+    if op_text == ">>" && matches!(lhs, Expr::Signed(..)) {
+        return Err(
+            "a logical right shift of a $signed(...) value (`$signed(x) >> n`) is not \
+             supported in v1 -- use `>>>` for an arithmetic (sign-replicating) shift, which \
+             is what a signed operand almost always means"
+                .to_string(),
+        );
+    }
+
     match op_text {
         "+" => Ok(Expr::Add(Box::new(lhs), Box::new(rhs))),
         "-" => Ok(Expr::Sub(Box::new(lhs), Box::new(rhs))),
         "*" => Ok(Expr::Mul(Box::new(lhs), Box::new(rhs))),
+        // `<<<` is bit-for-bit identical to `<<` in Verilog -- shifting
+        // left has no sign behavior to differ about -- so both lower to
+        // the same node rather than getting a distinct one.
+        "<<" | "<<<" => Ok(Expr::Shl(Box::new(lhs), Box::new(rhs))),
+        ">>" => Ok(Expr::Shr(Box::new(lhs), Box::new(rhs))),
+        // `>>>` differs from `>>` *only* for a signed left operand; on an
+        // unsigned one Verilog defines it as an ordinary logical shift, so
+        // that's what it lowers to -- not an approximation, the LRM's own
+        // rule. The `Signed` check is deliberately shallow (the operand
+        // itself, not a search through it), matching the ordering-comparison
+        // guard above: picorv32 always writes the direct
+        // `$signed(...) >>> n` form, so a `Signed` value buried deeper
+        // (`($signed(a) + 1) >>> n`) isn't detected -- and would lower to a
+        // logical shift. Worth revisiting if a real design ever writes that.
+        ">>>" => {
+            if matches!(lhs, Expr::Signed(..)) {
+                Ok(Expr::AShr(Box::new(lhs), Box::new(rhs)))
+            } else {
+                Ok(Expr::Shr(Box::new(lhs), Box::new(rhs)))
+            }
+        }
         "&" => Ok(Expr::And(Box::new(lhs), Box::new(rhs))),
         "|" => Ok(Expr::Or(Box::new(lhs), Box::new(rhs))),
         "^" => Ok(Expr::Xor(Box::new(lhs), Box::new(rhs))),

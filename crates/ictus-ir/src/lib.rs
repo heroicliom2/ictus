@@ -12,8 +12,8 @@
 //! signal), any number of clocked (`always @(posedge clk)`) processes
 //! and continuous `assign`s but no `always_comb` yet, `if`/`else`/
 //! `else if` and `case`/`casez`/`casex` (see `CaseValue`) alongside
-//! non-blocking assignment, `+ - * & | ^` and comparison/logical
-//! operators (a comparison/logical/reduction result is always exactly 1
+//! non-blocking assignment, `+ - * << >> >>> & | ^` and comparison/
+//! logical operators (a comparison/logical/reduction result is always exactly 1
 //! bit, by Verilog's own definition -- not an approximation the way a
 //! general arithmetic result's width would be, so unlike `Add`/`Sub`/
 //! `Mul` these are valid concatenation operands too; see
@@ -121,6 +121,35 @@ pub enum Expr {
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
+    /// Left shift (`a << b`, and `a <<< b` -- Verilog's arithmetic left
+    /// shift is bit-for-bit identical to the logical one, since shifting
+    /// *left* has no sign behavior to differ about). Like `Add`, the
+    /// result isn't masked here: bits shifted up past the eventual
+    /// target's width are dropped later, at signal-write time, which
+    /// matches Verilog's own context-determined sizing for the
+    /// assignment forms this lowers. A shift amount of 64 or more
+    /// produces 0 (every bit shifted out), rather than Rust's
+    /// shift-overflow panic or a `wrapping_shl`-style modulo-64 shift
+    /// amount, neither of which is what Verilog means.
+    Shl(Box<Expr>, Box<Expr>),
+    /// Logical right shift (`a >> b`) -- always zero-fills, for a signed
+    /// *or* unsigned operand; that's exactly why Verilog has a separate
+    /// `>>>`, represented by `AShr` below. A shift amount of 64 or more
+    /// produces 0, same reasoning as `Shl`.
+    Shr(Box<Expr>, Box<Expr>),
+    /// Arithmetic (sign-replicating) right shift (`a >>> b`) -- only ever
+    /// built when the left operand is a `Signed` value, since `>>>` on an
+    /// *unsigned* operand is defined by Verilog to be an ordinary logical
+    /// shift and the frontend lowers that case to `Shr` instead (see
+    /// `ictus-frontend-verilog::apply_binary_op`). That restriction is
+    /// what makes evaluating this as a plain `i64` shift correct: a
+    /// `Signed` operand has already been sign-extended across the full 64
+    /// bits (see `Signed`'s own doc comment), so the sign bit an `i64`
+    /// shift replicates is the operand's real sign bit, not whatever
+    /// happened to land in bit 63. A shift amount of 64 or more
+    /// replicates the sign bit across the whole result (all-ones for a
+    /// negative value, 0 otherwise).
+    AShr(Box<Expr>, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Xor(Box<Expr>, Box<Expr>),
