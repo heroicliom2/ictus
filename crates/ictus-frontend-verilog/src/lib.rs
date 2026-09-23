@@ -52,18 +52,20 @@
 //! `ReduceAnd`/`ReduceOr`/`ReduceXor`'s doc comments -- NAND/NOR/XNOR
 //! compose `BitwiseNot` with a reduction at lowering time rather than
 //! getting their own IR), the binary operators
-//! `+ - * << >> >>> & | ^ == != < <= > >= && ||` (`>>>` lowers to a real
-//! arithmetic shift only for a `$signed(...)` left operand, which is the
-//! only case Verilog makes it differ from `>>`; `>>` of a `$signed(...)`
-//! value is rejected rather than shifting that value's sign-extension
-//! bits down -- see `apply_binary_op`), and the `$signed(...)`
+//! `+ - * << >> >>> & | ^ == != < <= > >= && ||` -- several of which key
+//! off whether their operands are `$signed(...)`: `>>>` lowers to a real
+//! arithmetic shift only for a `$signed(...)` left operand (the only case
+//! Verilog makes it differ from `>>`), `>>` of a `$signed(...)` value is
+//! rejected rather than shifting that value's sign-extension bits down,
+//! and an ordering comparison lowers to a real *signed* comparison when
+//! *both* operands are `$signed(...)` (rejecting the mixed case, which
+//! Verilog compares unsigned via a truncation this doesn't implement) --
+//! see `apply_binary_op`. And the `$signed(...)`
 //! system function (see `lower_system_function_call` and
-//! `ictus_ir::Expr::Signed`'s doc comment -- v1 only implements this well
-//! enough to sign-extend a value into a wider assignment target, which is
-//! all picorv32 needs it for on the write side; using it as an operand of
-//! `< <= > >=` is rejected rather than silently doing an unsigned
-//! comparison, since a real signed *ordering* comparison isn't
-//! implemented -- see `apply_binary_op`'s guard). Also lowers a
+//! `ictus_ir::Expr::Signed`'s doc comment -- it sign-extends a value into
+//! a wider assignment target, and marks operands for the signed-aware
+//! operators listed above; it is *not* a general signed type system, so
+//! anything beyond those is rejected rather than guessed at). Also lowers a
 //! statement-level call to a *provably-empty* task (`some_task;`, no
 //! arguments -- see `lower_task_call_statement` and
 //! `lower_task_declarations`) as a true no-op, since v1 doesn't model
@@ -86,14 +88,15 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- a real *signed ordering
-//! comparison* (`$signed(a) < $signed(b)`, currently rejected by
-//! `apply_binary_op`'s guard rather than silently compared as unsigned;
-//! this is what picorv32 hits next, right after the shift-operator
-//! support above, in its ALU's `alu_lts`), array/memory signals (`reg
-//! [31:0] mem [0:31]`), `always_comb`, and module instantiation are the
-//! next-highest-value gaps toward running a real design like phase 0's
-//! picorv32 benchmark.
+//! later phases need more of the language -- array/memory signals (`reg
+//! [31:0] mem [0:31]`, indexed with a *runtime* index on both sides:
+//! picorv32's own register file, `cpuregs[latched_rd] <= ...`, is what
+//! the diagnostic hits next, right after the signed-comparison support
+//! above; this is the big one, needing new IR for an array-shaped signal,
+//! runtime-indexed reads *and* writes, and matching storage in the
+//! kernel, not just another operator), `always_comb`, and module
+//! instantiation are the next-highest-value gaps toward running a real
+//! design like phase 0's picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -593,6 +596,9 @@ fn try_const_fold(expr: &Expr) -> Option<u64> {
         Expr::Le(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? <= try_const_fold(rhs)?)),
         Expr::Gt(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? > try_const_fold(rhs)?)),
         Expr::Ge(lhs, rhs) => Some(bool_val(try_const_fold(lhs)? >= try_const_fold(rhs)?)),
+        Expr::SignedLt(lhs, rhs) => Some(bool_val(
+            (try_const_fold(lhs)? as i64) < (try_const_fold(rhs)? as i64),
+        )),
         Expr::LogicalAnd(lhs, rhs) => {
             Some(bool_val(try_const_fold(lhs)? != 0 && try_const_fold(rhs)? != 0))
         }
@@ -1465,13 +1471,21 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
 /// declared signedness, as long as only the low bits of a wrapping result
 /// are kept -- which is exactly what `wrapping_sub`/`wrapping_mul` on a
 /// full `u64` representation, truncated later by whatever narrower
-/// context actually needs it, already does. Ordering comparisons
-/// (`< <= > >=`) are different: real signed ordering needs a genuinely
-/// different comparison (treating the sign-extended bit pattern as a
-/// two's-complement negative number, not a huge positive one), which this
-/// kernel doesn't implement -- so a `Signed` operand there is rejected
-/// with a clear error instead of silently producing an *unsigned*
-/// comparison result that happens to look plausible.
+/// context actually needs it, already does.
+///
+/// Ordering comparisons (`< <= > >=`) are different, and split three ways
+/// by how many of their operands are `Signed`. With **both** signed, this
+/// builds a real signed comparison out of the single `Expr::SignedLt`
+/// variant -- `a > b` is `b < a`, `a <= b` is `!(b < a)`, `a >= b` is
+/// `!(a < b)` -- correct as an `i64` comparison downstream precisely
+/// because both operands arrive sign-extended across all 64 bits. With
+/// **neither** signed, the ordinary unsigned comparison. With exactly
+/// **one**, Verilog's own rule is to compare unsigned, but that needs the
+/// signed operand truncated back to its own width first (an 8-bit -1 has
+/// to read as 255, not as the 64-bit sign-extended pattern `Expr::Signed`
+/// evaluates to) -- not implemented, and not needed by any real design
+/// yet, so that combination is rejected rather than silently comparing
+/// the sign-extended pattern as an enormous positive number.
 ///
 /// The shift operators split three ways along the same axis. `<<`/`<<<`
 /// are sign-agnostic (shifting left has no sign behavior to differ
@@ -1490,15 +1504,39 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
 /// incidentally) rejected by the `other` arm below.
 fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> {
     let is_ordering_comparison = matches!(op_text, "<" | "<=" | ">" | ">=");
-    if is_ordering_comparison && (matches!(lhs, Expr::Signed(..)) || matches!(rhs, Expr::Signed(..)))
-    {
-        return Err(
-            "a signed comparison ($signed(...) as an operand of <, <=, >, or >=) is not \
-             supported in v1 -- $signed(...) is only supported directly as (or within a \
-             concatenation forming) an assignment's right-hand side, where sign extension \
-             happens automatically at write time"
-                .to_string(),
-        );
+    if is_ordering_comparison {
+        let lhs_signed = matches!(lhs, Expr::Signed(..));
+        let rhs_signed = matches!(rhs, Expr::Signed(..));
+        match (lhs_signed, rhs_signed) {
+            // Both signed: a real signed comparison, built from the one
+            // `SignedLt` variant plus operand-swapping and negation.
+            (true, true) => {
+                return Ok(match op_text {
+                    "<" => Expr::SignedLt(Box::new(lhs), Box::new(rhs)),
+                    ">" => Expr::SignedLt(Box::new(rhs), Box::new(lhs)),
+                    "<=" => Expr::Not(Box::new(Expr::SignedLt(Box::new(rhs), Box::new(lhs)))),
+                    ">=" => Expr::Not(Box::new(Expr::SignedLt(Box::new(lhs), Box::new(rhs)))),
+                    _ => unreachable!("is_ordering_comparison covers exactly these four"),
+                });
+            }
+            // Exactly one signed: Verilog says compare *unsigned* here --
+            // but doing that correctly needs the signed operand
+            // re-truncated to its own width first (an 8-bit -1 has to read
+            // as 255, not as the 64-bit sign-extended pattern
+            // `Expr::Signed` evaluates to). Not implemented, and no real
+            // design has needed it, so it's rejected rather than silently
+            // comparing that huge pattern.
+            (true, false) | (false, true) => {
+                return Err(
+                    "a mixed signed/unsigned comparison (only one operand is $signed(...)) is \
+                     not supported in v1 -- Verilog compares these as *unsigned*, which needs \
+                     the signed operand truncated back to its own width first"
+                        .to_string(),
+                );
+            }
+            // Neither signed: the ordinary unsigned comparison below.
+            (false, false) => {}
+        }
     }
 
     // Verilog's `>>` zero-fills for a signed operand just as it does for
@@ -1863,6 +1901,7 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         | Expr::Le(..)
         | Expr::Gt(..)
         | Expr::Ge(..)
+        | Expr::SignedLt(..)
         | Expr::LogicalAnd(..)
         | Expr::LogicalOr(..)
         | Expr::ReduceAnd(..)

@@ -62,20 +62,7 @@ fn lowers_signed_system_function_on_a_concatenation_argument() {
     }
 }
 
-/// `$signed(...)` used as an operand of an ordering comparison (`<`) must
-/// be rejected, not silently lowered as an *unsigned* comparison on the
-/// sign-extended bit pattern -- see `apply_binary_op`'s doc comment for
-/// why that would be silently wrong (a negative value's sign-extended
-/// pattern is numerically huge as an unsigned u64).
-#[test]
-fn rejects_signed_comparison() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/signed_comparison_test.v");
-    let err = ictus_frontend_verilog::lower_file(&path).expect_err(
-        "signed_comparison_test.v compares two $signed(...) values with <, which v1 must reject",
-    );
-    assert!(
-        err.contains("signed comparison"),
-        "expected the error to mention signed comparison, got: {err}"
-    );
-}
+// A `$signed(...)` operand of an ordering comparison used to be rejected
+// outright here; both-signed comparisons are supported now (decisions.md
+// D21), and the mixed signed/unsigned case that's still rejected is
+// covered by signed_compare.rs alongside the positive cases.

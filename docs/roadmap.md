@@ -654,20 +654,62 @@ are covered by `ictus_kernel`'s own unit tests instead -- a realistic
 design's shift-amount signal is only a few bits wide, so no differential
 fixture can reach them.
 
-**Next confirmed blocker**: a real *signed ordering comparison*
-(`$signed(a) < $signed(b)`). Re-running the picorv32 diagnostic after the
-shift work hits the guard D16 deliberately put in place -- picorv32's own
-ALU writes `alu_lts <= $signed(reg_op1) < $signed(reg_op2);`, exactly the
-case that guard rejects rather than silently comparing the sign-extended
-bit patterns as unsigned (where a negative value reads as an enormous
-positive one). Not yet attempted, and the fix is probably small now that
-`Expr::Signed` and `Expr::AShr` have established the pattern: since a
-`Signed` operand is already sign-extended across all 64 bits, comparing
-two of them as `i64` should be correct the same way `AShr`'s `i64` shift
-is. The real question is what to do with the *mixed* cases (one operand
-signed, one not) and how to keep the shallow-`Signed`-check limitation
-honest -- worth confirming against picorv32's own usage before assuming
-symmetry, not defaulting.
+**Signed ordering comparisons** (`$signed(a) < $signed(b)`): done,
+finally reaching and resolving the gap D16 deliberately deferred back
+when `$signed(...)` was first added. picorv32's ALU writes
+`alu_lts <= $signed(reg_op1) < $signed(reg_op2);` -- and that turned out
+to be the *only* signed-comparison shape in the whole design, with both
+operands signed, which made the scope clean. As the previous version of
+this section guessed, the fix was small once `Expr::Signed` and
+`Expr::AShr` had established the pattern:
+
+- One new `Expr::SignedLt` variant, not four. The other three orderings
+  are composed from it at lowering time by swapping operands and/or
+  negating (`a > b` is `b < a`; `a <= b` is `!(b < a)`; `a >= b` is
+  `!(a < b)`) -- identities that hold exactly for integers, and the same
+  "compose rather than add near-identical variants" approach
+  `~&x`/`ReduceAnd` and unsigned-`>>>`/`Shr` already take.
+- Evaluated as a plain `i64` comparison, correct for the same reason
+  `AShr`'s `i64` shift is: both operands arrive already sign-extended
+  across all 64 bits, so the sign an `i64` comparison reads is the
+  operand's real one rather than whatever landed in bit 63.
+- The *mixed* case the previous version of this section flagged as the
+  real open question got a definite answer rather than a default:
+  Verilog's own rule is that a comparison with one unsigned operand is
+  performed **unsigned**, but doing that correctly needs the signed
+  operand truncated back to its own width first (an 8-bit -1 has to read
+  as 255, not as the 64-bit sign-extended pattern `Expr::Signed`
+  evaluates to). That truncation isn't implemented and no real design
+  needs it, so the mixed case is rejected with an error that says so --
+  not silently compared as an enormous positive number. The shallow
+  `Signed`-check limitation carries over unchanged from the existing
+  guard, documented in place.
+
+Verified with a fixture covering all four orderings plus an unsigned
+control on the *same* operands, driven with values where exactly one
+sign bit is set -- so the signed and unsigned readings genuinely
+disagree and the control column comes out opposite, which is what proves
+the comparison is really signed rather than passing by accident. Checked
+structurally (`ictus-frontend-verilog/tests/signed_compare.rs`, asserting
+each composed shape, including that the unsigned control stays an
+ordinary `Expr::Lt`, plus a negative test for the rejected mixed case)
+and differentially against Icarus Verilog
+(`ictus-cli/tests/differential_signed_compare.rs`).
+
+**Next confirmed blocker**: array/memory signals -- and this is the big
+one the roadmap has been flagging as "distinct, likely-larger" since the
+very first bit-select work. Re-running the picorv32 diagnostic after the
+signed-comparison fix finally reaches `cpuregs`, picorv32's own register
+file: `reg [31:0] cpuregs [0:regfile_size-1];`, written as
+`cpuregs[latched_rd] <= ...` and read as `cpuregs[decoded_rs1]` -- a
+*runtime* index on both sides. Unlike every increment since the
+`localparam` work, this can't be done by widening expression lowering:
+it needs a new array-shaped `Signal`/IR representation, runtime-indexed
+reads *and* writes (the write side especially -- `Stmt::NonBlockingAssign`
+currently addresses exactly one `SignalId` with an optional *constant*
+bit range), and matching storage plus commit handling in the kernel. Not
+yet attempted; worth its own design pass (and decisions.md entry) rather
+than being started incrementally.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
@@ -683,18 +725,20 @@ or a concatenation of such -- as a non-blocking (`<=`) assignment target
 but not a continuous (`assign`) one and not with a variable index (though
 the index/bound *may* reference a parameter/localparam, per the
 constant-folding work), `$signed(...)` to sign-extend a value into a
-wider assignment target but not as an operand of an ordering comparison
-(and no other system function), a call to a provably-empty task but no
-other task/function calls, logical `!`, bitwise `~`, and the reduction
-operators, a 4-state `x`/`z` literal outside a case item (resolves to
-`0`), shifts including a real arithmetic right shift (`$signed(x) >>> n`)
-but *not* a logical right shift of a `$signed(...)` value, no
-array/memory signals (`reg
+wider assignment target and to mark operands for the signed-aware
+operators -- a real arithmetic right shift (`$signed(x) >>> n`) and a
+real signed ordering comparison (`$signed(a) < $signed(b)`) -- but *not*
+a logical right shift of a `$signed(...)` value, nor a *mixed*
+signed/unsigned comparison (and no other system function), a call to a
+provably-empty task but no other task/function calls, logical `!`,
+bitwise `~`, and the reduction operators, a 4-state `x`/`z` literal
+outside a case item (resolves to `0`), no array/memory signals (`reg
 [31:0] mem [0:31]` -- this is what picorv32's register file actually
-needs, and is a distinct, likely-larger gap from bit-select on a single
-signal), no module instantiation. Cranelift codegen and actually getting
-picorv32 fully through the pipeline are both still ahead of where this
-stands today.
+needs, it's now the confirmed next blocker, and it's a distinct,
+genuinely larger gap than anything since the `localparam` work), no
+module instantiation. Cranelift codegen and actually getting picorv32
+fully through the pipeline are both still ahead of where this stands
+today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

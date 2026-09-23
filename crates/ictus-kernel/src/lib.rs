@@ -235,6 +235,12 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
         Expr::Le(lhs, rhs) => bool_val(eval_expr(lhs, values) <= eval_expr(rhs, values)),
         Expr::Gt(lhs, rhs) => bool_val(eval_expr(lhs, values) > eval_expr(rhs, values)),
         Expr::Ge(lhs, rhs) => bool_val(eval_expr(lhs, values) >= eval_expr(rhs, values)),
+        // Correct as a plain `i64` comparison only because the frontend
+        // only ever builds this with two already-sign-extended `Signed`
+        // operands -- see `ictus_ir::Expr::SignedLt`'s doc comment.
+        Expr::SignedLt(lhs, rhs) => {
+            bool_val((eval_expr(lhs, values) as i64) < (eval_expr(rhs, values) as i64))
+        }
         Expr::LogicalAnd(lhs, rhs) => {
             bool_val(eval_expr(lhs, values) != 0 && eval_expr(rhs, values) != 0)
         }

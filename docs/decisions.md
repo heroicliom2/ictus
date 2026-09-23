@@ -896,3 +896,50 @@ would fail rather than slip through. Re-running the diagnostic once more
 after this fix lands on D16's own signed-ordering-comparison guard
 (picorv32's `alu_lts <= $signed(reg_op1) < $signed(reg_op2);`) -- a
 deliberately-deferred gap finally reached, not a new discovery.
+
+## D21 — Signed comparison: one `SignedLt`, and the mixed case stays rejected
+
+**Decision**: signed ordering comparisons are supported when **both**
+operands are `Signed`, via a single new `Expr::SignedLt` variant; the
+other three orderings are composed from it at lowering time (`a > b` is
+`b < a`; `a <= b` is `!(b < a)`; `a >= b` is `!(a < b)`). A comparison
+with exactly **one** `Signed` operand stays rejected. This closes the gap
+D16 opened deliberately, and does it along the same signed/unsigned axis
+D20 split the shift operators on.
+
+**Why one variant, not four**: the three identities hold exactly for
+integers (no NaN-like case to worry about), so four near-identical
+variants would be pure duplication -- the same reasoning that made
+`~&x` compose from `BitwiseNot` + `ReduceAnd` rather than getting its own
+node, and unsigned `>>>` reuse `Shr`. Evaluating `SignedLt` as a plain
+`i64` comparison is correct for exactly the reason `AShr`'s `i64` shift
+is: the both-operands-`Signed` restriction guarantees each side arrives
+sign-extended across all 64 bits, so the sign an `i64` comparison reads
+is the operand's real one, not whatever landed in bit 63.
+
+**Why the mixed case stays rejected -- the real fork here**: Verilog does
+define it (a comparison with any unsigned operand is performed
+*unsigned*), so this isn't a gap in the language's own answer. It's a gap
+in ours: performing it correctly needs the signed operand truncated back
+to its own declared width first, since an 8-bit `-1` has to read as
+`255`, not as the 64-bit sign-extended pattern `Expr::Signed` evaluates
+to. `Expr::Signed` does carry the width that truncation would need, so
+this is implementable -- it just isn't implemented, and no real design
+has needed it (picorv32's only signed comparison has both operands
+signed). Rejected with an error that names the reason rather than
+silently comparing that sign-extended pattern as an enormous positive
+number, which is the outcome D16 was guarding against in the first place.
+
+**Why discovered / confirmed, not assumed**: the scope came from grepping
+every `$signed` usage in picorv32 that touches a comparison -- there is
+exactly one shape, `$signed(a) < $signed(b)`, both operands signed, which
+is what made the both-signed/mixed split the obvious design rather than a
+speculative one. The differential test drives values where exactly one
+operand's sign bit is set, so the signed and unsigned readings genuinely
+disagree and an unsigned-control column comes out *opposite* to the
+signed result -- a regression that quietly compared unsigned would fail
+rather than pass. Re-running the diagnostic after this fix reaches
+`cpuregs`, picorv32's register file: array/memory signals with a runtime
+index on both read and write sides, the first blocker since the
+`localparam` work that genuinely can't be handled by widening expression
+lowering.

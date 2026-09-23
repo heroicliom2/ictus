@@ -82,9 +82,10 @@ attempt at lowering the actual phase 0 picorv32 benchmark design (not
 just hand-written fixtures), which is how most of the gaps just closed
 were found. A concatenation of such targets (`{a, b[3:0]} <= v;`) is
 also supported, split into one write per part at lowering time. The
-`$signed(...)` system function is supported well enough to sign-extend a
-value into a wider assignment target (not yet as an operand of a signed
-comparison). A call to a *provably-empty* task (`some_task;`) is
+`$signed(...)` system function sign-extends a value into a wider
+assignment target and marks operands for the signed-aware operators
+(arithmetic right shift, signed comparison). A call to a
+*provably-empty* task (`some_task;`) is
 supported as a true no-op — picorv32's own `` `assert(...) `` macro
 relies on exactly this. Unary bitwise complement (`~`) and the reduction
 operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) are also supported now.
@@ -93,11 +94,12 @@ item resolves to `0` (matching Verilator's own default X-handling
 policy), and a comparison/logical/reduction result (always exactly 1
 bit) can be used as a concatenation operand. Shifts are supported
 including the arithmetic right shift (`$signed(x) >>> n`, which really
-does replicate the sign bit). A *signed ordering comparison*
-(`$signed(a) < $signed(b)`, which picorv32's ALU needs), array/memory
-signals (picorv32's register file needs these), module instantiation,
-and Cranelift JIT codegen are all still ahead of where this stands
-today.
+does replicate the sign bit), as are signed ordering comparisons
+(`$signed(a) < $signed(b)`, which picorv32's ALU needs). Array/memory
+signals (`reg [31:0] mem [0:31]`, indexed at runtime — picorv32's
+register file needs these, and it's the next real milestone), module
+instantiation, and Cranelift JIT codegen are all still ahead of where
+this stands today.
 
 ## Workspace layout
 

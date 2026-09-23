@@ -24,9 +24,10 @@
 //! repeated `N` times by the frontend at lowering time rather than given
 //! its own IR representation; see `ictus-frontend-verilog`'s
 //! `lower_multiple_concatenation`), the ternary operator, and
-//! `$signed(...)` (see `Expr::Signed`'s doc comment -- only well enough
-//! to sign-extend a value into a wider assignment target, not as an
-//! operand of an ordering comparison), logical `!`, bitwise complement
+//! `$signed(...)` (see `Expr::Signed`'s doc comment -- it sign-extends a
+//! value into a wider assignment target and marks operands for the
+//! signed-aware operators, `Expr::AShr` and `Expr::SignedLt`, rather than
+//! being a general signed type system), logical `!`, bitwise complement
 //! `~`, and the reduction operators `& | ^ ~& ~| ~^`/`^~` (see
 //! `Expr::BitwiseNot`/`ReduceAnd`/`ReduceOr`/`ReduceXor`'s doc comments --
 //! the NAND/NOR/XNOR forms compose `BitwiseNot` with a reduction rather
@@ -160,6 +161,26 @@ pub enum Expr {
     Le(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
     Ge(Box<Expr>, Box<Expr>),
+    /// Signed less-than (`$signed(a) < $signed(b)`) -- the *only* signed
+    /// ordering comparison with its own variant. The other three are
+    /// composed from it at lowering time, since each is exactly this one
+    /// with its operands swapped and/or logically negated
+    /// (`a > b` is `b < a`; `a <= b` is `!(b < a)`; `a >= b` is
+    /// `!(a < b)`) -- identities that hold exactly for integers, the same
+    /// "compose rather than add near-identical variants" approach
+    /// `ReduceAnd`/`~&x` and `Shr`/unsigned-`>>>` already take. See
+    /// `ictus-frontend-verilog::apply_binary_op`.
+    ///
+    /// Only ever built when *both* operands are `Signed`, which is what
+    /// makes evaluating it as a plain `i64` comparison correct rather
+    /// than accidentally correct: each operand has then already been
+    /// sign-extended across all 64 bits (see `Signed`), so the sign an
+    /// `i64` comparison reads is the operand's real one. Verilog's own
+    /// rule that a *mixed* signed/unsigned comparison is performed
+    /// unsigned isn't implemented -- it would need the signed operand
+    /// re-truncated to its own width first, and no real design has needed
+    /// it -- so the frontend rejects that combination instead of guessing.
+    SignedLt(Box<Expr>, Box<Expr>),
     LogicalAnd(Box<Expr>, Box<Expr>),
     LogicalOr(Box<Expr>, Box<Expr>),
     /// Bit-select (`x[3]`, `msb == lsb`) or part-select (`x[7:0]`), with a
