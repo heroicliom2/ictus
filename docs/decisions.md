@@ -1287,3 +1287,104 @@ is the same silent-drop failure as (2) above and is called out as such --
 rejecting it today would stop picorv32 lowering at all and take the
 differential test with it, so it is the immediate next increment rather
 than a deferred one.
+
+## D26 — Combinational `always` blocks, and settling to a fixpoint
+
+**Decision**: `always @*`, `always @(*)` and `always_comb` lower to a new
+`ictus_ir::CombProcess`, and the kernel settles all combinational logic --
+continuous assignments and these blocks together -- by iterating to a
+fixpoint instead of making one pass in declaration order.
+
+**With this, picorv32 executes.** The bus trace already matched (D25);
+now the register file matches Icarus too, across a program that does ALU
+work, a store, a load and a branch. That was the whole point of the
+increment: picorv32 computes its register writes (`cpuregs_write`,
+`cpuregs_wrdata`) inside an `always @*`, so with those blocks ignored the
+core reproduced every bus cycle while writing no registers at all.
+
+**No sensitivity list is stored.** All three spellings mean "re-run
+whenever anything this block reads changes", so the list is implied by
+the body; recording one would create a second source of truth that could
+disagree with it. An **explicit** list (`always @(a or b)`) is rejected
+rather than quietly widened to `@*`. That is not pedantry: an incomplete
+sensitivity list is a classic Verilog bug, a conforming simulator honours
+the list exactly as written, and silently widening it would make this
+simulator disagree with the reference on precisely the designs where the
+difference matters.
+
+**The body needed no new machinery.** These blocks are `if`/`case` plus
+*blocking* assignment, all of which landed in earlier increments -- the
+blocking-assignment work (D23) turns out to have been the prerequisite,
+since "a later statement sees what an earlier one wrote" is the whole
+execution model of a combinational block. A *non-blocking* assignment
+inside one is rejected: it is legal Verilog with specific meaning (the
+write defers past the block's own later statements), and combinational
+settling happens outside any clock edge with no deferral phase to put it
+in. Treating it as blocking would be the silent-wrong-answer case.
+
+**Why a fixpoint, not an ordering.** A single pass is correct only when
+the source happens to be written in dependency order. Continuous
+assignments made that *usually* true; `always @*` blocks make it much
+easier to violate, since two blocks can feed each other in either
+direction and no source order is right for every design. Iterating until
+a whole pass changes nothing gives the same answer regardless of order,
+and removes a class of bug rather than documenting it.
+
+**The subtle part, which this got wrong first**: convergence must be
+decided by comparing the state before and after a *whole pass*, not by
+asking each write whether it changed anything. Combinational Verilog's
+dominant idiom is to assign a default and then override it:
+
+```verilog
+always @* begin
+    cpuregs_write = 0;
+    if (...) cpuregs_write = 1;
+end
+```
+
+Every pass over that writes the signal twice and can end exactly where it
+began. A per-write "did this change something" flag is therefore true
+forever, and settling never terminates -- which is how the first version
+reported picorv32 as having a combinational loop. The per-write flag was
+the obvious optimization and it was wrong; the state comparison costs a
+clone per pass, which this interpreter can afford (D12).
+
+**Non-convergence panics**, naming the signals still moving. A design
+whose combinational logic has no stable answer has a real bug, and a
+conventional simulator surfaces it as a hang or an oscillating waveform;
+saying which signals are oscillating is more useful than either.
+
+**Inferred latches fall out, and are not special-cased.** A block that
+doesn't assign its target on every path leaves the previous value in
+place, which is exactly Verilog's inferred latch -- nothing had to
+implement it, and nothing flags it. Flagging was considered (many linters
+do) and rejected: this is a simulator, and a latch is legal, simulable
+Verilog whose meaning is unambiguous.
+
+**A latch did force one API addition**, `Simulation::set_all`. For
+ordinary combinational logic, driving inputs one at a time and settling
+between them is indistinguishable from driving them together -- settling
+is a function of the final inputs. For a latch it is not: lowering the
+enable *after* changing the data lets the latch capture the new data
+first. Verilog draws the same distinction by whether simulation time
+advanced between the two assignments, and a testbench writing a group of
+inputs in one instant gets the "together" behaviour. `set_all` reproduces
+that; `set` remains a one-signal convenience built on it. This surfaced
+as a genuine Icarus/Ictus disagreement in the new differential test, not
+as a theory.
+
+**Also rejected rather than skipped, now**: `negedge` blocks,
+`always_ff`, `always_latch`. Every `always` construct now lowers to
+something or errors. Previously anything that wasn't `posedge` was
+silently ignored, which is the failure mode D25 was written about -- it
+is what hid `always @*` in the first place.
+
+**String literals** came along because reaching picorv32's `always @*`
+blocks finally reached its disassembly block (`new_ascii_instr = "lui";`,
+a signal that exists for waveform viewing). A string literal in an
+expression is not a string type: IEEE 1800 §5.9 defines it as its
+characters packed 8 bits each, so `"lui"` is a 24-bit `0x6C7569`. Capped
+at 8 characters, since longer genuinely does not fit this kernel's `u64`
+values -- rejected with that reason rather than truncated, a silently
+truncated string being both wrong and hard to notice. picorv32's longest
+is exactly 8, into a `reg [63:0]`.

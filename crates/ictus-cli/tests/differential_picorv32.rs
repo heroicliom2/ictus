@@ -30,7 +30,16 @@
 //! how many points were actually compared, so this can't quietly erode
 //! into a test that skips everything and passes.
 //!
-//! This test is what found the three defects in docs/decisions.md D25,
+//! **Why the register file is checked too, and not just the ports.** For
+//! straight-line code the fetch addresses don't depend on any register
+//! value, so a core whose datapath is completely dead still reproduces
+//! the bus trace exactly. That is not hypothetical: it was the state of
+//! this simulator for one increment, with every port matching while
+//! picorv32 wrote no registers at all, because `always @*` blocks -- where
+//! picorv32 computes its register writes -- were being dropped. Agreement
+//! on a design's ports is not evidence that the design ran.
+//!
+//! This test is what found the defects in docs/decisions.md D25 and D26,
 //! every one of which made the core lower cleanly, run without error, and
 //! execute the wrong program.
 
@@ -108,36 +117,27 @@ fn picorv32_matches_icarus_verilog() {
          the test would pass without checking anything meaningful"
     );
 
-    // Icarus's final register file, which pins down that the recorded
-    // stimulus is a real program execution and not just a plausible
-    // sequence of bus cycles: addi x1,x0,5 / addi x2,x0,7 / add x3,x1,x2.
+    // Final architectural state -- the program's actual result, read out
+    // of picorv32's own register file on both sides. This is the check
+    // the port comparison above cannot make: for straight-line code the
+    // fetch addresses don't depend on any register value, so a core with
+    // a completely dead datapath still reproduces the bus trace exactly.
+    // It did, for a while -- see the note in this file's header.
+    //
+    // It also reads an unpacked array at design scale, since picorv32's
+    // register file is one.
     assert_eq!(
         registers,
-        vec![(1, 5), (2, 7), (3, 12)],
+        vec![(1, 5), (2, 7), (3, 12), (4, 12), (5, 7)],
         "expected the testbench program to have executed under Icarus"
     );
-
-    // Ictus's own register file is deliberately *not* compared here yet,
-    // and the reason is the most useful thing this test has to say.
-    //
-    // Every one of the port comparisons above passes, and picorv32's
-    // register file in Ictus is nevertheless still empty -- x1, x2 and x3
-    // are all 0. The core reproduces the bus trace exactly while not
-    // executing anything at all, because `cpuregs_write`/`cpuregs_wrdata`
-    // are driven from an `always @*` block that this frontend does not
-    // lower (see the roadmap). For straight-line code the fetch addresses
-    // don't depend on any register value, so a dead datapath is invisible
-    // from the bus.
-    //
-    // The lesson is worth more than the assertion would be: agreement on
-    // a design's ports is not evidence that the design *ran*. The
-    // comparison lands here the moment `always @*` does, and until then
-    // this test's scope is honestly the bus protocol, not execution.
-    assert_eq!(
-        sim.get_array("cpuregs", 1),
-        0,
-        "if this now holds 5, `always @*` has landed -- compare the whole \n         register file against Icarus here and extend the test program"
-    );
+    for (index, expected) in &registers {
+        assert_eq!(
+            sim.get_array("cpuregs", *index as usize),
+            *expected,
+            "register x{index} differs from Icarus after the program ran"
+        );
+    }
 }
 
 /// One recorded negedge sample: every traced field, with a value Icarus

@@ -80,21 +80,18 @@ module picorv32_trace_tb;
 
     always #5 clk = ~clk;
 
-    // A hand-assembled RISC-V program:
+    // A hand-assembled RISC-V program, reaching past the ALU into the
+    // memory path and a branch -- the store is what finally drives
+    // mem_wstrb and mem_wdata to something other than x:
     //
     //   0:  addi x1, x0, 5      ; x1 = 5
     //   4:  addi x2, x0, 7      ; x2 = 7
     //   8:  add  x3, x1, x2     ; x3 = 12
-    //   12: jal  x0, 0          ; spin here forever
-    //
-    // Register-to-register work and a jump, deliberately no load or
-    // store. Not because those are uninteresting -- they are the most
-    // interesting part -- but because picorv32 computes a store's write
-    // data in an `always @*` block, which this frontend does not yet
-    // lower at all. Reaching a store today would compare Ictus against
-    // Icarus on logic Ictus never ran, which tests nothing and reports it
-    // as a failure of something else. The program grows the moment
-    // `always @*` lands; see docs/roadmap.md.
+    //   12: sw   x3, 64(x0)     ; memory[16] = 12
+    //   16: lw   x4, 64(x0)     ; x4 = 12
+    //   20: sub  x5, x4, x1     ; x5 = 7
+    //   24: bne  x5, x2, +8     ; not taken (7 == 7)
+    //   28: jal  x0, 0          ; spin here forever
     reg [31:0] memory [0:63];
     integer i;
     initial begin
@@ -103,7 +100,11 @@ module picorv32_trace_tb;
         memory[0] = 32'h00500093;
         memory[1] = 32'h00700113;
         memory[2] = 32'h002081b3;
-        memory[3] = 32'h0000006f;
+        memory[3] = 32'h04302023;
+        memory[4] = 32'h04002203;
+        memory[5] = 32'h401202b3;
+        memory[6] = 32'h00229463;
+        memory[7] = 32'h0000006f;
     end
 
     // A single-cycle-latency memory: one wait state, then ready for
@@ -146,7 +147,7 @@ module picorv32_trace_tb;
 
     integer r;
     initial begin
-        repeat (80) @(posedge clk);
+        repeat (200) @(posedge clk);
         // Final architectural state. The port trace shows the core
         // behaving; this shows it actually computed something -- and it
         // reads picorv32's register file, which is an unpacked array, so

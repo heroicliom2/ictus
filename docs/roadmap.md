@@ -913,47 +913,93 @@ on a design's ports is not evidence that the design ran, and the test now
 says so in its own comments -- it asserts the register file is *still*
 empty, so that assertion fails loudly the moment the gap closes.
 
-**Next confirmed blocker: `always @*`** (and its `always_comb` spelling).
-This is a feature rather than a fix, and it is the immediate next
-increment rather than a deferred one, because today it is *ignored* --
-the same silent-drop failure as the net-initializer defect above, which
-is not an acceptable thing to leave sitting. It isn't rejected instead
-only because rejecting it would stop picorv32 lowering at all and take
-the differential test with it. What it needs:
+**Combinational `always` blocks are done, and with them picorv32 actually
+executes.** The bus trace already matched; now the register file matches
+Icarus too, across a program doing ALU work, a store, a load and a
+branch. Design in decisions.md D26.
 
-- A combinational process in the IR alongside `clocked_processes`. The
-  statement machinery already exists and needs nothing new: these blocks
-  are built from `if`/`case` and *blocking* assignment, all of which
-  landed in earlier increments.
-- A settle step in the kernel that runs them together with the continuous
-  assignments. This is where the real design question is, and it is the
-  same one flagged below: a single pass in source order isn't enough once
-  processes and assigns feed each other, so this should settle to a
-  **fixpoint** -- iterate until nothing changes, with a cap that reports a
-  combinational loop loudly rather than hanging.
-- A decision on what a block that doesn't assign on every path means.
-  Verilog infers a latch; keeping the previous value is what falls out
-  naturally, and whether that is accepted silently or flagged is a real
-  choice, not a default.
+- `always @*`, `always @(*)` and `always_comb` lower to a new
+  `ictus_ir::CombProcess`. No sensitivity list is stored -- all three
+  mean "re-run on whatever the body reads", so recording one would only
+  create a second source of truth. An *explicit* list (`always @(a or
+  b)`) is rejected rather than widened to `@*`: an incomplete list is a
+  classic Verilog bug, a conforming simulator honours it as written, and
+  widening it would disagree with the reference exactly where it matters.
+- The body needed no new statement machinery. These blocks are
+  `if`/`case` plus **blocking** assignment, which the earlier increment
+  (D23) turns out to have been the prerequisite for -- "a later statement
+  sees what an earlier one wrote" *is* the execution model here. A
+  non-blocking assignment inside one is rejected: it defers past the
+  block's own later statements, and settling has no deferral phase.
+- The kernel now settles to a **fixpoint** -- all continuous assignments
+  and all combinational blocks, re-run until a whole pass changes nothing
+  -- replacing the single declaration-order pass flagged as a limitation
+  above. Order-dependence is removed rather than documented, which is what
+  makes these blocks safe: two of them can feed each other in either
+  direction and no source order is right for every design.
+- **The subtle part, got wrong first**: convergence has to compare state
+  before and after a whole pass, not ask each write whether it changed
+  anything. Combinational Verilog's dominant idiom is assign-a-default-
+  then-override, so every pass writes twice and can end where it began; a
+  per-write flag is true forever. That first version reported picorv32 as
+  having a combinational loop.
+- Logic that never converges panics, naming the signals still moving. A
+  conventional simulator answers a combinational loop with a hang or an
+  oscillating waveform; saying which signals oscillate beats both.
+- Inferred latches fall out and are not special-cased: a block that
+  doesn't assign on every path leaves the previous value in place, which
+  is what Verilog means by one. Flagging it was considered and rejected --
+  this is a simulator, and a latch is legal, unambiguous Verilog.
+- A latch did force one API addition, `Simulation::set_all`, which drives
+  a group of inputs *in one instant*. For ordinary combinational logic
+  that's indistinguishable from repeated `set` calls; for a latch it is
+  not, since lowering an enable after changing the data lets the latch
+  capture it first. Verilog draws the same distinction by whether time
+  advanced between the assignments. This showed up as a real
+  Icarus/Ictus disagreement, not as a theory.
+- `negedge`, `always_ff` and `always_latch` blocks are now **rejected**
+  rather than silently skipped. Everything that isn't `posedge` used to
+  be ignored, which is what hid `always @*` in the first place.
+- String literals landed alongside, because reaching those blocks reached
+  picorv32's disassembly signal (`new_ascii_instr = "lui";`). IEEE 1800
+  §5.9 makes a string literal in an expression its characters packed 8
+  bits each, so `"lui"` is a 24-bit `0x6C7569`; capped at 8 characters,
+  which is exactly what fits this kernel's `u64` values and exactly
+  picorv32's longest.
 
-Once it lands, the differential test's program grows to include a store,
-a load and a branch (the store is what finally drives `mem_wstrb` and
-`mem_wdata` to something other than `x`), and the register-file
-comparison against Icarus replaces the placeholder assertion.
+Verified structurally (`ictus-frontend-verilog/tests/comb_always.rs`,
+including all three rejections), differentially against Icarus
+(`ictus-cli/tests/differential_comb_always.rs`, covering
+default-then-override, a block that reads one declared after it, and a
+latch observed across a change of its data input), by `ictus_kernel`'s
+own unit tests for the two things no reference simulator can answer
+(order-independent settling, and a combinational loop being reported
+rather than hanging), and end-to-end by the picorv32 test, which now
+compares the register file.
 
-**Known limitation, exposed but not fixed**: `settle_combinational`
-evaluates each continuous assignment once, in source order, which is not
-guaranteed to be a correct evaluation order -- an assignment reading a
-net driven further down sees a stale value for a cycle. Both spellings of
-continuous assignment are now collected in one pass so source order is at
-least preserved rather than reordered. Settling to a fixpoint is the real
-fix and folds naturally into the `always @*` work above.
+**Next**: no single confirmed blocker -- picorv32 lowers *and* executes
+correctly, which closes the loop that has driven every increment since
+D13. Candidates, roughly in order of what would prove the most:
+
+- **A longer, more demanding program.** The current one is eight
+  instructions. Running picorv32's own firmware or its
+  instruction-set tests would exercise far more of the core, and the
+  harness already supports it -- what it needs is a testbench memory big
+  enough and a way to load a program image rather than four hand-written
+  words. This is the cheapest way to find the next real gap, and it is
+  the same diagnostic loop that has worked every time so far.
+- **Module instantiation.** The largest remaining language gap, and the
+  one that would let Ictus run a testbench directly rather than replaying
+  a recorded trace.
+- **Cranelift codegen** (phase 1's actual goal), now that there is a
+  correctness baseline with a real design behind it to check against --
+  which was D12's condition for starting.
 
 The supported language subset is still intentionally narrow: single
-ANSI-style module, any number of clocked processes and `assign`s (in
-both spellings -- a standalone `assign` and a net declaration carrying an
-initializer) but no combinational `always` block yet, `#(parameter ...)`
-*and* `localparam` sharing one
+ANSI-style module, any number of clocked processes, combinational
+`always @*`/`always_comb` blocks, and `assign`s (in both spellings -- a
+standalone `assign` and a net declaration carrying an initializer),
+`#(parameter ...)` *and* `localparam` sharing one
 resolution pass (value expressions may reference an earlier parameter/
 localparam, and use `+ - * << >> >>> & | ^ == != < <= > >= && ||`, the
 ternary operator, and concatenation; no overriding a `parameter` at
@@ -979,10 +1025,10 @@ outside a case item (resolves to `0`), array/memory signals (`reg [31:0]
 mem [0:31]`) with one unpacked dimension, internal-only, one element at a
 time -- but no array port, no bit-select of an element, and no `assign`
 to one -- and both `<=` and `=` inside a clocked block, but no compound
-assignment (`+=` and friends), no `always @*`/`always_comb`, no module
-instantiation. The whole of picorv32.v lowers within this subset and its
-bus behaviour matches Icarus cycle for cycle; making it actually
-*execute* needs `always @*`, and Cranelift codegen is further out still.
+assignment (`+=` and friends), no explicit sensitivity list, no `negedge`
+block, no module instantiation. The whole of picorv32.v lowers within
+this subset and both its bus behaviour and its register file match Icarus
+while it executes a program; Cranelift codegen is further out still.
 
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential

@@ -37,9 +37,10 @@
 //! separate map first) is still correct even when more than one partial
 //! write targets the same signal in one tick.
 //!
-//! Combinational logic (`ictus_ir::Assign`, i.e. `assign target = value;`)
-//! is "settled" -- every `Assign` re-evaluated and written immediately,
-//! not deferred like non-blocking assignment -- at two points per `tick()`:
+//! Combinational logic -- both `ictus_ir::Assign` (`assign target =
+//! value;`) and `ictus_ir::CombProcess` (an `always @*` block) -- is
+//! "settled": re-evaluated and written immediately, not deferred like
+//! non-blocking assignment. This happens at two points per `tick()`:
 //! once *before* clocked processes run (so a clocked process reading a
 //! combinationally-derived signal sees it reflect the pre-edge register
 //! state, matching real continuous-assignment semantics) and once *after*
@@ -47,27 +48,36 @@
 //! *next* `tick()`'s initial settle -- sees combinational logic reflect
 //! the registers this edge just updated). `new()` also settles once, so a
 //! `Simulation` that's never been ticked still has correct combinational
-//! output for its (zeroed) initial state, and so does every `set()` --
-//! driving an input feeds continuous assignments with no clock edge in
-//! between, and leaving that to the caller made a real design's memory
-//! handshake lag a cycle while still looking plausible (decisions.md
-//! D25).
+//! output for its (zeroed) initial state, and so does every `set()`/
+//! `set_all()` -- driving an input feeds continuous assignments with no
+//! clock edge in between, and leaving that to the caller made a real
+//! design's memory handshake lag a cycle while still looking plausible
+//! (decisions.md D25). Use `set_all` to drive a group of inputs in one
+//! instant: it makes no difference to ordinary combinational logic, but
+//! it does to an inferred latch.
 //!
-//! Settling is a **single pass over `Module::assigns` in declaration
-//! order**, not a full fixed-point/topological solve. This is correct as
-//! long as combinational signals are declared in dependency order in the
-//! source (the overwhelmingly common style, and the only style this
-//! frontend's test fixtures use) -- a signal assigned from another
-//! combinational signal declared *later* in the source won't see that
-//! later signal's fresh value until the *next* settle call. Running
-//! picorv32 has since made this concrete rather than hypothetical: it is
-//! why both spellings of continuous assignment are now collected in one
-//! source-order pass by the frontend rather than one kind after the
-//! other, which would have reordered every design's logic. Settling to a
-//! real fixpoint (iterate until nothing changes, with a cap that reports
-//! a combinational loop rather than hanging) is the actual fix, and it
-//! lands together with `always @*` support, which needs the same
-//! machinery -- see docs/roadmap.md.
+//! Settling runs to a **fixpoint**: the whole body of combinational logic
+//! is re-evaluated until a complete pass changes nothing. Declaration
+//! order therefore doesn't affect the result, which is what makes
+//! `always @*` blocks safe to support -- one block can feed another in
+//! either direction, and there is no source order that is right for every
+//! design. (It replaced a single pass in declaration order, which was
+//! correct only when the source happened to be written in dependency
+//! order.)
+//!
+//! Convergence is decided by comparing state before and after a whole
+//! pass, **not** by asking each write whether it changed something. That
+//! distinction is easy to get wrong and was: combinational Verilog's
+//! usual idiom is to assign a default and then override it, so every
+//! pass over such a block writes twice and can end where it began,
+//! making a per-write "did anything change" flag true forever. See
+//! `settle_combinational`.
+//!
+//! Logic that never converges panics with the names of the signals still
+//! moving, rather than spinning or returning half-settled state: a design
+//! whose combinational logic has no stable answer has a real bug, and in
+//! a conventional simulator it surfaces as a hang or an oscillating
+//! waveform.
 
 use ictus_ir::{Expr, Module, SignalId, Stmt};
 
@@ -133,11 +143,39 @@ impl<'m> Simulation<'m> {
     /// module's `assign`s per call, which this interpreter can afford
     /// (docs/decisions.md D12) and which a caller cannot forget.
     pub fn set(&mut self, name: &str, value: u64) {
-        let id = self
-            .module
-            .signal_id(name)
-            .unwrap_or_else(|| panic!("unknown signal '{name}'"));
-        self.values[id] = mask(value, self.module.signals[id].width);
+        self.set_all(&[(name, value)]);
+    }
+
+    /// Drives several signals *in one instant* -- all of them written
+    /// before combinational logic re-settles even once.
+    ///
+    /// For ordinary combinational logic this is indistinguishable from
+    /// calling `set` repeatedly: settling is a function of the final
+    /// input values, so the intermediate passes wash out. It matters when
+    /// a combinational block holds state -- an inferred latch, a block
+    /// that doesn't assign its target on every path:
+    ///
+    /// ```verilog
+    /// always @* if (en) held = a;
+    /// ```
+    ///
+    /// Driving `a` and then lowering `en` with a settle in between lets
+    /// the latch capture the new `a` before it closes; driving both
+    /// together does not. Verilog draws the same distinction, by whether
+    /// simulation time advanced between the two assignments -- a
+    /// testbench writing both in one instant gets the second behaviour,
+    /// which is what this method reproduces.
+    ///
+    /// So a driver mirroring a testbench that assigns a group of inputs
+    /// together should use this rather than a sequence of `set` calls.
+    pub fn set_all(&mut self, values: &[(&str, u64)]) {
+        for (name, value) in values {
+            let id = self
+                .module
+                .signal_id(name)
+                .unwrap_or_else(|| panic!("unknown signal '{name}'"));
+            self.values[id] = mask(*value, self.module.signals[id].width);
+        }
         self.settle_combinational();
     }
 
@@ -187,13 +225,107 @@ impl<'m> Simulation<'m> {
         self.settle_combinational();
     }
 
-    /// Re-evaluates every continuous `assign` once, in declaration order.
-    /// See this module's doc comment for when `tick()` calls this and why.
+    /// Re-evaluates every continuous `assign` and every combinational
+    /// `always` block until nothing changes -- a real fixpoint, not one
+    /// pass in declaration order. See this module's doc comment for when
+    /// `tick()` calls this and why.
+    ///
+    /// The fixpoint is what makes evaluation *order* stop mattering. A
+    /// single pass is only correct when the source happens to be written
+    /// in dependency order, which nothing guarantees and which a
+    /// combinational `always` block makes much easier to violate, since
+    /// one block can feed another in either direction. Iterating until a
+    /// whole pass changes nothing gives the same answer whatever order
+    /// they appear in.
+    ///
+    /// Non-convergence panics rather than looping forever or quietly
+    /// returning a half-settled state. A design whose combinational logic
+    /// has no stable answer -- `assign x = ~x;` and its less obvious
+    /// relatives -- has a real bug, and in a real simulator it shows up as
+    /// a hang or an oscillating waveform. Saying so with the iteration
+    /// count is more useful than either.
     fn settle_combinational(&mut self) {
+        // Generous: this bounds the *dependency depth* of the
+        // combinational logic, not its size, since every independent
+        // chain settles together. picorv32 converges in a handful.
+        const MAX_PASSES: usize = 10_000;
+
+        for _ in 0..MAX_PASSES {
+            // Convergence is decided by comparing the state before and
+            // after a whole pass, *not* by asking each write whether it
+            // changed anything.
+            //
+            // That distinction is the whole ballgame, and it isn't
+            // obvious. Combinational Verilog's dominant idiom is
+            // "assign a default, then override it":
+            //
+            //     always @* begin
+            //         cpuregs_write = 0;
+            //         if (...) cpuregs_write = 1;
+            //     end
+            //
+            // Every pass over that block writes the signal twice and can
+            // end exactly where it began. A per-write "did this change
+            // something" flag is therefore true on every pass forever,
+            // and settling never terminates -- which is precisely how
+            // this first reported picorv32 as having a combinational
+            // loop.
+            let before_values = self.values.clone();
+            let before_arrays = self.arrays.clone();
+            self.settle_pass();
+            if self.values == before_values && self.arrays == before_arrays {
+                return;
+            }
+        }
+
+        // Didn't converge. Run one more pass against a snapshot purely to
+        // name the signals still moving -- a bare "there is a loop" tells
+        // you nothing about where, and this costs one clone on a path
+        // that is about to panic anyway.
+        let before = self.values.clone();
+        self.settle_pass();
+        let unstable: Vec<&str> = self
+            .values
+            .iter()
+            .zip(&before)
+            .enumerate()
+            .filter(|(_, (new, old))| new != old)
+            .map(|(id, _)| self.module.signals[id].name.as_str())
+            .collect();
+        panic!(
+            "combinational logic did not settle after {MAX_PASSES} passes -- these signals are \
+             still changing, so one of them depends on itself with no register in between: \
+             {unstable:?}"
+        );
+    }
+
+    /// One pass over all combinational logic: every continuous `assign`,
+    /// then every combinational process.
+    fn settle_pass(&mut self) {
         for assign in &self.module.assigns {
             let value = eval_expr(&assign.value, &self.values, &self.arrays);
             self.values[assign.target] = mask(value, self.module.signals[assign.target].width);
         }
+
+        // A combinational block's writes are all blocking (the frontend
+        // rejects `<=` in one), so they land during evaluation and
+        // `updates` stays empty -- it's threaded through only because
+        // `eval_stmts` is shared with the clocked path.
+        let module = self.module;
+        let mut updates = Vec::new();
+        for process in &module.comb_processes {
+            eval_stmts(
+                &process.body,
+                module,
+                &mut self.values,
+                &mut self.arrays,
+                &mut updates,
+            );
+        }
+        debug_assert!(
+            updates.is_empty(),
+            "a combinational process queued a deferred write"
+        );
     }
 }
 
@@ -1045,5 +1177,85 @@ mod tests {
 
         sim.set("a", 9);
         assert_eq!(sim.get("doubled"), 18);
+    }
+
+    /// Combinational logic settles to a fixpoint, so the order the
+    /// assignments happen to appear in doesn't change the answer. These
+    /// are deliberately in *reverse* dependency order: a single pass over
+    /// them would leave `c` computed from a stale `b`.
+    #[test]
+    fn combinational_logic_settles_regardless_of_declaration_order() {
+        let mut m = Module {
+            name: "reverse_order".to_string(),
+            ..Default::default()
+        };
+        let a = m.push_signal(Signal {
+            name: "a".to_string(),
+            width: 8,
+            direction: Some(Direction::Input),
+            depth: None,
+        });
+        let b = m.push_signal(Signal {
+            name: "b".to_string(),
+            width: 8,
+            direction: None,
+            depth: None,
+        });
+        let c = m.push_signal(Signal {
+            name: "c".to_string(),
+            width: 8,
+            direction: Some(Direction::Output),
+            depth: None,
+        });
+
+        // assign c = b + 1;  (first, though it depends on the next one)
+        m.assigns.push(Assign {
+            target: c,
+            value: Expr::Add(
+                Box::new(Expr::Ref(b)),
+                Box::new(Expr::Literal { value: 1, width: 8 }),
+            ),
+        });
+        // assign b = a + 1;
+        m.assigns.push(Assign {
+            target: b,
+            value: Expr::Add(
+                Box::new(Expr::Ref(a)),
+                Box::new(Expr::Literal { value: 1, width: 8 }),
+            ),
+        });
+
+        let mut sim = Simulation::new(&m);
+        sim.set("a", 5);
+        assert_eq!(sim.get("b"), 6);
+        assert_eq!(sim.get("c"), 7, "c must see the settled b, not a stale one");
+    }
+
+    /// A combinational loop has no stable answer, so settling reports it
+    /// instead of spinning forever or returning a half-settled state.
+    /// Covered here rather than differentially for the obvious reason: a
+    /// reference simulator's answer to this is to hang or to oscillate,
+    /// neither of which is a value to compare against.
+    #[test]
+    #[should_panic(expected = "did not settle")]
+    fn a_combinational_loop_is_reported_rather_than_spinning_forever() {
+        let mut m = Module {
+            name: "looped".to_string(),
+            ..Default::default()
+        };
+        let looped = m.push_signal(Signal {
+            name: "looped".to_string(),
+            width: 1,
+            direction: None,
+            depth: None,
+        });
+        // assign looped = ~looped;
+        m.assigns.push(Assign {
+            target: looped,
+            value: Expr::BitwiseNot(Box::new(Expr::Ref(looped)), 1),
+        });
+
+        // `new` settles, so this is where it gives up.
+        let _sim = Simulation::new(&m);
     }
 }

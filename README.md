@@ -59,7 +59,8 @@ sequencing.
 
 Phase 1 in progress (see docs/roadmap.md). A narrow Verilog subset (single
 module, ports that may inherit direction in a list, any number of clocked
-`always @(posedge clk)` blocks and continuous `assign`s, `if`/`else`/`else
+`always @(posedge clk)` blocks, combinational `always @*` blocks, and
+continuous `assign`s, `if`/`else`/`else
 if`, `case`/`casez`/`casex` with wildcard bits, both non-blocking (`<=`) and
 blocking (`=`) assignment,
 internal `wire`/`reg` declarations naming one or more signals each,
@@ -106,24 +107,29 @@ exactly this shape. Blocking assignment (`=`) works alongside `<=` in the
 same clocked block, with the timing Verilog defines: a blocking write
 lands immediately, so the next statement reads the new value, while a
 non-blocking one is still invisible to a later read in the same edge.
+Combinational `always @*`/`always_comb` blocks are supported as well,
+with the kernel settling all combinational logic to a fixpoint so
+declaration order does not affect the result.
 
 The whole of the vendored picorv32.v — a real 32-bit RISC-V CPU core —
-lowers through this frontend cleanly (225 signals), and runs against a
-recorded trace from Icarus Verilog with every traced port matching cycle
-for cycle while it fetches a small program. Getting there found three
-defects that each let the design lower, run, and produce plausible output
-while being wrong: driving an input didn't re-settle combinational logic,
-net declarations carrying an initializer (`wire x = a + b;`, which is how
-most of picorv32's combinational logic is written) were dropped silently,
-and binary operator precedence was never applied at all, so the
-instruction decoder read `addi` as a shift instruction.
+lowers through this frontend cleanly and **executes correctly**: run
+against a recorded trace from Icarus Verilog, every traced port matches
+cycle for cycle and the register file matches at the end, across a
+program that does ALU work, a store, a load and a branch.
 
-What that does *not* yet establish is that the core **executes**: its
-register file is still empty, because `always @*` blocks aren't lowered
-and picorv32 computes its register writes in one. Agreement on a design's
-ports is not evidence that the design ran. `always @*` is next on the
-roadmap; compound assignment (`+=` and friends), module instantiation,
-and Cranelift JIT codegen are further out.
+Getting there found four defects that each let the design lower, run, and
+produce plausible output while being wrong — none reachable by reading
+the code or by a feature-sized test. Driving an input didn't re-settle
+combinational logic. Net declarations carrying an initializer
+(`wire x = a + b;`, which is how most of picorv32's combinational logic
+is written) were dropped silently. Binary operator precedence was never
+applied at all, so the instruction decoder read `addi` as a shift
+instruction. And `always @*` blocks were ignored, which left the core
+reproducing every bus cycle while writing no registers at all — a
+reminder that agreement on a design's ports is not evidence that the
+design ran.
+
+Module instantiation and Cranelift JIT codegen are the next large pieces.
 
 ## Workspace layout
 

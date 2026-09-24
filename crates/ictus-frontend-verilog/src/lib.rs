@@ -5,7 +5,12 @@
 //! comment): a single ANSI-style module (`module foo (input wire clk,
 //! ...)`, ports may inherit direction from the previous one in the list
 //! -- `input clk, resetn,` -- see `lower_port`), any number of clocked
-//! `always @(posedge clk) begin ... end` blocks, `if`/`else`/`else if`
+//! `always @(posedge clk) begin ... end` blocks, combinational
+//! `always @*`/`always @(*)`/`always_comb` blocks (see
+//! `lower_comb_process`; an *explicit* sensitivity list, `negedge`,
+//! `always_ff` and `always_latch` are all rejected rather than skipped --
+//! silently skipping anything that wasn't `posedge` is what hid the
+//! missing combinational support for as long as it did), `if`/`else`/`else if`
 //! chains (lowered to nested `Stmt::If` -- see `lower_if` -- no new IR
 //! needed), `case`/`casez`/`casex` (wildcard bits only on a case *item*'s
 //! own literal -- see `lower_case`/`lower_case_value`), both non-blocking
@@ -106,18 +111,18 @@
 //!
 //! Widen this as later phases need more of the language. The whole of
 //! phase 0's picorv32 benchmark design lowers through here cleanly (225
-//! signals) and its bus behaviour then matches Icarus Verilog cycle for
-//! cycle -- but it does not yet *execute*, because `always @*` blocks
-//! (which is where picorv32 computes its register writes) are still
-//! ignored rather than lowered. That is the next increment and the
-//! highest-value gap by a wide margin; see decisions.md D25, which also
-//! records the three defects running the real design turned up, every one
-//! of which lowered cleanly and ran while being wrong. After it: shift
-//! results still have no width (see `expr_width` and decisions.md D24),
-//! then compound assignment (`+=`) and module instantiation.
+//! signals) and then *executes* correctly: replayed against a recorded
+//! Icarus trace, every traced port matches cycle for cycle and the
+//! register file matches at the end. Getting there turned up four defects
+//! that each let the design lower, run, and produce plausible output
+//! while being wrong -- see decisions.md D25 and D26. Remaining gaps, in
+//! rough order of value: module instantiation, compound assignment
+//! (`+=`), and shift results still having no width (see `expr_width` and
+//! decisions.md D24).
 
 use ictus_ir::{
-    Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
+    Assign, CaseArm, CaseValue, ClockedProcess, CombProcess, Direction, Expr, Module, Signal,
+    SignalId, Stmt,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -235,10 +240,12 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     };
 
     let mut clocked_processes = Vec::new();
+    let mut comb_processes = Vec::new();
     for always_node in module_node.into_iter() {
         if let RefNode::AlwaysConstruct(always) = always_node {
-            if let Some(process) = lower_always(always, &tree, &ctx)? {
-                clocked_processes.push(process);
+            match lower_always(always, &tree, &ctx)? {
+                LoweredAlways::Clocked(process) => clocked_processes.push(process),
+                LoweredAlways::Combinational(process) => comb_processes.push(process),
             }
         }
     }
@@ -276,6 +283,7 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     }
 
     module.clocked_processes = clocked_processes;
+    module.comb_processes = comb_processes;
     module.assigns = assigns;
 
     Ok(module)
@@ -967,21 +975,71 @@ fn lower_packed_range(
     Ok((msb as u32).abs_diff(lsb as u32) + 1)
 }
 
+/// What an `always` block lowered to. Every block is now one of these or
+/// an error -- none is silently skipped, which an earlier version did for
+/// anything that wasn't `posedge` (see docs/decisions.md D25/D26: a
+/// dropped block leaves its targets reading 0 forever while the design
+/// still lowers and runs).
+enum LoweredAlways {
+    Clocked(ClockedProcess),
+    Combinational(CombProcess),
+}
+
 fn lower_always(
     always: &AlwaysConstruct,
     tree: &SyntaxTree,
     module: &Ctx,
-) -> Result<Option<ClockedProcess>, String> {
+) -> Result<LoweredAlways, String> {
+    // `always_comb` (and the `always @*`/`always @(*)` spellings handled
+    // just below) all mean the same thing: re-run whenever anything the
+    // body reads changes. `always_latch` and `always_ff` are rejected --
+    // `always_ff` would need its own edge handling and `always_latch`
+    // deliberately-latching semantics, and guessing at either is worse
+    // than saying so.
+    if let sv_parser::AlwaysKeyword::AlwaysComb(_) = &always.nodes.0 {
+        return Ok(LoweredAlways::Combinational(lower_comb_process(
+            always, tree, module,
+        )?));
+    }
+    if let sv_parser::AlwaysKeyword::AlwaysLatch(_) | sv_parser::AlwaysKeyword::AlwaysFf(_) =
+        &always.nodes.0
+    {
+        return Err(
+            "`always_latch` and `always_ff` are not supported in v1 (use `always @(posedge clk)` \
+             or `always @*`)"
+                .to_string(),
+        );
+    }
+
     let edge_node = match unwrap_node!(always, EdgeIdentifier) {
         Some(n) => n,
-        // No edge identifier at all (e.g. combinational `always @*`) --
-        // not lowered in v1.
-        None => return Ok(None),
+        None => {
+            // No edge identifier: either a combinational `always @*` /
+            // `always @(*)`, or an explicit sensitivity list.
+            let is_star = unwrap_node!(always, EventControlAsterisk).is_some()
+                || unwrap_node!(always, EventControlParenAsterisk).is_some();
+            if !is_star {
+                return Err(
+                    "an `always` block with an explicit sensitivity list (`always @(a or b)`) is \
+                     not supported in v1 -- use `always @*`, which re-runs on everything the \
+                     block reads. An explicit list that is missing a signal simulates \
+                     differently from the same list written as `@*`, so widening it here would \
+                     silently disagree with a simulator that honours it as written"
+                        .to_string(),
+                );
+            }
+            return Ok(LoweredAlways::Combinational(lower_comb_process(
+                always, tree, module,
+            )?));
+        }
     };
     let is_posedge = matches!(edge_node, RefNode::EdgeIdentifier(EdgeIdentifier::Posedge(_)));
     if !is_posedge {
-        // `negedge`-triggered blocks aren't lowered in v1.
-        return Ok(None);
+        return Err(
+            "a `negedge`-triggered `always` block is not supported in v1 (only \
+             `always @(posedge clk)`)"
+                .to_string(),
+        );
     }
 
     let event_expr = unwrap_node!(always, EventExpressionExpression)
@@ -1002,7 +1060,63 @@ fn lower_always(
     };
     let body = lower_statement_or_null(stmt_or_null, tree, module)?;
 
-    Ok(Some(ClockedProcess { clock, body }))
+    Ok(LoweredAlways::Clocked(ClockedProcess { clock, body }))
+}
+
+/// Lowers the body of a combinational `always` block. The body uses the
+/// same statement lowering as a clocked block, so nothing new is needed
+/// -- these blocks are `if`/`case` plus **blocking** assignment, which is
+/// exactly what makes a later statement see what an earlier one wrote.
+///
+/// A *non-blocking* assignment inside one is rejected. It is legal
+/// Verilog and means something quite specific -- the write is deferred to
+/// the NBA region, so the block's own later statements don't see it --
+/// and this kernel settles combinational logic outside any clock edge,
+/// with no NBA region to defer into. Accepting it as though it were
+/// blocking would be the silent-wrong-answer case; see decisions.md D26.
+fn lower_comb_process(
+    always: &AlwaysConstruct,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<CombProcess, String> {
+    let stmt_node = unwrap_node!(always, StatementOrNull)
+        .ok_or("combinational always block has no statement body")?;
+    let RefNode::StatementOrNull(stmt_or_null) = stmt_node else {
+        unreachable!("unwrap_node! guarantees the requested variant");
+    };
+    let body = lower_statement_or_null(stmt_or_null, tree, module)?;
+    reject_nonblocking_in_comb(&body)?;
+    Ok(CombProcess { body })
+}
+
+/// Walks a combinational block's statements (into `if`/`case` arms too)
+/// and rejects any non-blocking assignment. See `lower_comb_process`.
+fn reject_nonblocking_in_comb(stmts: &[Stmt]) -> Result<(), String> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::NonBlockingAssign { .. } | Stmt::ArrayAssign { .. } => {
+                return Err(
+                    "a non-blocking assignment (`<=`) inside a combinational `always` block is \
+                     not supported in v1 -- it defers the write past the block's own later \
+                     statements, and combinational settling has no such deferral phase to put \
+                     it in. Use `=` here"
+                        .to_string(),
+                );
+            }
+            Stmt::If { then_branch, else_branch, .. } => {
+                reject_nonblocking_in_comb(then_branch)?;
+                reject_nonblocking_in_comb(else_branch)?;
+            }
+            Stmt::Case { arms, default, .. } => {
+                for arm in arms {
+                    reject_nonblocking_in_comb(&arm.body)?;
+                }
+                reject_nonblocking_in_comb(default)?;
+            }
+            Stmt::BlockingAssign { .. } | Stmt::BlockingArrayAssign { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn lower_statement_or_null(
@@ -1839,6 +1953,59 @@ fn apply_top(values: &mut Vec<Expr>, op: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Lowers a string literal (`"lui"`) to the integer Verilog says it is:
+/// its characters packed 8 bits each, first character in the most
+/// significant byte, so `"lui"` is a 24-bit `0x6C7569`. There is no
+/// string *type* involved -- IEEE 1800 §5.9 defines a string literal in an
+/// expression as exactly this packed vector, which is why assigning one
+/// to a `reg [63:0]` (picorv32's `new_ascii_instr`, a disassembly signal
+/// for waveform viewing) simply zero-extends it.
+///
+/// Capped at 8 characters, because this kernel's values are `u64` and a
+/// longer literal genuinely cannot be represented -- rejected with that
+/// reason rather than truncated, since a silently truncated string is
+/// both wrong and very hard to notice. Escape sequences are rejected for
+/// the same reason: guessing at `\n` versus a literal backslash-n would
+/// be a silent wrong value, and nothing needs them yet.
+fn lower_string_literal(
+    string: &sv_parser::StringLiteral,
+    tree: &SyntaxTree,
+) -> Result<Expr, String> {
+    let raw = tree
+        .get_str(&string.nodes.0)
+        .ok_or("string literal unreadable")?;
+    // `nodes.0` spans the quotes as written in the source.
+    let body = raw.trim_start_matches('"').trim_end_matches('"');
+    if body.contains('\\') {
+        return Err(format!(
+            "escape sequences in a string literal are not supported in v1: {raw}"
+        ));
+    }
+    if !body.is_ascii() {
+        return Err(format!(
+            "a non-ASCII string literal is not supported in v1: {raw}"
+        ));
+    }
+    if body.len() > 8 {
+        return Err(format!(
+            "string literal {raw} is {} characters, more than the 8 that fit in this kernel's \
+             64-bit values",
+            body.len()
+        ));
+    }
+
+    let mut value = 0u64;
+    for byte in body.bytes() {
+        value = (value << 8) | u64::from(byte);
+    }
+    // An empty string is "equivalent to the value 0" (IEEE 1800 §5.9); a
+    // zero-width literal would be meaningless to every consumer of
+    // `expr_width`, so it takes the width of the one null character that
+    // reading is closest to.
+    let width = if body.is_empty() { 8 } else { body.len() as u32 * 8 };
+    Ok(Expr::Literal { value, width })
+}
+
 /// Combines two already-lowered operands with a binary operator.
 ///
 /// A `$signed(...)` operand (`Expr::Signed`) is safe to pass straight
@@ -1989,6 +2156,7 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) 
     match primary {
         P::PrimaryLiteral(lit) => match &**lit {
             sv_parser::PrimaryLiteral::Number(number) => lower_number(number, tree),
+            sv_parser::PrimaryLiteral::StringLiteral(string) => lower_string_literal(string, tree),
             other => Err(format!("literal form not supported in v1: {other:?}")),
         },
         P::Hierarchical(h) => {

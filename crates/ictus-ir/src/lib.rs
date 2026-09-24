@@ -10,8 +10,9 @@
 //! (`reg [31:0] mem [0:31]`) *are* supported, with one unpacked
 //! dimension, read and written one element at a time at a runtime index
 //! (see `Signal::depth`, `Expr::ArrayRead`, `Stmt::ArrayAssign`), any
-//! number of clocked (`always @(posedge clk)`) processes
-//! and continuous `assign`s but no `always_comb` yet, `if`/`else`/
+//! number of clocked (`always @(posedge clk)`) processes, combinational
+//! ones (`always @*`/`always_comb`, see `CombProcess`), and continuous
+//! `assign`s, `if`/`else`/
 //! `else if` and `case`/`casez`/`casex` (see `CaseValue`) alongside
 //! non-blocking (`<=`) *and* blocking (`=`) assignment (see
 //! `Stmt::BlockingAssign` -- they differ only in when the write becomes
@@ -396,11 +397,40 @@ pub enum CaseValue {
 }
 
 /// A single `always @(posedge <clock>) begin ... end` block. A module can
-/// have any number of these; `always_comb` is not lowered yet (see this
-/// crate's doc comment) -- use `Assign` (below) for combinational logic.
+/// have any number of these. For combinational logic see `CombProcess`
+/// (a full `always @*` block) and `Assign` (a single continuous
+/// assignment), below.
 #[derive(Debug, Clone)]
 pub struct ClockedProcess {
     pub clock: SignalId,
+    pub body: Vec<Stmt>,
+}
+
+/// A combinational always block -- `always @*`, `always @(*)` or
+/// `always_comb`.
+///
+/// There is no sensitivity list, deliberately: all three of those
+/// spellings mean "re-run whenever anything this block reads changes",
+/// so the list is implied by the body and recording it would only create
+/// a second source of truth. (An *explicit* list, `always @(a or b)`, is
+/// rejected by the frontend rather than represented here -- an incomplete
+/// one is a classic Verilog bug, and quietly widening it to `@*` would
+/// make this simulator disagree with one that honours the list as
+/// written.)
+///
+/// The body is the same `Stmt` list a clocked process has, and needs
+/// nothing new: these blocks are built from `if`/`case` and **blocking**
+/// assignment, which is what makes a mid-block read see the value the
+/// statement above it just wrote.
+///
+/// The kernel re-runs these to a fixpoint alongside `Assign`s rather than
+/// once in order, so how they are interleaved with each other and with
+/// the continuous assignments does not affect the result. A block that
+/// doesn't assign its target on every path simply leaves the previous
+/// value in place, which is Verilog's inferred latch -- see
+/// `ictus_kernel`'s doc comment and docs/decisions.md D26.
+#[derive(Debug, Clone)]
+pub struct CombProcess {
     pub body: Vec<Stmt>,
 }
 
@@ -423,6 +453,7 @@ pub struct Module {
     pub name: String,
     pub signals: Vec<Signal>,
     pub clocked_processes: Vec<ClockedProcess>,
+    pub comb_processes: Vec<CombProcess>,
     pub assigns: Vec<Assign>,
 }
 
