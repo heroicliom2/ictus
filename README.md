@@ -60,7 +60,8 @@ sequencing.
 Phase 1 in progress (see docs/roadmap.md). A narrow Verilog subset (single
 module, ports that may inherit direction in a list, any number of clocked
 `always @(posedge clk)` blocks and continuous `assign`s, `if`/`else`/`else
-if`, `case`/`casez`/`casex` with wildcard bits, non-blocking assignment,
+if`, `case`/`casez`/`casex` with wildcard bits, both non-blocking (`<=`) and
+blocking (`=`) assignment,
 internal `wire`/`reg` declarations naming one or more signals each,
 module parameters *and* `localparam` (resolved to constants at lowering
 time, sharing one name table — a `localparam`'s value may reference an
@@ -68,7 +69,7 @@ earlier parameter, use the ternary operator, and use arithmetic),
 constant/variable bit-select, constant part-select, concatenation
 (including replication, `{N{a,b}}`), and the ternary operator on reads
 (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`, `{4{a,b}}`, `c ? a : b`), plus a
-*constant* bit-select/part-select as a non-blocking
+*constant* bit-select/part-select as a procedural
 assignment target (`x[7:0] <= v;`, with correct read-modify-write
 semantics in the kernel — the rest of the signal's bits are left
 untouched, and multiple partial writes to the same signal in one clock
@@ -98,9 +99,12 @@ does replicate the sign bit), as are signed ordering comparisons
 (`$signed(a) < $signed(b)`, which picorv32's ALU needs). Array/memory
 signals (`reg [31:0] mem [0:31]`, read and written one element at a time
 at a runtime index) are supported too — picorv32's register file is
-exactly this shape. Blocking assignment (`=` inside a clocked block),
-module instantiation, and Cranelift JIT codegen are all still ahead of
-where this stands today.
+exactly this shape. Blocking assignment (`=`) works alongside `<=` in the
+same clocked block, with the timing Verilog defines: a blocking write
+lands immediately, so the next statement reads the new value, while a
+non-blocking one is still invisible to a later read in the same edge.
+Compound assignment (`+=` and friends), module instantiation, and
+Cranelift JIT codegen are all still ahead of where this stands today.
 
 ## Workspace layout
 

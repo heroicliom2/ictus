@@ -13,7 +13,10 @@
 //! number of clocked (`always @(posedge clk)`) processes
 //! and continuous `assign`s but no `always_comb` yet, `if`/`else`/
 //! `else if` and `case`/`casez`/`casex` (see `CaseValue`) alongside
-//! non-blocking assignment, `+ - * << >> >>> & | ^` and comparison/
+//! non-blocking (`<=`) *and* blocking (`=`) assignment (see
+//! `Stmt::BlockingAssign` -- they differ only in when the write becomes
+//! visible, which is the whole of the distinction),
+//! `+ - * << >> >>> & | ^` and comparison/
 //! logical operators (a comparison/logical/reduction result is always exactly 1
 //! bit, by Verilog's own definition -- not an approximation the way a
 //! general arithmetic result's width would be, so unlike `Add`/`Sub`/
@@ -35,13 +38,14 @@
 //! than getting their own variants) on reads (no indexed part-select
 //! `x[base +: width]`), plus
 //! a constant bit-select/part-select
-//! as a non-blocking-assignment *target* (`x[7:0] <= v;`) -- a variable
-//! index or indexed range as a target isn't supported, and neither is a
-//! select as a *continuous*-assignment target (`assign x[7:0] = v;`; only
-//! `<=` supports a partial write, since it alone has a commit phase to do
-//! the read-modify-write in). A concatenation of such targets
+//! as a *procedural*-assignment target (`x[7:0] <= v;` or `x[7:0] = v;`)
+//! -- a variable index or indexed range as a target isn't supported, and
+//! neither is a select as a *continuous*-assignment target
+//! (`assign x[7:0] = v;`; only a procedural assignment reaches the
+//! kernel's shared write path, which is where the read-modify-write
+//! happens). A concatenation of such targets
 //! (`{a, b[3:0]} <= v;`) needs no IR support of its own at all -- the
-//! frontend splits it into several plain `Stmt::NonBlockingAssign`s, one
+//! frontend splits it into several plain assignment statements, one
 //! per part, at lowering time (see `ictus-frontend-verilog`'s
 //! `lower_concat_target_assign`). Likewise, a call to a *provably-empty*
 //! task (`some_task;`) needs no IR support either -- the frontend lowers
@@ -311,6 +315,35 @@ pub enum Stmt {
     /// update, and 2-state storage has no way to record "this went
     /// nowhere" -- see `ArrayRead` for the reading half of this policy).
     ArrayAssign {
+        array: SignalId,
+        index: Expr,
+        value: Expr,
+    },
+    /// *Blocking* assignment (`x = value;`) -- same target forms as
+    /// `NonBlockingAssign`, but the write lands **immediately**, before
+    /// the next statement in the block is evaluated, instead of being
+    /// deferred to the end of the tick. A later statement in the same
+    /// process therefore reads the new value, and a later `<=`'s
+    /// right-hand side does too.
+    ///
+    /// The two are separate statements rather than one carrying a
+    /// `blocking: bool` flag, even though they differ only in timing:
+    /// `Stmt::Assign` would collide confusingly with the top-level
+    /// `Assign` struct (continuous assignment), and a match arm that
+    /// *says* `BlockingAssign` is clearer at the point of use than one
+    /// whose meaning depends on reading a field. See docs/decisions.md
+    /// D23 -- the logic for actually performing a write is shared
+    /// between both kinds in the kernel regardless, so this costs
+    /// duplicated field lists, not duplicated behavior.
+    BlockingAssign {
+        target: SignalId,
+        target_range: Option<(u32, u32)>,
+        value: Expr,
+    },
+    /// Blocking write to an array element (`mem[i] = value;`) -- the
+    /// immediate counterpart of `ArrayAssign`, applied before the next
+    /// statement runs. Same out-of-range policy: the write is dropped.
+    BlockingArrayAssign {
         array: SignalId,
         index: Expr,
         value: Expr,

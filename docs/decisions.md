@@ -1025,3 +1025,86 @@ after this lands reaches blocking assignment (`=`), which is not another
 statement form but a second *write discipline* that has to coexist with
 this kernel's evaluate-then-commit model -- flagged in roadmap.md as
 needing its own decision.
+
+## D23 — Blocking assignment: a second write discipline, applied through one shared write path
+
+**Decision**: blocking assignment (`=` inside a clocked block) is
+implemented by letting the statement-evaluation phase mutate live state
+directly, alongside the existing queue of deferred writes — and the
+two kinds get separate IR statements (`Stmt::BlockingAssign`,
+`Stmt::BlockingArrayAssign`) rather than a `blocking: bool` flag on the
+existing ones.
+
+**Background, in Verilog's terms**: a clocked block contains two kinds of
+assignment that look almost identical and behave differently.
+`x <= value;` (non-blocking) schedules the write; every read in that same
+block still sees the *old* `x`, which is what lets a shift register be
+written as a plain sequence of statements without each stage clobbering
+the next. `x = value;` (blocking) writes immediately, so the next
+statement reads the new value — it is used as a local variable in the
+middle of a sequence. The LRM models this as two regions of one time
+step: active (where blocking writes happen, in statement order) and NBA
+(where non-blocking writes land, afterwards).
+
+**Why this needed a decision at all**: every write this kernel had
+modelled until now was deferred. `tick()` evaluated all processes against
+a frozen snapshot, collected pending writes, then committed them. A
+blocking write cannot go through that path — deferring it would make the
+very next statement read a stale value, silently computing the wrong
+answer rather than failing. So the evaluation phase had to become capable
+of mutating state, which it previously was not.
+
+**How the two coexist**: `eval_stmts` now takes `&mut` access to the
+value buffer and the array side table *and* the pending-write list.
+A blocking statement calls `apply_write` immediately; a non-blocking one
+pushes onto the list as before, and the list is drained through the same
+`apply_write` after every process has run. That falls out of the LRM's
+own ordering rather than approximating it, and it gets both of the cases
+that distinguish the two kinds right without either being special-cased:
+
+* `a = 5; b <= a;` — `b` is scheduled with 5, because the blocking write
+  already landed in the live buffer that the right-hand side reads.
+* `x <= 1; y = x;` — `y` gets the *old* `x`, because the non-blocking
+  write is still sitting in the pending list, untouched by anything the
+  active region reads.
+
+**Why one `apply_write` rather than two write paths**: the read-modify-
+write for a partial (bit-range) target, the width masking, and the
+out-of-range array rule are subtle enough that two copies would drift.
+Extracting them means the only thing that differs between the two
+disciplines is *when* the function is called — which is exactly the
+distinction the LRM draws, and nothing else.
+
+**Why separate statements rather than a flag** (the narrow reading of the
+principle in D15/D20 — separate variants for different *addressing*,
+composition or flags for different *timing* — would have said flag):
+three reasons outweighed it. `Stmt::Assign` as a name collides with the
+existing top-level continuous-`assign` struct, so the variants would have
+had to be named awkwardly. A match arm reading `BlockingAssign` states
+the timing at the place a reader needs it, where `NonBlockingAssign { .. }`
+whose meaning inverts on a field several lines down does not. And the
+cost the principle exists to avoid — duplicated *behaviour* — is already
+avoided by the shared `apply_write`; what separate variants actually cost
+here is a duplicated field list.
+
+**Deliberately rejected, with a test**: compound assignment (`acc += in;`).
+sv-parser routes it through the same `OperatorAssignment` node as `=`,
+differing only in the operator symbol, so accepting the node blindly would
+have treated `+=` as `=` and silently dropped the accumulate. The operator
+is checked explicitly and anything but `=` is rejected by name.
+
+**Why discovered / confirmed, not assumed**: the gap came from the
+picorv32 diagnostic — `set_mem_do_rinst = 1;` sitting a few lines from
+`decoder_trigger <= 0;` inside one `always @(posedge clk)` block, which is
+also why the fixture mixes both kinds in one block rather than testing
+them apart. The differential test is the load-bearing one: structural
+tests can only show the two kinds stayed distinguishable through
+lowering, whereas the difference *is* the timing. It compares a blocking
+write read by the next statement, a non-blocking right-hand side reading a
+just-blocking-written signal, and — the case that fails if the two
+disciplines are collapsed — a blocking read of a signal a non-blocking
+write targeted two statements earlier, which must still see the pre-edge
+value. Its first cycle is unsampled for the usual 2-state/4-state reason
+(D19). Re-running the diagnostic after this lands reaches a narrower gap:
+`expr_width` can't determine the width of a bitwise `And` used as a
+concatenation operand.

@@ -15,7 +15,19 @@
 //! against the state as it was *before* this tick, and only then are all
 //! the resulting writes committed together -- matching Verilog's
 //! non-blocking assignment rule that `<=` reads pre-edge values regardless
-//! of statement order within the same clock edge. A write with a
+//! of statement order within the same clock edge.
+//!
+//! A *blocking* assignment (`=`) is the other half of that rule, and the
+//! one exception to "nothing is written during evaluation": it writes
+//! immediately, so the statements after it read the new value, which is
+//! what makes it usable as a local variable mid-sequence. The two
+//! disciplines run side by side in one pass -- `eval_stmts` mutates state
+//! for a blocking write and queues a non-blocking one, and the queue
+//! drains afterwards -- which is Verilog's own active-region/NBA-region
+//! ordering rather than an approximation of it. Both go through the same
+//! `apply_write`, so the two differ in *when* that function is called and
+//! in nothing else (see `ictus_ir::Stmt::BlockingAssign`, decisions.md
+//! D23). A write with a
 //! `target_range` (`x[7:0] <= v;` -- a constant bit-select/part-select
 //! target, see `ictus_ir::Stmt::NonBlockingAssign`) is committed as a
 //! read-modify-write against the signal's current stored value rather
@@ -117,44 +129,35 @@ impl<'m> Simulation<'m> {
     pub fn tick(&mut self) {
         self.settle_combinational();
 
+        // `module` is copied out of `self` first so the loop below can
+        // borrow `self.values`/`self.arrays` mutably: a *blocking*
+        // assignment inside a process writes them as it goes, so
+        // evaluation can't hold `self` immutably the way it did when
+        // every write was deferred.
+        let module = self.module;
         let mut updates = Vec::new();
-        for process in &self.module.clocked_processes {
-            eval_stmts(&process.body, &self.values, &self.arrays, &mut updates);
+        for process in &module.clocked_processes {
+            eval_stmts(
+                &process.body,
+                module,
+                &mut self.values,
+                &mut self.arrays,
+                &mut updates,
+            );
         }
         // Applied in order via direct mutation, not staged in a separate
-        // map: every RHS above was already evaluated against the pre-tick
-        // snapshot before this loop starts touching `self.values`, so a
-        // later partial write to the same signal correctly builds on an
-        // earlier one from this same tick (matching real hardware, where
-        // multiple non-blocking writes to the same bits in one process is
-        // "last write wins" and writes to disjoint bit ranges combine).
+        // map: every *non-blocking* RHS above was already evaluated before
+        // this loop starts, so a later partial write to the same signal
+        // correctly builds on an earlier one from this same tick (matching
+        // real hardware, where multiple non-blocking writes to the same
+        // bits in one process is "last write wins" and writes to disjoint
+        // bit ranges combine).
+        //
+        // This is Verilog's own two-region ordering: blocking assignments
+        // take effect during statement execution (above), queued
+        // non-blocking ones all land afterwards (here).
         for update in updates {
-            match update {
-                PendingWrite::Scalar { target, range: None, value } => {
-                    self.values[target] = mask(value, self.module.signals[target].width)
-                }
-                PendingWrite::Scalar { target, range: Some((msb, lsb)), value } => {
-                    let width = msb - lsb + 1;
-                    let clear_mask = mask(u64::MAX, width) << lsb;
-                    let current = self.values[target] & !clear_mask;
-                    let new_bits = (mask(value, width)) << lsb;
-                    self.values[target] =
-                        mask(current | new_bits, self.module.signals[target].width);
-                }
-                // An index past the end of the array drops the write --
-                // there's no element to update, and clamping or wrapping
-                // it would corrupt a *different* element, which is worse
-                // than doing nothing. See `ictus_ir::Stmt::ArrayAssign`.
-                PendingWrite::Array { array, index, value } => {
-                    let width = self.module.signals[array].width;
-                    if let Some(slot) = usize::try_from(index)
-                        .ok()
-                        .and_then(|index| self.arrays[array].get_mut(index))
-                    {
-                        *slot = mask(value, width);
-                    }
-                }
-            }
+            apply_write(module, &mut self.values, &mut self.arrays, update);
         }
 
         self.settle_combinational();
@@ -190,10 +193,51 @@ enum PendingWrite {
     },
 }
 
+/// Performs one write against live state. Shared by both assignment
+/// kinds: a blocking assignment calls this the moment it's evaluated, a
+/// non-blocking one has it called from `tick`'s commit loop once every
+/// right-hand side has been read. The two differ in *when* this runs,
+/// never in what it does -- which is why the two `Stmt` variants for them
+/// duplicate only field lists, not behavior (see
+/// `ictus_ir::Stmt::BlockingAssign`).
+fn apply_write(
+    module: &Module,
+    values: &mut [u64],
+    arrays: &mut [Vec<u64>],
+    write: PendingWrite,
+) {
+    match write {
+        PendingWrite::Scalar { target, range: None, value } => {
+            values[target] = mask(value, module.signals[target].width)
+        }
+        PendingWrite::Scalar { target, range: Some((msb, lsb)), value } => {
+            let width = msb - lsb + 1;
+            let clear_mask = mask(u64::MAX, width) << lsb;
+            let current = values[target] & !clear_mask;
+            let new_bits = (mask(value, width)) << lsb;
+            values[target] = mask(current | new_bits, module.signals[target].width);
+        }
+        // An index past the end of the array drops the write -- there's no
+        // element to update, and clamping or wrapping it would corrupt a
+        // *different* element, which is worse than doing nothing. See
+        // `ictus_ir::Stmt::ArrayAssign`.
+        PendingWrite::Array { array, index, value } => {
+            let width = module.signals[array].width;
+            if let Some(slot) = usize::try_from(index)
+                .ok()
+                .and_then(|index| arrays[array].get_mut(index))
+            {
+                *slot = mask(value, width);
+            }
+        }
+    }
+}
+
 fn eval_stmts(
     stmts: &[Stmt],
-    values: &[u64],
-    arrays: &[Vec<u64>],
+    module: &Module,
+    values: &mut [u64],
+    arrays: &mut [Vec<u64>],
     updates: &mut Vec<PendingWrite>,
 ) {
     for stmt in stmts {
@@ -220,6 +264,33 @@ fn eval_stmts(
                     value: eval_expr(value, values, arrays),
                 });
             }
+            // Blocking: evaluated and written right here, so the next
+            // statement -- and any later `<=`'s right-hand side -- sees
+            // the new value.
+            Stmt::BlockingAssign {
+                target,
+                target_range,
+                value,
+            } => {
+                let write = PendingWrite::Scalar {
+                    target: *target,
+                    range: *target_range,
+                    value: eval_expr(value, values, arrays),
+                };
+                apply_write(module, values, arrays, write);
+            }
+            Stmt::BlockingArrayAssign {
+                array,
+                index,
+                value,
+            } => {
+                let write = PendingWrite::Array {
+                    array: *array,
+                    index: eval_expr(index, values, arrays),
+                    value: eval_expr(value, values, arrays),
+                };
+                apply_write(module, values, arrays, write);
+            }
             Stmt::If {
                 cond,
                 then_branch,
@@ -230,7 +301,7 @@ fn eval_stmts(
                 } else {
                     else_branch
                 };
-                eval_stmts(branch, values, arrays, updates);
+                eval_stmts(branch, module, values, arrays, updates);
             }
             Stmt::Case {
                 selector,
@@ -244,8 +315,8 @@ fn eval_stmts(
                         .any(|v| case_value_matches(v, selector_value, values, arrays))
                 });
                 match matched_arm {
-                    Some(arm) => eval_stmts(&arm.body, values, arrays, updates),
-                    None => eval_stmts(default, values, arrays, updates),
+                    Some(arm) => eval_stmts(&arm.body, module, values, arrays, updates),
+                    None => eval_stmts(default, module, values, arrays, updates),
                 }
             }
         }

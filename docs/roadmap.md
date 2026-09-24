@@ -755,17 +755,78 @@ than test anything -- the same discipline D19 established. The
 out-of-range read/write policies are covered by `ictus_kernel`'s own unit
 tests for that same reason.
 
-**Next confirmed blocker**: *blocking* assignment (`=` inside a clocked
-block). Re-running the diagnostic after the array work hits
-`StatementItem::BlockingAssignment`, which `lower_statement_item` has no
-case for -- only non-blocking `<=` is lowered. Not yet attempted, and it
-needs a real decision rather than a default: blocking assignment takes
-effect *immediately*, mid-statement-sequence, where every write this
-kernel currently models is deferred to the commit phase at the end of a
-tick. So it isn't another statement form to add alongside the others --
-it's a second write discipline that has to coexist with the
-evaluate-then-commit model in `tick()`, and getting the interaction
-wrong is exactly the kind of silent-wrong-answer this project rejects.
+**Blocking assignment (`=` inside a clocked block) is done** -- the gap
+the array work surfaced, and the one flagged above as needing a real
+decision rather than a default, because it is not another statement form
+but a second *write discipline*. Design in decisions.md D23.
+
+In Verilog's own terms: `x <= value;` (non-blocking) schedules the write
+so every read in that same block still sees the old `x` -- that is what
+lets a shift register be written as a plain sequence of statements. `x =
+value;` (blocking) writes immediately, so the next statement reads the
+new value; it is how a signal gets used as a local variable mid-sequence.
+picorv32 mixes both freely in one `always @(posedge clk)` block
+(`set_mem_do_rinst = 1;` a few lines from `decoder_trigger <= 0;`), which
+is what forced the issue. The shape:
+
+- `Stmt::BlockingAssign { target, target_range, value }` and
+  `Stmt::BlockingArrayAssign { array, index, value }` -- separate
+  statements rather than a `blocking: bool` flag on the existing pair.
+  The strict reading of the rule the earlier increments followed
+  (separate variants for different *addressing*, flags for different
+  *timing*) would have said flag; three things outweighed it, and D23
+  records them: `Stmt::Assign` as a name collides with the existing
+  continuous-`assign` struct, a match arm reading `BlockingAssign` states
+  the timing where a reader needs it, and the duplication the rule exists
+  to prevent -- duplicated *behaviour* -- is avoided by the shared write
+  path below regardless.
+- The kernel's evaluation phase can now mutate live state. `eval_stmts`
+  takes `&mut` access to the value buffer and the array side table
+  *alongside* the pending-write list; a blocking statement writes
+  immediately, a non-blocking one queues as before, and the queue drains
+  afterwards. That is the LRM's own active-region/NBA-region ordering
+  rather than an approximation of it, and both of the cases that
+  distinguish the two kinds fall out of it without special-casing:
+  `a = 5; b <= a;` schedules `b` with 5, while `x <= 1; y = x;` gives `y`
+  the *old* `x`.
+- Both disciplines write through one extracted `apply_write`, so the
+  partial-target read-modify-write (D14), the width masking and the
+  out-of-range array rule (D22) exist once. The only thing that differs
+  between blocking and non-blocking is *when* that function is called --
+  which is exactly the distinction Verilog draws, and nothing else.
+- Rejected with a test: compound assignment (`acc += in;`). sv-parser
+  routes it through the same `OperatorAssignment` node as `=`, differing
+  only in the operator symbol, so accepting the node blindly would treat
+  `+=` as `=` and silently drop the accumulate.
+
+Verified structurally (`ictus-frontend-verilog/tests/blocking.rs` --
+that both kinds stay distinguishable through lowering, in source order,
+since a blocking write is only correct *relative to* the statements
+around it) and, load-bearingly, differentially against Icarus Verilog
+(`ictus-cli/tests/differential_blocking.rs`): the difference between the
+two kinds *is* the timing, which no structural check can show. That test
+compares a blocking write read by the very next statement, a non-blocking
+right-hand side reading a just-blocking-written signal, and -- the case
+that fails if the two disciplines are collapsed into one -- a blocking
+read of a signal a non-blocking write targeted two statements earlier,
+which must still see the pre-edge value. Its first cycle is unsampled for
+the usual 2-state/4-state reason (D19).
+
+**Next confirmed blocker**: a bitwise `And` used as a *concatenation
+operand*. Re-running the diagnostic after blocking assignment lands
+reports that `expr_width` can't determine the width of
+`And(Ref(49), BitwiseNot(Ref(48), 32))` -- concatenation has to know each
+operand's width to place it, and `expr_width` currently answers only for
+literals, signal references, selects, nested concatenation, ternaries and
+the always-1-bit comparison/logical/reduction results. This is a much
+narrower gap than the last few, and it may be a legitimate small
+extension rather than a design fork: `&`, `|` and `^` of two operands
+have a width Verilog defines as the max of the operands' widths, and
+neither can produce a bit its operands didn't have. That is *not* true in
+the same clean way of `+`/`-`/`*`, where the LRM's "truncate to the wider
+operand" rule discards a carry the writer may well have expected to keep
+-- so whether to extend to those at the same time is the actual decision.
+Confirm against the real usage site in picorv32 before choosing.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
@@ -776,10 +837,11 @@ ternary operator, and concatenation; no overriding a `parameter` at
 instantiation), constant/variable bit-select and constant part-select,
 concatenation (plain and replication) and ternary on reads only -- with
 comparison/logical/reduction results, not just literals/refs/selects,
-now valid concatenation operands -- a constant bit-select/part-select --
-or a concatenation of such -- as a non-blocking (`<=`) assignment target
-but not a continuous (`assign`) one and not with a variable index (though
-the index/bound *may* reference a parameter/localparam, per the
+valid as concatenation operands, but *not* an arithmetic or bitwise
+result (the current next blocker) -- a constant bit-select/part-select --
+or a concatenation of such -- as a procedural assignment target but not a
+continuous (`assign`) one and not with a variable index (though the
+index/bound *may* reference a parameter/localparam, per the
 constant-folding work), `$signed(...)` to sign-extend a value into a
 wider assignment target and to mark operands for the signed-aware
 operators -- a real arithmetic right shift (`$signed(x) >>> n`) and a
@@ -791,10 +853,10 @@ bitwise `~`, and the reduction operators, a 4-state `x`/`z` literal
 outside a case item (resolves to `0`), array/memory signals (`reg [31:0]
 mem [0:31]`) with one unpacked dimension, internal-only, one element at a
 time -- but no array port, no bit-select of an element, and no `assign`
-to one -- no *blocking* assignment (`=`, now the confirmed next blocker),
-no module instantiation. Cranelift codegen and actually getting picorv32
-fully through the pipeline are both still ahead of where this stands
-today.
+to one -- and both `<=` and `=` inside a clocked block, but no compound
+assignment (`+=` and friends), no module instantiation. Cranelift codegen
+and actually getting picorv32 fully through the pipeline are both still
+ahead of where this stands today.
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

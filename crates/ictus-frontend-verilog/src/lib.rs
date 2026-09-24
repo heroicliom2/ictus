@@ -8,8 +8,11 @@
 //! `always @(posedge clk) begin ... end` blocks, `if`/`else`/`else if`
 //! chains (lowered to nested `Stmt::If` -- see `lower_if` -- no new IR
 //! needed), `case`/`casez`/`casex` (wildcard bits only on a case *item*'s
-//! own literal -- see `lower_case`/`lower_case_value`), non-blocking
-//! assignment, internal `wire`/`reg` declarations naming one or more
+//! own literal -- see `lower_case`/`lower_case_value`), both non-blocking
+//! (`<=`) and blocking (`=`) assignment -- which differ only in *when*
+//! the write lands, and so share one `lower_procedural_assign` and differ
+//! only in which `Stmt` it emits; see decisions.md D23 --
+//! internal `wire`/`reg` declarations naming one or more
 //! signals per declaration (`reg a, b, c;` -- see `lower_internal_signal`)
 //! in addition to ports, array/memory signals (`reg [7:0] mem [0:3];` --
 //! one unpacked `[high:low]` dimension, internal signals only, read and
@@ -35,16 +38,18 @@
 //! ternary operator on the *read* side (`x[3]`, `x[i]`, `x[7:0]`, `{a,b}`,
 //! `{4{a,b}}`, `c ? a : b`; no indexed part-select `x[base +: width]`), plus
 //! on the *assignment-target* side: a *constant* bit-select/part-select as
-//! a non-blocking-assignment target (`x[7:0] <= v;`, picorv32's
+//! a procedural-assignment target (`x[7:0] <= v;`, picorv32's
 //! `mem_rdata_q[...] <= ...` style -- see `lower_select_target_range`),
 //! and a concatenation of such targets (`{a, b[3:0]} <= v;`, picorv32's
 //! `{mem_rdata_q[31:25], mem_rdata_q[11:7]} <= ...` style -- see
 //! `lower_concat_target_assign`, which splits it into one plain
-//! `Stmt::NonBlockingAssign` per part rather than needing new IR; a
+//! assignment statement per part rather than needing new IR; a
 //! *nested* concatenation inside the target is rejected, not guessed at).
 //! A variable index/indexed-range target, and any select or concatenation
-//! as a *continuous*-assignment target, are still rejected, since only
-//! `<=` has a commit phase to do the read-modify-write in -- see the
+//! as a *continuous*-assignment target, are still rejected: a procedural
+//! assignment reaches a shared write path that does the read-modify-write
+//! (`ictus_kernel`'s `apply_write`), and a continuous one has no
+//! equivalent -- see the
 //! `NetLvalue::Lvalue` check in `lower_continuous_assign`. And expressions
 //! built from literals (decimal/binary/hex, not octal; a 4-state `x`/`z`
 //! digit -- whole-value or mixed with real digits, any base, *outside* a
@@ -92,10 +97,13 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- *blocking* assignment (`=`
-//! inside a clocked block; only non-blocking `<=` is lowered today, and
-//! this is what the diagnostic hits next, right after the array support
-//! above), `always_comb`, and module instantiation are the
+//! later phases need more of the language. The diagnostic's next gap is
+//! narrower than the last few: `expr_width` can't determine the width of
+//! a bitwise `&`/`|`/`^` result, so one can't yet be a *concatenation*
+//! operand (see `expr_width`, and roadmap.md for why extending it to the
+//! arithmetic operators at the same time is a real decision rather than
+//! the same change twice). Beyond that, compound assignment (`+=`),
+//! `always_comb`, and module instantiation are the
 //! next-highest-value gaps toward running a real design like phase 0's
 //! picorv32 benchmark.
 
@@ -978,10 +986,14 @@ fn lower_statement_item(
         }
         StatementItem::ConditionalStatement(cond) => Ok(vec![lower_if(cond, tree, module)?]),
         StatementItem::CaseStatement(case) => Ok(vec![lower_case(case, tree, module)?]),
+        StatementItem::BlockingAssignment(b) => {
+            let (assign, _semicolon) = &**b;
+            lower_blocking_assign(assign, tree, module)
+        }
         StatementItem::SubroutineCallStatement(call) => lower_task_call_statement(call, tree, module),
         _ => Err(
             "statement form not supported in v1 (only begin/end blocks, if/else, case, \
-             non-blocking assignment, and a call to a provably-empty task)"
+             blocking and non-blocking assignment, and a call to a provably-empty \n             task)"
                 .to_string(),
         ),
     }
@@ -1225,21 +1237,65 @@ fn lower_nonblocking_assign(
     tree: &SyntaxTree,
     module: &Ctx,
 ) -> Result<Vec<Stmt>, String> {
+    lower_procedural_assign(&assign.nodes.0, &assign.nodes.3, false, tree, module)
+}
+
+/// Lowers a *blocking* assignment (`x = value;`). Only the plain `=` form
+/// is accepted: sv-parser routes `=` and the compound operators
+/// (`+=`, `<<=`, ...) through the same `OperatorAssignment` node, and a
+/// compound one is rejected rather than silently treated as a plain
+/// assignment, which would discard the read-modify part entirely.
+fn lower_blocking_assign(
+    assign: &sv_parser::BlockingAssignment,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Vec<Stmt>, String> {
+    let sv_parser::BlockingAssignment::OperatorAssignment(op_assign) = assign else {
+        return Err(
+            "this blocking assignment form is not supported in v1 (no delay or event control \
+             on the assignment itself)"
+                .to_string(),
+        );
+    };
+    let operator =
+        symbol_text(&op_assign.nodes.1, tree).ok_or("assignment operator unreadable")?;
+    if operator != "=" {
+        return Err(format!(
+            "compound assignment '{operator}' is not supported in v1 -- write it out as \
+             `x = x {} ...;`",
+            operator.trim_end_matches('=')
+        ));
+    }
+    lower_procedural_assign(&op_assign.nodes.0, &op_assign.nodes.2, true, tree, module)
+}
+
+/// Shared body for both procedural assignment kinds. They differ only in
+/// *when* the write lands (see `ictus_ir::Stmt::BlockingAssign`), never in
+/// what a target may look like, so target resolution -- concatenation,
+/// array element, bit range, or plain signal -- is written once here and
+/// the `blocking` flag only picks which `Stmt` comes out.
+fn lower_procedural_assign(
+    lvalue: &sv_parser::VariableLvalue,
+    value_expr: &sv_parser::Expression,
+    blocking: bool,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Vec<Stmt>, String> {
     // A concatenation target (`{a, b} <= x;`) is its own `VariableLvalue`
     // variant (`Lvalue`, wrapping a brace-list of lvalues), not just an
     // identifier with an unusual `Select` -- checked separately, and
     // first, because the identifier-based checks below would otherwise
     // deep-search *past* this and silently match `a` alone, discarding
     // `b` and the split-assignment semantics entirely. Handled by
-    // `lower_concat_target_assign`, which splits it into one
-    // `Stmt::NonBlockingAssign` per part rather than needing new IR.
-    if let sv_parser::VariableLvalue::Lvalue(concat) = &assign.nodes.0 {
-        let value = lower_expr(&assign.nodes.3, tree, module)?;
-        return lower_concat_target_assign(concat, value, tree, module);
+    // `lower_concat_target_assign`, which splits it into one statement
+    // per part rather than needing new IR.
+    if let sv_parser::VariableLvalue::Lvalue(concat) = lvalue {
+        let value = lower_expr(value_expr, tree, module)?;
+        return lower_concat_target_assign(concat, value, blocking, tree, module);
     }
 
-    let lhs_ident = unwrap_node!(&assign.nodes.0, SimpleIdentifier)
-        .ok_or("non-blocking assignment target is not a simple identifier")?;
+    let lhs_ident = unwrap_node!(lvalue, SimpleIdentifier)
+        .ok_or("assignment target is not a simple identifier")?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assignment target unreadable")?;
     let target = module
         .signal_id(target_name)
@@ -1249,7 +1305,7 @@ fn lower_nonblocking_assign(
     // element rather than a bit range of a fixed signal, so it's its own
     // statement -- see `ictus_ir::Stmt::ArrayAssign`.
     if module.signals[target].depth.is_some() {
-        let select = unwrap_node!(&assign.nodes.0, Select)
+        let select = unwrap_node!(lvalue, Select)
             .and_then(|node| match node {
                 RefNode::Select(select) => Some(select),
                 _ => None,
@@ -1259,23 +1315,32 @@ fn lower_nonblocking_assign(
         else {
             unreachable!("lower_array_index always returns an ArrayRead");
         };
-        return Ok(vec![Stmt::ArrayAssign {
-            array,
-            index: *index,
-            value: lower_expr(&assign.nodes.3, tree, module)?,
+        let index = *index;
+        let value = lower_expr(value_expr, tree, module)?;
+        return Ok(vec![if blocking {
+            Stmt::BlockingArrayAssign { array, index, value }
+        } else {
+            Stmt::ArrayAssign { array, index, value }
         }]);
     }
 
-    let target_range =
-        lower_select_target_range(&assign.nodes.0, target_name, tree, module)?;
+    let target_range = lower_select_target_range(lvalue, target_name, tree, module)?;
     check_target_range(target_range, target, target_name, module)?;
 
-    let value = lower_expr(&assign.nodes.3, tree, module)?;
+    let value = lower_expr(value_expr, tree, module)?;
 
-    Ok(vec![Stmt::NonBlockingAssign {
-        target,
-        target_range,
-        value,
+    Ok(vec![if blocking {
+        Stmt::BlockingAssign {
+            target,
+            target_range,
+            value,
+        }
+    } else {
+        Stmt::NonBlockingAssign {
+            target,
+            target_range,
+            value,
+        }
     }])
 }
 
@@ -1304,6 +1369,7 @@ type ConcatTargetPart = (SignalId, Option<(u32, u32)>, u32);
 fn lower_concat_target_assign(
     concat: &sv_parser::VariableLvalueLvalue,
     value: Expr,
+    blocking: bool,
     tree: &SyntaxTree,
     module: &Ctx,
 ) -> Result<Vec<Stmt>, String> {
@@ -1346,14 +1412,23 @@ fn lower_concat_target_assign(
         let msb = shift - 1;
         let lsb = shift - width;
         shift -= width;
-        stmts.push(Stmt::NonBlockingAssign {
-            target,
-            target_range,
-            value: Expr::Select {
-                base: Box::new(value.clone()),
-                msb,
-                lsb,
-            },
+        let part_value = Expr::Select {
+            base: Box::new(value.clone()),
+            msb,
+            lsb,
+        };
+        stmts.push(if blocking {
+            Stmt::BlockingAssign {
+                target,
+                target_range,
+                value: part_value,
+            }
+        } else {
+            Stmt::NonBlockingAssign {
+                target,
+                target_range,
+                value: part_value,
+            }
         });
     }
     Ok(stmts)
