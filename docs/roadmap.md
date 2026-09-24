@@ -858,29 +858,102 @@ differentially against Icarus Verilog
 cases specifically: `a = 12, b = 10` makes `{a + b, 2'b11}` equal 27, not
 the 91 an untruncated 5-bit sum would give.
 
-**Next: whether picorv32 *simulates* correctly, which lowering cleanly
-says nothing about.** This is a change of question rather than another
-gap of the same kind, and it is likely to be a larger piece of work than
-any single increment so far. Lowering proves every construct in the file
-was *representable*; it does not prove any of them was given the right
-meaning, and the constructs picorv32 uses that this frontend accepts only
-in a narrowed form (a task call treated as a no-op, `x`/`z` resolved to
-0, an out-of-range index reading 0) are exactly the places where a
-representable-but-wrong lowering would hide. The natural first step is
-the smallest thing that would expose it: run the design against its own
-testbench in Icarus and in Ictus and compare, starting from reset and a
-handful of cycles rather than a full program, since the first divergence
-is the informative one. Two things to expect: `$display`/`$finish` and
-the memory interface in picorv32's testbench are outside the supported
-subset, so the harness will need to drive the design directly rather than
-through that testbench; and 4-state divergence (decisions.md D19) will
-show up immediately at reset, so the comparison has to start from a point
-where both simulators hold defined values -- the same discipline the
-array and blocking tests already use, applied at design scale.
+**picorv32 now runs, and the answer to "does it simulate correctly?" is
+"yes for the bus, not yet for execution"** -- a distinction the work
+itself produced rather than one anticipated. Design and full findings in
+decisions.md D25.
+
+The harness is a *trace replay*, not a co-simulation. Ictus can't
+instantiate modules, so it can't run a testbench; reimplementing the
+memory model in Rust would have put two hand-written models on the two
+sides of the comparison, where every disagreement between them looks
+exactly like a simulator bug. Instead Icarus runs the testbench and
+records both what it drove into the core and what the core produced, and
+the Rust side replays the recorded inputs. The stimulus is then identical
+by construction. Sampling is at each negedge, where nothing is moving, so
+one row holds the outputs after edge N and the inputs for edge N+1
+together -- and replaying a row takes two steps, since a combinational
+output reacts to an input with no edge in between.
+
+Three real defects came out of it, and the common thread is the point:
+each let the design lower cleanly, run without error, and produce
+plausible output while being wrong. None was reachable by reading the
+code, and none would have been caught by a fixture-sized test.
+
+- **`Simulation::set` didn't re-settle combinational logic**, so a `get`
+  between ticks reflected the *previous* inputs. picorv32's
+  `assign mem_xfer = mem_valid && mem_ready;` reacts to an input with no
+  edge in between, so the whole memory handshake lagged a cycle. `set`
+  now settles rather than exposing a `settle()` the caller must remember
+  -- forgetting that would be silent.
+- **Net declarations with an initializer were silently dropped.**
+  `wire mem_done = ...;` *is* a continuous assignment, and picorv32 uses
+  that spelling for most of its combinational logic (59 of them against
+  43 standalone `assign` statements). The wires existed and read 0
+  forever. A *variable* initializer (`reg x = 0;`) looks identical and
+  means something else entirely -- once, before time zero -- and is now
+  rejected rather than mis-lowered or ignored.
+- **Binary operator precedence was never applied at all.** sv-parser
+  returns a right-leaning chain in source order, so
+  `a == b && c == d` arrived as `a == (b && (c == d))`. picorv32's
+  instruction decoder is built from exactly this shape, so the core
+  decoded `addi` as a shift instruction and kept running.
+  `lower_binary_chain` now re-associates by real precedence, which
+  subsumes D13's narrow ternary fix (a bare `?:` binds looser than every
+  binary operator, so it can only end a chain) and also fixed an
+  unnoticed associativity bug -- `a - b - c` was `a - (b - c)`.
+
+After all three, every traced port matches Icarus exactly, every cycle.
+**And picorv32's register file in Ictus is still empty.** The core
+reproduces the bus trace while executing nothing, because `cpuregs_write`
+and `cpuregs_wrdata` come from an `always @*` block this frontend doesn't
+lower; for straight-line code the fetch addresses don't depend on any
+register value, so a dead datapath is invisible from the ports. Agreement
+on a design's ports is not evidence that the design ran, and the test now
+says so in its own comments -- it asserts the register file is *still*
+empty, so that assertion fails loudly the moment the gap closes.
+
+**Next confirmed blocker: `always @*`** (and its `always_comb` spelling).
+This is a feature rather than a fix, and it is the immediate next
+increment rather than a deferred one, because today it is *ignored* --
+the same silent-drop failure as the net-initializer defect above, which
+is not an acceptable thing to leave sitting. It isn't rejected instead
+only because rejecting it would stop picorv32 lowering at all and take
+the differential test with it. What it needs:
+
+- A combinational process in the IR alongside `clocked_processes`. The
+  statement machinery already exists and needs nothing new: these blocks
+  are built from `if`/`case` and *blocking* assignment, all of which
+  landed in earlier increments.
+- A settle step in the kernel that runs them together with the continuous
+  assignments. This is where the real design question is, and it is the
+  same one flagged below: a single pass in source order isn't enough once
+  processes and assigns feed each other, so this should settle to a
+  **fixpoint** -- iterate until nothing changes, with a cap that reports a
+  combinational loop loudly rather than hanging.
+- A decision on what a block that doesn't assign on every path means.
+  Verilog infers a latch; keeping the previous value is what falls out
+  naturally, and whether that is accepted silently or flagged is a real
+  choice, not a default.
+
+Once it lands, the differential test's program grows to include a store,
+a load and a branch (the store is what finally drives `mem_wstrb` and
+`mem_wdata` to something other than `x`), and the register-file
+comparison against Icarus replaces the placeholder assertion.
+
+**Known limitation, exposed but not fixed**: `settle_combinational`
+evaluates each continuous assignment once, in source order, which is not
+guaranteed to be a correct evaluation order -- an assignment reading a
+net driven further down sees a stale value for a cycle. Both spellings of
+continuous assignment are now collected in one pass so source order is at
+least preserved rather than reordered. Settling to a fixpoint is the real
+fix and folds naturally into the `always @*` work above.
 
 The supported language subset is still intentionally narrow: single
-ANSI-style module, any number of clocked processes and `assign`s but no
-`always_comb`, `#(parameter ...)` *and* `localparam` sharing one
+ANSI-style module, any number of clocked processes and `assign`s (in
+both spellings -- a standalone `assign` and a net declaration carrying an
+initializer) but no combinational `always` block yet, `#(parameter ...)`
+*and* `localparam` sharing one
 resolution pass (value expressions may reference an earlier parameter/
 localparam, and use `+ - * << >> >>> & | ^ == != < <= > >= && ||`, the
 ternary operator, and concatenation; no overriding a `parameter` at
@@ -906,10 +979,10 @@ outside a case item (resolves to `0`), array/memory signals (`reg [31:0]
 mem [0:31]`) with one unpacked dimension, internal-only, one element at a
 time -- but no array port, no bit-select of an element, and no `assign`
 to one -- and both `<=` and `=` inside a clocked block, but no compound
-assignment (`+=` and friends), no module instantiation. The whole of
-picorv32.v now *lowers* within this subset; Cranelift codegen, and
-establishing that the design also *simulates* correctly, are both still
-ahead of where this stands today.
+assignment (`+=` and friends), no `always @*`/`always_comb`, no module
+instantiation. The whole of picorv32.v lowers within this subset and its
+bus behaviour matches Icarus cycle for cycle; making it actually
+*execute* needs `always @*`, and Cranelift codegen is further out still.
 
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential

@@ -1187,3 +1187,103 @@ frontend end to end. That closes the diagnostic loop that has driven
 every increment since D13. It says nothing yet about whether the design
 *simulates* correctly, which is a different and much larger question, and
 the roadmap now frames that as the next thing to establish.
+
+## D25 — Running the real design: trace replay, and three defects it found
+
+**Decision**: correctness at design scale is established by *replaying a
+recorded trace*, not by co-simulating two hand-written testbenches. Icarus
+runs a testbench that wraps picorv32 in a memory and records both what it
+drove into the core and what the core produced; the Rust side replays the
+recorded inputs into Ictus and compares the outputs.
+
+**Why that shape**: Ictus can't instantiate modules, so it can't run the
+testbench. The obvious alternative -- reimplement the memory model in Rust
+-- would put two hand-written models on the two sides of the comparison,
+and every disagreement between *them* would look exactly like a simulator
+bug. Replaying a recording makes the stimulus identical by construction,
+so a difference can only mean the two simulators read the same design
+differently. It also costs nothing in fidelity: the recording is of a real
+memory model, just not one that had to be written twice.
+
+**Sampling and timing**: the testbench samples at each negedge, where
+nothing is moving, so one recorded row holds the core's outputs after edge
+N *and* the inputs it will see at edge N+1. Replaying a row therefore
+takes two steps -- drive the previous row's inputs and tick (registers
+sample what was on the wire before the edge), then drive this row's inputs
+before reading (a combinational output reacts to an input with no edge in
+between). Getting this backwards moves every combinational output by a
+full cycle, which is not a subtle inaccuracy.
+
+**What it found.** Three defects, and the common thread is what matters:
+every one of them let the design lower cleanly, run without error, and
+produce plausible output while being wrong. None was reachable by reading
+the code or by any fixture-sized test.
+
+1. **`Simulation::set` did not re-settle combinational logic.** A driven
+   input feeds continuous assignments with no clock edge in between --
+   picorv32's `assign mem_xfer = mem_valid && mem_ready;` is exactly this
+   -- so a `get` between ticks returned a value computed from the
+   *previous* inputs. `set` now settles, rather than exposing a separate
+   `settle()` the caller must remember: forgetting it would be silent, and
+   the cost is one pass over the module's `assign`s on a kernel that
+   D12 already designates the correctness baseline rather than the fast
+   path.
+
+2. **Net declarations with an initializer were silently dropped.**
+   `wire mem_done = ...;` is defined by IEEE 1800 as exactly
+   `wire mem_done; assign mem_done = ...;`, and picorv32 uses that
+   spelling for most of its combinational logic -- 59 declarations against
+   43 standalone `assign` statements. The frontend created the wires and
+   never drove them, so they read 0 forever. A *variable* initializer
+   (`reg x = 0;`) looks identical and means something entirely different
+   -- it runs once before time zero rather than driving the signal
+   continuously -- so it is now rejected outright instead of being
+   mis-lowered or quietly ignored, since ignoring is right only for `= 0`.
+
+3. **Binary operator precedence was never applied.** `sv-parser` returns
+   a binary expression as a right-leaning chain in source order:
+   `a == b && c == d` arrives as `a == (b && (c == d))`. Lowering that
+   literally computes a different value than Verilog specifies. picorv32's
+   instruction decoder is built entirely from this shape
+   (`rdata[14:12] == 3'b001 && rdata[31:25] == 7'b0000000`), so the core
+   decoded `addi` as a shift instruction -- and kept running. The narrow
+   ternary fix from D13 is now subsumed: `?:` binds looser than every
+   binary operator, so a bare ternary can only end a chain and everything
+   left of it is really its condition, which falls out of the general
+   precedence rule rather than needing its own hand-written case. The same
+   rule also fixed an unnoticed associativity bug: `a - b - c` was being
+   lowered as `a - (b - c)`.
+
+**The most useful thing it found isn't a defect.** After all three fixes
+the port comparison passes exactly -- every traced output, every cycle --
+and picorv32's register file in Ictus is still empty. The core reproduces
+the bus trace while executing nothing, because `cpuregs_write` and
+`cpuregs_wrdata` are driven from an `always @*` block the frontend does
+not lower. For straight-line code the fetch addresses don't depend on any
+register value, so a dead datapath is invisible from the ports.
+
+That is worth stating plainly: **agreement on a design's ports is not
+evidence that the design ran.** The differential test says so in its own
+comments and asserts the register file is *still* empty, so the assertion
+fails loudly the moment `always @*` lands and the real comparison can
+replace it.
+
+**Unknown values**: a field Icarus reports as `x` is skipped rather than
+compared, the same 2-state/4-state boundary as D19. The test asserts a
+floor on how many points were actually compared, so it can't erode into
+something that skips everything and passes.
+
+**Known limitation this exposed, not fixed**: `settle_combinational`
+evaluates each continuous assignment once, in source order. Source order
+is not guaranteed to be a correct evaluation order -- an assignment
+reading a net driven further down would see a stale value for a cycle.
+Both spellings of continuous assignment are now collected in one pass so
+that source order is at least *preserved* (collecting them separately
+would have reordered every design's logic for no reason), but settling to
+a real fixpoint is the actual fix and is on the roadmap.
+
+**Next**: `always @*`. It is currently ignored rather than rejected, which
+is the same silent-drop failure as (2) above and is called out as such --
+rejecting it today would stop picorv32 lowering at all and take the
+differential test with it, so it is the immediate next increment rather
+than a deferred one.

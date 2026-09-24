@@ -107,13 +107,23 @@ same clocked block, with the timing Verilog defines: a blocking write
 lands immediately, so the next statement reads the new value, while a
 non-blocking one is still invisible to a later read in the same edge.
 
-The whole of the vendored picorv32.v now lowers through this frontend
-cleanly — 225 signals, no error — which is what the running diagnostic
-against the real design had been driving toward. Lowering cleanly is not
-the same as simulating correctly, and establishing the latter is the next
-thing on the roadmap. Compound assignment (`+=` and friends), module
-instantiation, and Cranelift JIT codegen are all still ahead of where
-this stands today.
+The whole of the vendored picorv32.v — a real 32-bit RISC-V CPU core —
+lowers through this frontend cleanly (225 signals), and runs against a
+recorded trace from Icarus Verilog with every traced port matching cycle
+for cycle while it fetches a small program. Getting there found three
+defects that each let the design lower, run, and produce plausible output
+while being wrong: driving an input didn't re-settle combinational logic,
+net declarations carrying an initializer (`wire x = a + b;`, which is how
+most of picorv32's combinational logic is written) were dropped silently,
+and binary operator precedence was never applied at all, so the
+instruction decoder read `addi` as a shift instruction.
+
+What that does *not* yet establish is that the core **executes**: its
+register file is still empty, because `always @*` blocks aren't lowered
+and picorv32 computes its register writes in one. Agreement on a design's
+ports is not evidence that the design ran. `always @*` is next on the
+roadmap; compound assignment (`+=` and friends), module instantiation,
+and Cranelift JIT codegen are further out.
 
 ## Workspace layout
 

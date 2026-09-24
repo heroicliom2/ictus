@@ -96,18 +96,25 @@
 //! project's own differential testing (docs/architecture.md, Validation
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
-//! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language. The whole of phase 0's
-//! picorv32 benchmark design now lowers through here cleanly (225
-//! signals), which is what the running diagnostic against the real file
-//! had been driving toward -- but lowering cleanly only says every
-//! construct was *representable*, not that each was given the right
-//! meaning, and establishing the latter is the next thing on the
-//! roadmap. Shift results still have no width (see `expr_width`, and
-//! decisions.md D24 for why that rule is genuinely different from the
-//! binary operators around it rather than the same change twice);
-//! compound assignment (`+=`), `always_comb`, and module instantiation
-//! are the next-highest-value language gaps.
+//! `lower_continuous_assign`) into `ictus_ir::Assign`, *and* the
+//! equivalent net-declaration form `wire x = expr;` (see
+//! `lower_net_decl_assigns`), which IEEE 1800 defines as the same thing
+//! and which real designs use far more; both are collected in one pass so
+//! they keep their source order relative to each other. A *variable*
+//! initializer (`reg x = 0;`) looks identical, means something else
+//! entirely, and is rejected -- see `reject_variable_initializer`.
+//!
+//! Widen this as later phases need more of the language. The whole of
+//! phase 0's picorv32 benchmark design lowers through here cleanly (225
+//! signals) and its bus behaviour then matches Icarus Verilog cycle for
+//! cycle -- but it does not yet *execute*, because `always @*` blocks
+//! (which is where picorv32 computes its register writes) are still
+//! ignored rather than lowered. That is the next increment and the
+//! highest-value gap by a wide margin; see decisions.md D25, which also
+//! records the three defects running the real design turned up, every one
+//! of which lowered cleanly and ran while being wrong. After it: shift
+//! results still have no width (see `expr_width` and decisions.md D24),
+//! then compound assignment (`+=`) and module instantiation.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -205,6 +212,7 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
                 }
             }
             RefNode::DataDeclaration(DataDeclaration::Variable(var)) => {
+                reject_variable_initializer(var, &tree)?;
                 for signal in lower_internal_signal(&**var, &tree, &parameters)? {
                     module.push_signal(signal);
                 }
@@ -235,10 +243,35 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
         }
     }
 
+    // Continuous assignments come in two spellings -- a standalone
+    // `assign mem_xfer = ...;` and a net declaration carrying an
+    // initializer, `wire mem_done = ...;`, which IEEE 1800 defines as
+    // exactly equivalent to `wire mem_done; assign mem_done = ...;`.
+    //
+    // Both are collected in **one pass**, so the resulting `assigns` keep
+    // their original source order however the two are interleaved. That
+    // matters: `Simulation::settle_combinational` evaluates them once
+    // each in this order, so an assignment that reads a net driven by a
+    // later one would see a stale value for a cycle. Source order is not
+    // a guarantee of a correct topological order -- nothing stops a
+    // design from writing them in any order at all, and settling to a
+    // real fixpoint is the actual fix (see docs/roadmap.md) -- but
+    // preserving it keeps the common, readable case right instead of
+    // reordering every design's logic for no reason.
+    //
+    // This runs after the signal walk rather than inside it, because a
+    // right-hand side may reference any signal in the module, including
+    // ones declared further down.
     let mut assigns = Vec::new();
-    for assign_node in module_node.into_iter() {
-        if let RefNode::ContinuousAssign(sv_parser::ContinuousAssign::Net(net)) = assign_node {
-            assigns.push(lower_continuous_assign(net, &tree, &ctx)?);
+    for node in module_node.into_iter() {
+        match node {
+            RefNode::ContinuousAssign(sv_parser::ContinuousAssign::Net(net)) => {
+                assigns.push(lower_continuous_assign(net, &tree, &ctx)?);
+            }
+            RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net)) => {
+                assigns.extend(lower_net_decl_assigns(net, &tree, &ctx)?);
+            }
+            _ => {}
         }
     }
 
@@ -1458,6 +1491,94 @@ fn lower_concat_target_assign(
 /// this frontend's tests specifically guard against. Bit-select and
 /// concatenation targets (`assign {a,b} = x;`) are explicitly rejected,
 /// not just undocumented gaps -- see the `NetLvalue::Lvalue` check below.
+/// Rejects a *variable* declaration carrying an initializer (`reg x =
+/// 0;`). This looks like the net form `lower_net_decl_assigns` handles
+/// and means something entirely different: a net initializer is a
+/// continuous assignment that drives the net for the whole simulation,
+/// while a variable initializer runs **once**, before time zero, and the
+/// variable is free to change afterwards. Lowering it as a continuous
+/// assignment would pin the variable to its initial value forever.
+///
+/// v1 has no initialization phase to run it in -- every signal starts at
+/// 0 -- so this is rejected rather than either mis-lowered or quietly
+/// ignored. Quietly ignoring it would be right only for `= 0` and
+/// silently wrong for anything else, and "silently wrong for some inputs"
+/// is the failure this whole area of the frontend just got bitten by
+/// (docs/decisions.md D25).
+fn reject_variable_initializer(
+    var: &sv_parser::DataDeclarationVariable,
+    tree: &SyntaxTree,
+) -> Result<(), String> {
+    for node in var.into_iter() {
+        if let RefNode::VariableDeclAssignmentVariable(decl) = node {
+            if decl.nodes.2.is_some() {
+                let name = unwrap_node!(&decl.nodes.0, SimpleIdentifier)
+                    .and_then(|n| ident_str(n, tree))
+                    .unwrap_or("<unreadable>");
+                return Err(format!(
+                    "variable '{name}' is declared with an initializer (`reg {name} = ...;`), \
+                     which v1 doesn't support -- unlike a net initializer (`wire {name} = ...;`, \
+                     a continuous assignment) this runs once before time zero, and this kernel \
+                     has no initialization phase to run it in"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lowers the *initializer* on a net declaration -- `wire mem_done =
+/// resetn && ...;` -- into the same `ictus_ir::Assign` a standalone
+/// `assign mem_done = ...;` produces. IEEE 1800 defines the two forms as
+/// exactly equivalent, and picorv32 uses the declaration form far more
+/// (59 of them against 43 standalone `assign` statements), so a frontend
+/// that handles only the standalone form leaves most of a real design's
+/// combinational logic undriven.
+///
+/// That is what happened: these were silently dropped, the wires existed
+/// and read as 0 forever, and the design still *lowered* and *ran* --
+/// producing a plausible, wrong answer rather than an error. See
+/// docs/decisions.md D25; it is the reason the module-item walk now
+/// rejects declaration forms it doesn't handle instead of ignoring them.
+///
+/// One declaration may declare several nets (`wire a = x, b = y;`), so
+/// this returns a `Vec` and walks the real `List<Symbol,
+/// NetDeclAssignment>` rather than subtree-searching for a single node
+/// the way `lower_continuous_assign` does -- searching would silently
+/// lower only the first, which is precisely the failure being fixed here.
+/// Nets without an initializer are the ordinary case and are skipped:
+/// they were already turned into signals by the earlier declaration walk.
+fn lower_net_decl_assigns(
+    net: &sv_parser::NetDeclarationNetType,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Vec<Assign>, String> {
+    let mut assigns = Vec::new();
+    for decl in net.nodes.5.nodes.0.contents() {
+        let Some((_equals, value_expr)) = &decl.nodes.2 else {
+            continue;
+        };
+        let ident = unwrap_node!(&decl.nodes.0, SimpleIdentifier)
+            .ok_or("net declaration name is not a simple identifier")?;
+        let name = ident_str(ident, tree).ok_or("net declaration name unreadable")?;
+        let target = module
+            .signal_id(name)
+            .ok_or_else(|| format!("net '{name}' is not a known signal"))?;
+        // Same restriction as `lower_continuous_assign`'s: `ictus_ir::Assign`
+        // names one whole signal, with no element index to carry.
+        if module.signals[target].depth.is_some() {
+            return Err(format!(
+                "net '{name}' is an array declared with an initializer, which v1 doesn't support"
+            ));
+        }
+        assigns.push(Assign {
+            target,
+            value: lower_expr(value_expr, tree, module)?,
+        });
+    }
+    Ok(assigns)
+}
+
 fn lower_continuous_assign(
     net: &ContinuousAssignNet,
     tree: &SyntaxTree,
@@ -1572,47 +1693,7 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
                 other => Err(format!("unsupported unary operator '{other}'")),
             }
         }
-        E::Binary(binary) => {
-            let op_text = symbol_text(&binary.nodes.1, tree).ok_or("binary operator unreadable")?;
-
-            // sv-parser mis-associates an *unparenthesized* ternary
-            // immediately following a binary operator's right operand:
-            // `a > c ? a : c` comes back structured as `a > (c ? a : c)`
-            // (Binary{op: >, lhs: a, rhs: ConditionalExpression{cond: c,
-            // then: a, else: c}}) instead of the only-correct real-Verilog
-            // parse `(a > c) ? a : c` -- every operator handled below
-            // binds tighter than `?:`, so a bare (no explicit parens)
-            // ConditionalExpression can never legitimately be a binary
-            // operator's own right operand; a *parenthesized* ternary
-            // operand parses as Primary::MintypmaxExpression instead and
-            // is unaffected by this check. Confirmed empirically (not
-            // assumed) against both the parenthesized and unparenthesized
-            // forms before writing this -- see decl_style.rs and
-            // ternary_precedence.rs. Only the immediate-RHS case is fixed
-            // here; a ternary appearing deeper on the right (e.g.
-            // `a > b + (c ? x : y)`, sic -- without parens there this
-            // mis-parses too, one level down) is corrected by this same
-            // check firing again during the recursive lower_expr call for
-            // that inner operator, but a case where the *outer* operator
-            // would ALSO need to re-associate past an already-fixed inner
-            // ternary is not handled.
-            if let sv_parser::Expression::ConditionalExpression(ternary) = &binary.nodes.3 {
-                let lhs = lower_expr(&binary.nodes.0, tree, module)?;
-                let inner_cond = lower_cond_predicate(&ternary.nodes.0, tree, module)?;
-                let cond = apply_binary_op(op_text, lhs, inner_cond)?;
-                let then_val = lower_expr(&ternary.nodes.3, tree, module)?;
-                let else_val = lower_expr(&ternary.nodes.5, tree, module)?;
-                return Ok(Expr::Ternary {
-                    cond: Box::new(cond),
-                    then_val: Box::new(then_val),
-                    else_val: Box::new(else_val),
-                });
-            }
-
-            let lhs = lower_expr(&binary.nodes.0, tree, module)?;
-            let rhs = lower_expr(&binary.nodes.3, tree, module)?;
-            apply_binary_op(op_text, lhs, rhs)
-        }
+        E::Binary(binary) => lower_binary_chain(binary, tree, module),
         E::ConditionalExpression(ternary) => {
             let cond = lower_cond_predicate(&ternary.nodes.0, tree, module)?;
             let then_val = lower_expr(&ternary.nodes.3, tree, module)?;
@@ -1625,6 +1706,137 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
         }
         other => Err(format!("expression form not supported in v1: {other:?}")),
     }
+}
+
+/// Verilog's binary operator precedence, tighter-binding first. Only
+/// relative order matters. `?:` is deliberately absent: it binds looser
+/// than every operator here, which is what lets `lower_binary_chain`
+/// treat a trailing ternary as ending the chain rather than as one more
+/// operator in it.
+fn precedence(op: &str) -> u8 {
+    match op {
+        "**" => 11,
+        "*" | "/" | "%" => 10,
+        "+" | "-" => 9,
+        "<<" | ">>" | "<<<" | ">>>" => 8,
+        "<" | "<=" | ">" | ">=" => 7,
+        "==" | "!=" | "===" | "!==" => 6,
+        "&" => 5,
+        "^" | "^~" | "~^" => 4,
+        "|" => 3,
+        "&&" => 2,
+        "||" => 1,
+        // An operator this frontend doesn't support at all. Its position
+        // can't change the outcome -- every pairing is ultimately built by
+        // `apply_binary_op`, which rejects it wherever it lands -- so it
+        // gets the loosest binding and produces that error rather than a
+        // second, worse one from here.
+        _ => 0,
+    }
+}
+
+/// Lowers a chain of binary operators, re-associating it by real Verilog
+/// precedence.
+///
+/// **This is a correction to `sv-parser`, not just a convenience.** The
+/// parser returns a binary expression as a right-leaning chain in source
+/// order -- `a == b && c == d` arrives as `Eq(a, And(b, Eq(c, d)))`, i.e.
+/// `a == (b && (c == d))` -- with no precedence applied. Lowering that
+/// shape literally computes a different value than Verilog specifies:
+/// picorv32's instruction decoder is full of
+/// `rdata[14:12] == 3'b001 && rdata[31:25] == 7'b0000000`, which under the
+/// literal reading decodes `addi` as a shift instruction. The design still
+/// lowered and still ran; it just executed the wrong program, which is why
+/// this was found by differential execution against Icarus rather than by
+/// any amount of reading. See docs/decisions.md D25.
+///
+/// The chain is flattened into operands and operators and re-combined by
+/// precedence climbing (all of these operators are left-associative, so
+/// an operator of *equal* precedence on the stack is applied first --
+/// which is what makes `a - b - c` mean `(a - b) - c` rather than
+/// sv-parser's literal `a - (b - c)`).
+///
+/// This subsumes the narrower ternary correction that used to live here
+/// (decisions.md D13): `?:` binds looser than every binary operator, so a
+/// bare ternary can only ever *end* a chain, and everything to its left is
+/// really its condition. `a > c ? a : c` therefore reassociates to
+/// `(a > c) ? a : c` as a special case of the general rule rather than as
+/// its own hand-written fix -- including the case the old code called out
+/// as unhandled, where the outer operator also has to re-associate past
+/// the ternary. A *parenthesized* ternary parses as
+/// `Primary::MintypmaxExpression` instead and never reaches here.
+fn lower_binary_chain(
+    binary: &sv_parser::ExpressionBinary,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Expr, String> {
+    use sv_parser::Expression as E;
+
+    let mut operands = Vec::new();
+    let mut ops: Vec<&str> = Vec::new();
+    let mut current = binary;
+    let tail = loop {
+        operands.push(lower_expr(&current.nodes.0, tree, module)?);
+        ops.push(symbol_text(&current.nodes.1, tree).ok_or("binary operator unreadable")?);
+        match &current.nodes.3 {
+            E::Binary(next) => current = &**next,
+            other => break other,
+        }
+    };
+
+    // A trailing ternary's own condition is the chain's last operand: in
+    // `a == b && c ? x : y` the parser hands back `c` as the ternary's
+    // condition, when really the condition is the whole `(a == b) && c`.
+    let ternary = match tail {
+        E::ConditionalExpression(t) => {
+            operands.push(lower_cond_predicate(&t.nodes.0, tree, module)?);
+            Some(&**t)
+        }
+        other => {
+            operands.push(lower_expr(other, tree, module)?);
+            None
+        }
+    };
+
+    let mut remaining = operands.into_iter();
+    let mut values = vec![remaining.next().expect("a chain has at least one operand")];
+    let mut pending: Vec<&str> = Vec::new();
+    for op in ops.iter().copied() {
+        while pending
+            .last()
+            .is_some_and(|top| precedence(top) >= precedence(op))
+        {
+            apply_top(&mut values, pending.pop().expect("just checked"))?;
+        }
+        pending.push(op);
+        values.push(
+            remaining
+                .next()
+                .expect("a chain has one more operand than operators"),
+        );
+    }
+    while let Some(op) = pending.pop() {
+        apply_top(&mut values, op)?;
+    }
+    let combined = values.pop().expect("a chain always leaves one value");
+
+    match ternary {
+        None => Ok(combined),
+        Some(t) => Ok(Expr::Ternary {
+            cond: Box::new(combined),
+            then_val: Box::new(lower_expr(&t.nodes.3, tree, module)?),
+            else_val: Box::new(lower_expr(&t.nodes.5, tree, module)?),
+        }),
+    }
+}
+
+/// Pops the top two values and recombines them with `op`. Split out only
+/// so `lower_binary_chain`'s two drain sites can't drift apart.
+fn apply_top(values: &mut Vec<Expr>, op: &str) -> Result<(), String> {
+    let rhs = values.pop().ok_or("malformed binary chain")?;
+    let lhs = values.pop().ok_or("malformed binary chain")?;
+    values.push(apply_binary_op(op, lhs, rhs)?);
+    Ok(())
 }
 
 /// Combines two already-lowered operands with a binary operator.

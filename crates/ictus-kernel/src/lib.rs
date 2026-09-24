@@ -47,7 +47,11 @@
 //! *next* `tick()`'s initial settle -- sees combinational logic reflect
 //! the registers this edge just updated). `new()` also settles once, so a
 //! `Simulation` that's never been ticked still has correct combinational
-//! output for its (zeroed) initial state.
+//! output for its (zeroed) initial state, and so does every `set()` --
+//! driving an input feeds continuous assignments with no clock edge in
+//! between, and leaving that to the caller made a real design's memory
+//! handshake lag a cycle while still looking plausible (decisions.md
+//! D25).
 //!
 //! Settling is a **single pass over `Module::assigns` in declaration
 //! order**, not a full fixed-point/topological solve. This is correct as
@@ -55,10 +59,15 @@
 //! source (the overwhelmingly common style, and the only style this
 //! frontend's test fixtures use) -- a signal assigned from another
 //! combinational signal declared *later* in the source won't see that
-//! later signal's fresh value until the *next* settle call. Worth fixing
-//! properly (topological sort, matching the kernel's eventual compiled
-//! design in docs/architecture.md) if this ever bites a real design;
-//! flagged here rather than silently trusted.
+//! later signal's fresh value until the *next* settle call. Running
+//! picorv32 has since made this concrete rather than hypothetical: it is
+//! why both spellings of continuous assignment are now collected in one
+//! source-order pass by the frontend rather than one kind after the
+//! other, which would have reordered every design's logic. Settling to a
+//! real fixpoint (iterate until nothing changes, with a cap that reports
+//! a combinational loop rather than hanging) is the actual fix, and it
+//! lands together with `always @*` support, which needs the same
+//! machinery -- see docs/roadmap.md.
 
 use ictus_ir::{Expr, Module, SignalId, Stmt};
 
@@ -109,12 +118,27 @@ impl<'m> Simulation<'m> {
             .unwrap_or_else(|| panic!("index {index} is out of range for array '{name}'"))
     }
 
+    /// Drives a signal -- normally an input port -- and re-settles
+    /// combinational logic so every continuous `assign` that reads it
+    /// reflects the new value immediately.
+    ///
+    /// The re-settle is the whole point, and it is deliberately not left
+    /// to the caller. A driven input can feed a continuous `assign`
+    /// without any clock edge in between (picorv32's `assign mem_xfer =
+    /// mem_valid && mem_ready;` reacts to its `mem_ready` input exactly
+    /// this way), so without it a `get` of such a signal between ticks
+    /// would return a value computed from the *previous* inputs -- stale,
+    /// plausible, and wrong, which is the failure mode this project is
+    /// least willing to ship. Settling here costs one pass over the
+    /// module's `assign`s per call, which this interpreter can afford
+    /// (docs/decisions.md D12) and which a caller cannot forget.
     pub fn set(&mut self, name: &str, value: u64) {
         let id = self
             .module
             .signal_id(name)
             .unwrap_or_else(|| panic!("unknown signal '{name}'"));
         self.values[id] = mask(value, self.module.signals[id].width);
+        self.settle_combinational();
     }
 
     pub fn get(&self, name: &str) -> u64 {
@@ -493,7 +517,7 @@ fn mask(value: u64, width: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ictus_ir::{ClockedProcess, Direction, Signal};
+    use ictus_ir::{Assign, ClockedProcess, Direction, Signal};
 
     /// Hand-built IR for the same `counter` module
     /// `ictus-frontend-verilog/tests/fixtures/counter.v` lowers to -- kept
@@ -979,5 +1003,47 @@ mod tests {
             index: Box::new(Expr::Literal { value: 100, width: 32 }),
         };
         assert_eq!(eval_expr(&expr, &[], &[]), 0);
+    }
+
+    /// Driving an input has to re-settle combinational logic, or a `get`
+    /// between ticks reads a value computed from the *previous* inputs.
+    ///
+    /// This is not hypothetical: picorv32's `assign mem_xfer = mem_valid
+    /// && mem_ready;` reacts to its `mem_ready` input with no clock edge
+    /// in between, and `set` not settling made the core's whole memory
+    /// handshake lag by a cycle -- while still producing a plausible
+    /// trace. See docs/decisions.md D25.
+    #[test]
+    fn driving_an_input_resettles_combinational_logic() {
+        let mut m = Module {
+            name: "comb_module".to_string(),
+            ..Default::default()
+        };
+        let a = m.push_signal(Signal {
+            name: "a".to_string(),
+            width: 8,
+            direction: Some(Direction::Input),
+            depth: None,
+        });
+        let doubled = m.push_signal(Signal {
+            name: "doubled".to_string(),
+            width: 8,
+            direction: Some(Direction::Output),
+            depth: None,
+        });
+        // assign doubled = a + a;
+        m.assigns.push(Assign {
+            target: doubled,
+            value: Expr::Add(Box::new(Expr::Ref(a)), Box::new(Expr::Ref(a))),
+        });
+
+        let mut sim = Simulation::new(&m);
+        sim.set("a", 5);
+        // No tick: a continuous assignment has no edge to wait for, so
+        // this must already reflect the value just driven.
+        assert_eq!(sim.get("doubled"), 10);
+
+        sim.set("a", 9);
+        assert_eq!(sim.get("doubled"), 18);
     }
 }
