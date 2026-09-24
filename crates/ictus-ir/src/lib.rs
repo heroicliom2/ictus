@@ -17,11 +17,14 @@
 //! `Stmt::BlockingAssign` -- they differ only in when the write becomes
 //! visible, which is the whole of the distinction),
 //! `+ - * << >> >>> & | ^` and comparison/
-//! logical operators (a comparison/logical/reduction result is always exactly 1
-//! bit, by Verilog's own definition -- not an approximation the way a
-//! general arithmetic result's width would be, so unlike `Add`/`Sub`/
-//! `Mul` these are valid concatenation operands too; see
-//! `ictus-frontend-verilog`'s `expr_width`), constant and variable
+//! logical operators (a comparison/logical/reduction result is always
+//! exactly 1 bit by Verilog's own definition, and a binary bitwise or
+//! arithmetic result takes the wider of its two operands' widths --
+//! Verilog's self-determined width rule, which truncates an adder's carry
+//! away rather than widening to hold it; the shift operators follow a
+//! *different* rule and are not supported where a width is needed. See
+//! `ictus-frontend-verilog`'s `expr_width` and decisions.md D24),
+//! constant and variable
 //! bit-select, constant part-select,
 //! concatenation (including replication/multiple concatenation,
 //! `{N{a,b}}` -- also just an `Expr::Concat`, its part list physically

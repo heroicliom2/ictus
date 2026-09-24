@@ -97,15 +97,17 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language. The diagnostic's next gap is
-//! narrower than the last few: `expr_width` can't determine the width of
-//! a bitwise `&`/`|`/`^` result, so one can't yet be a *concatenation*
-//! operand (see `expr_width`, and roadmap.md for why extending it to the
-//! arithmetic operators at the same time is a real decision rather than
-//! the same change twice). Beyond that, compound assignment (`+=`),
-//! `always_comb`, and module instantiation are the
-//! next-highest-value gaps toward running a real design like phase 0's
-//! picorv32 benchmark.
+//! later phases need more of the language. The whole of phase 0's
+//! picorv32 benchmark design now lowers through here cleanly (225
+//! signals), which is what the running diagnostic against the real file
+//! had been driving toward -- but lowering cleanly only says every
+//! construct was *representable*, not that each was given the right
+//! meaning, and establishing the latter is the next thing on the
+//! roadmap. Shift results still have no width (see `expr_width`, and
+//! decisions.md D24 for why that rule is genuinely different from the
+//! binary operators around it rather than the same change twice);
+//! compound assignment (`+=`), `always_comb`, and module instantiation
+//! are the next-highest-value language gaps.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -661,6 +663,16 @@ fn constant_expr_width(expr: &Expr) -> Result<u32, String> {
         Expr::Ternary { then_val, else_val, .. } => {
             Ok(constant_expr_width(then_val)?.max(constant_expr_width(else_val)?))
         }
+        // Same self-determined-width rule as `expr_width`'s equivalent
+        // arm, kept in step with it deliberately: a `localparam` whose
+        // value concatenates `A + B` should not fail where the identical
+        // expression in a general context succeeds.
+        Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Xor(lhs, rhs)
+        | Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs) => Ok(constant_expr_width(lhs)?.max(constant_expr_width(rhs)?)),
         other => Err(format!(
             "concatenation operand's width can't be determined in a constant expression in v1: \
              {other:?}"
@@ -2070,13 +2082,15 @@ fn lower_multiple_concatenation(
 }
 
 /// Computes a statically-known bit width for an already-lowered
-/// expression -- needed to pack concatenation operands into their correct
-/// bit positions (see `Expr::Concat`'s doc comment in `ictus_ir`). Only
-/// expression forms with an exactly-known width are accepted:
-/// arithmetic/comparison results don't have a width this frontend can
-/// determine without real type inference (Verilog's own width-inference
-/// rules for something like `a + b` are more involved than this frontend
-/// implements), so those are rejected here rather than guessed at.
+/// expression. Two callers need it: packing concatenation operands into
+/// their correct bit positions (see `Expr::Concat`'s doc comment in
+/// `ictus_ir`), and telling a unary operator how many bits it covers
+/// (`~x` preserves its operand's width; a reduction folds exactly its
+/// operand's bits).
+///
+/// Only expression forms with an exactly-known width are accepted; the
+/// rest are rejected rather than guessed at, since a wrong width here is
+/// a silently wrong *value* at either call site.
 pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
     match expr {
         Expr::Literal { width, .. } => Ok(*width),
@@ -2102,10 +2116,8 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         // always exactly 1 bit, regardless of what it reduced.
         Expr::BitwiseNot(_, width) => Ok(*width),
         // Every comparison, logical, and reduction operator is *defined*
-        // by Verilog to produce exactly 1 bit (0 or 1) -- not a guess or
-        // an approximation the way a general arithmetic result's width
-        // would be, so these are safe to allow as concatenation operands
-        // unlike `Add`/`Sub`/`Mul`/etc. below.
+        // by Verilog to produce exactly 1 bit (0 or 1), whatever the
+        // width of what it compared or reduced.
         Expr::Not(_)
         | Expr::Eq(..)
         | Expr::Ne(..)
@@ -2119,11 +2131,35 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         | Expr::ReduceAnd(..)
         | Expr::ReduceOr(..)
         | Expr::ReduceXor(..) => Ok(1),
+        // Verilog gives every binary bitwise and arithmetic operator the
+        // same *self-determined* width: the wider of its two operands.
+        // Both operands are extended to that width before the operation,
+        // and the result is truncated back down to it.
+        //
+        // For the bitwise three that is exact in the strongest sense --
+        // neither operand can contribute a set bit above its own width,
+        // so nothing is lost either way. For the arithmetic three it is
+        // Verilog's rule but also a real trap worth naming: `{a + b, c}`
+        // with 8-bit `a` and `b` packs 8 bits and *discards the carry*,
+        // so an adder's 9th bit has to be asked for by widening an
+        // operand (`{1'b0, a} + {1'b0, b}`) rather than appearing on its
+        // own. This matches Verilog rather than second-guessing it, and
+        // the truncation genuinely happens: every consumer of this width
+        // masks the evaluated value back down to it -- concatenation
+        // packing, `BitwiseNot`, and the reduction operators all do (see
+        // `ictus_kernel::eval_expr`).
+        Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Xor(lhs, rhs)
+        | Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs) => Ok(expr_width(lhs, module)?.max(expr_width(rhs, module)?)),
         other => Err(format!(
-            "concatenation operand's width can't be determined in v1 (only literals, signal \
-             references, bit-select/part-select, nested concatenation, ternary, and \
-             comparison/logical/reduction operators -- always exactly 1 bit -- are supported \
-             as operands): {other:?}"
+            "this expression's width can't be determined in v1, which is needed here either \
+             to pack it into a concatenation or to know how many bits a unary operator \
+             covers (the shift operators are the notable gap: Verilog gives `a << b` its \
+             *left* operand's width, a different rule from the binary operators above, and \
+             that isn't implemented): {other:?}"
         )),
     }
 }

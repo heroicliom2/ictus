@@ -812,21 +812,71 @@ read of a signal a non-blocking write targeted two statements earlier,
 which must still see the pre-edge value. Its first cycle is unsampled for
 the usual 2-state/4-state reason (D19).
 
-**Next confirmed blocker**: a bitwise `And` used as a *concatenation
-operand*. Re-running the diagnostic after blocking assignment lands
-reports that `expr_width` can't determine the width of
-`And(Ref(49), BitwiseNot(Ref(48), 32))` -- concatenation has to know each
-operand's width to place it, and `expr_width` currently answers only for
-literals, signal references, selects, nested concatenation, ternaries and
-the always-1-bit comparison/logical/reduction results. This is a much
-narrower gap than the last few, and it may be a legitimate small
-extension rather than a design fork: `&`, `|` and `^` of two operands
-have a width Verilog defines as the max of the operands' widths, and
-neither can produce a bit its operands didn't have. That is *not* true in
-the same clean way of `+`/`-`/`*`, where the LRM's "truncate to the wider
-operand" rule discards a carry the writer may well have expected to keep
--- so whether to extend to those at the same time is the actual decision.
-Confirm against the real usage site in picorv32 before choosing.
+**Self-determined operand widths are done, and with them the whole of
+picorv32.v lowers cleanly** -- 225 signals, no error. That is the first
+time the real design has made it through the frontend end to end, and it
+closes the diagnostic loop that has driven every increment since D13.
+Design in decisions.md D24.
+
+The gap itself turned out to be smaller than the previous entry claimed,
+and *differently placed*: this was recorded here as a concatenation
+problem because the error text said "concatenation operand's width can't
+be determined", but `expr_width` has two callers and picorv32 tripped the
+other one -- `|(irq_pending & ~irq_mask)` at picorv32.v:1538, a reduction
+operator needing its operand's width to know how many bits to fold. The
+message named only the caller it was first written for. It now describes
+what the function is for instead, which is the transferable lesson: an
+error raised by a shared helper shouldn't name one caller's context as
+though it were the only one.
+
+- `expr_width` (and `constant_expr_width`, kept in step) answers for
+  `& | ^ + - *` as the wider of the two operands -- Verilog's
+  self-determined width rule, not an approximation of it.
+- For the bitwise three that is exact in the strongest sense: neither
+  operand can set a bit above its own width, so nothing can be lost. For
+  the arithmetic three the width is the same rule but the result can
+  exceed it, and Verilog *discards the overflow* -- `{a + b, c}` with
+  4-bit operands packs four bits, so the adder's carry is gone unless an
+  operand is widened first (`{1'b0, a} + {1'b0, b}`).
+- That trap was the argument for leaving arithmetic rejected, and it lost
+  deliberately: refusing it here wouldn't prevent the trap, only move it,
+  since the same truncation already happens whenever `a + b` is assigned
+  to a narrower register -- which this frontend has always allowed.
+  Matching Verilog uniformly, and naming the trap where the decision is
+  made, beats an inconsistency the user has to discover.
+- The truncation genuinely happens rather than being assumed: the kernel
+  evaluates on `u64`, and every consumer of `expr_width` masks back down
+  to it (concatenation packing, `BitwiseNot`, all three reductions).
+- Shifts stay rejected, with a test. Verilog gives `a << b` its *left*
+  operand's width -- a different rule, not the same change twice -- and
+  folding them in on the assumption the rules match is exactly the guess
+  this project declines to make.
+
+Verified structurally (`ictus-frontend-verilog/tests/width.rs`) and
+differentially against Icarus Verilog
+(`ictus-cli/tests/differential_width.rs`), which pins the truncation
+cases specifically: `a = 12, b = 10` makes `{a + b, 2'b11}` equal 27, not
+the 91 an untruncated 5-bit sum would give.
+
+**Next: whether picorv32 *simulates* correctly, which lowering cleanly
+says nothing about.** This is a change of question rather than another
+gap of the same kind, and it is likely to be a larger piece of work than
+any single increment so far. Lowering proves every construct in the file
+was *representable*; it does not prove any of them was given the right
+meaning, and the constructs picorv32 uses that this frontend accepts only
+in a narrowed form (a task call treated as a no-op, `x`/`z` resolved to
+0, an out-of-range index reading 0) are exactly the places where a
+representable-but-wrong lowering would hide. The natural first step is
+the smallest thing that would expose it: run the design against its own
+testbench in Icarus and in Ictus and compare, starting from reset and a
+handful of cycles rather than a full program, since the first divergence
+is the informative one. Two things to expect: `$display`/`$finish` and
+the memory interface in picorv32's testbench are outside the supported
+subset, so the harness will need to drive the design directly rather than
+through that testbench; and 4-state divergence (decisions.md D19) will
+show up immediately at reset, so the comparison has to start from a point
+where both simulators hold defined values -- the same discipline the
+array and blocking tests already use, applied at design scale.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
@@ -836,9 +886,11 @@ localparam, and use `+ - * << >> >>> & | ^ == != < <= > >= && ||`, the
 ternary operator, and concatenation; no overriding a `parameter` at
 instantiation), constant/variable bit-select and constant part-select,
 concatenation (plain and replication) and ternary on reads only -- with
-comparison/logical/reduction results, not just literals/refs/selects,
-valid as concatenation operands, but *not* an arithmetic or bitwise
-result (the current next blocker) -- a constant bit-select/part-select --
+comparison/logical/reduction results and binary bitwise/arithmetic
+results, not just literals/refs/selects, valid as concatenation operands
+(each at Verilog's self-determined width, so an arithmetic carry is
+truncated away), but *not* a shift result -- a constant
+bit-select/part-select --
 or a concatenation of such -- as a procedural assignment target but not a
 continuous (`assign`) one and not with a variable index (though the
 index/bound *may* reference a parameter/localparam, per the
@@ -854,9 +906,11 @@ outside a case item (resolves to `0`), array/memory signals (`reg [31:0]
 mem [0:31]`) with one unpacked dimension, internal-only, one element at a
 time -- but no array port, no bit-select of an element, and no `assign`
 to one -- and both `<=` and `=` inside a clocked block, but no compound
-assignment (`+=` and friends), no module instantiation. Cranelift codegen
-and actually getting picorv32 fully through the pipeline are both still
+assignment (`+=` and friends), no module instantiation. The whole of
+picorv32.v now *lowers* within this subset; Cranelift codegen, and
+establishing that the design also *simulates* correctly, are both still
 ahead of where this stands today.
+
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
 match against a reference simulator) and timing is recorded as a baseline.

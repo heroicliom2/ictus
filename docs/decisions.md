@@ -1108,3 +1108,82 @@ value. Its first cycle is unsampled for the usual 2-state/4-state reason
 (D19). Re-running the diagnostic after this lands reaches a narrower gap:
 `expr_width` can't determine the width of a bitwise `And` used as a
 concatenation operand.
+
+## D24 — Self-determined width for binary bitwise and arithmetic results
+
+**Decision**: `expr_width` now answers for `& | ^ + - *`, returning the
+wider of the two operands' widths — Verilog's own self-determined width
+rule. Shifts stay rejected.
+
+**First, a correction to how this gap was recorded.** D23 and the roadmap
+described it as a *concatenation* operand problem, because the error text
+said "concatenation operand's width can't be determined". It wasn't.
+`expr_width` has two callers, and the one picorv32 actually tripped is
+the other: `|(irq_pending & ~irq_mask)` at picorv32.v:1538 — a reduction
+operator, which needs its operand's width to know how many bits to fold.
+The error message named only the caller it was originally written for,
+which made the diagnosis wrong in a way that would have pointed the fix
+at the wrong place. The message now describes what the function is for
+rather than one of its callers, which is the actual lesson: an error
+raised by a shared helper should not name one caller's context as if it
+were the only one.
+
+**The rule**: for `a OP b`, Verilog extends both operands to
+`max(width(a), width(b))`, performs the operation there, and truncates
+the result back to that width. This is not an approximation — it's what
+the LRM specifies for a self-determined context, which is what both of
+`expr_width`'s callers are.
+
+**Why the bitwise and arithmetic operators went in together** (they were
+initially considered separately, and the difference between them is worth
+recording rather than smoothing over): for `& | ^` the rule is exact in
+the strongest sense — neither operand can contribute a set bit above its
+own width, so nothing can be lost and the answer is right regardless of
+what any consumer does with it. For `+ - *` the width is the same rule
+but the result genuinely can exceed it, and Verilog *discards the
+overflow*. `{a + b, c}` with 4-bit `a` and `b` packs four bits, so a
+carry out of the adder is simply gone; getting it requires widening an
+operand first (`{1'b0, a} + {1'b0, b}`). That is a real trap, and it was
+the argument for leaving arithmetic rejected — a loud error is better
+than a silently dropped carry.
+
+It went in anyway, deliberately: rejecting `a + b` here would not have
+prevented the trap, only moved it. The same truncation already happens
+whenever `a + b` is assigned to a register narrower than the sum, which
+this frontend has always supported. Refusing it in *these* two positions
+while allowing it everywhere else would be an inconsistency the user has
+to discover, not a safeguard. Matching Verilog uniformly, and naming the
+trap in the code where the decision is made, is the honest version.
+
+**What makes the arithmetic case actually correct**, rather than correct
+by assumption: the kernel evaluates on `u64`, so an `Add` result really
+does carry bits above the reported width. Every consumer of `expr_width`
+masks the evaluated value back down to it — concatenation packing,
+`BitwiseNot`, and all three reduction operators (see
+`ictus_kernel::eval_expr`). The truncation happens; it isn't inferred.
+
+**Why shifts stay rejected**: Verilog gives `a << b` its **left**
+operand's width, not the max of the two — a genuinely different rule, not
+the same change applied twice. Folding them in on the assumption the
+rules match is exactly the guess this project declines to make, so they
+are rejected with an error that names the difference, and there is a test
+for it.
+
+**`constant_expr_width` got the same arms**, so a `localparam` whose
+value concatenates `A + B` doesn't fail where the identical expression in
+a general context succeeds.
+
+**Why discovered / confirmed, not assumed**: the usage site was located
+in picorv32 before choosing anything (`irq_mask`/`irq_pending`, declared
+consecutively at lines 198-199, confirming the signal ids in the error),
+which is what revealed the misdiagnosis above. The differential test
+against Icarus pins the truncation cases specifically — `a = 12, b = 10`
+gives `{a + b, 2'b11}` = 27, not the 91 an untruncated 5-bit sum would
+give.
+
+**With this, the whole of picorv32.v lowers cleanly** — 225 signals, no
+error — which is the first time the real design has made it through the
+frontend end to end. That closes the diagnostic loop that has driven
+every increment since D13. It says nothing yet about whether the design
+*simulates* correctly, which is a different and much larger question, and
+the roadmap now frames that as the next thing to establish.

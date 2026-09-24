@@ -93,7 +93,10 @@ operators (`&`, `|`, `^`, `~&`, `~|`, `~^`/`^~`) are also supported now.
 A 4-state `x`/`z` digit in a literal outside a `case`/`casez`/`casex`
 item resolves to `0` (matching Verilator's own default X-handling
 policy), and a comparison/logical/reduction result (always exactly 1
-bit) can be used as a concatenation operand. Shifts are supported
+bit) can be used as a concatenation operand. So can a binary bitwise or
+arithmetic result, at the width Verilog gives it — the wider of its two
+operands, which means an adder's carry is truncated away exactly as a
+real simulator truncates it. Shifts are supported
 including the arithmetic right shift (`$signed(x) >>> n`, which really
 does replicate the sign bit), as are signed ordering comparisons
 (`$signed(a) < $signed(b)`, which picorv32's ALU needs). Array/memory
@@ -103,8 +106,14 @@ exactly this shape. Blocking assignment (`=`) works alongside `<=` in the
 same clocked block, with the timing Verilog defines: a blocking write
 lands immediately, so the next statement reads the new value, while a
 non-blocking one is still invisible to a later read in the same edge.
-Compound assignment (`+=` and friends), module instantiation, and
-Cranelift JIT codegen are all still ahead of where this stands today.
+
+The whole of the vendored picorv32.v now lowers through this frontend
+cleanly — 225 signals, no error — which is what the running diagnostic
+against the real design had been driving toward. Lowering cleanly is not
+the same as simulating correctly, and establishing the latter is the next
+thing on the roadmap. Compound assignment (`+=` and friends), module
+instantiation, and Cranelift JIT codegen are all still ahead of where
+this stands today.
 
 ## Workspace layout
 
