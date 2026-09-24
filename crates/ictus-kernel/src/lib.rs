@@ -53,16 +53,48 @@ use ictus_ir::{Expr, Module, SignalId, Stmt};
 pub struct Simulation<'m> {
     module: &'m Module,
     values: Vec<u64>,
+    /// Array signals' contents, indexed by the same `SignalId` as
+    /// `values` -- an empty `Vec` for every scalar signal, so the index
+    /// spaces line up and a lookup stays O(1) without a map. Kept as a
+    /// side table rather than packed into `values` deliberately: it leaves
+    /// scalar access (by far the common case) exactly as it was, and this
+    /// interpreter's storage layout isn't the one that has to be fast --
+    /// see this module's opening comment on Cranelift replacing these
+    /// internals, and docs/architecture.md on the bit-packed contiguous
+    /// layout the compiled kernel is meant to end up with instead.
+    arrays: Vec<Vec<u64>>,
 }
 
 impl<'m> Simulation<'m> {
     pub fn new(module: &'m Module) -> Self {
+        let arrays = module
+            .signals
+            .iter()
+            .map(|signal| match signal.depth {
+                Some(depth) => vec![0; depth as usize],
+                None => Vec::new(),
+            })
+            .collect();
         let mut sim = Self {
             module,
             values: vec![0; module.signals.len()],
+            arrays,
         };
         sim.settle_combinational();
         sim
+    }
+
+    /// Reads one element of an array signal by name, for a test or driver
+    /// that needs to look inside one (`sim.get`/`set` address scalars, and
+    /// an array has no single value for them to return).
+    pub fn get_array(&self, name: &str, index: usize) -> u64 {
+        let id = self
+            .module
+            .signal_id(name)
+            .unwrap_or_else(|| panic!("unknown signal '{name}'"));
+        *self.arrays[id]
+            .get(index)
+            .unwrap_or_else(|| panic!("index {index} is out of range for array '{name}'"))
     }
 
     pub fn set(&mut self, name: &str, value: u64) {
@@ -87,7 +119,7 @@ impl<'m> Simulation<'m> {
 
         let mut updates = Vec::new();
         for process in &self.module.clocked_processes {
-            eval_stmts(&process.body, &self.values, &mut updates);
+            eval_stmts(&process.body, &self.values, &self.arrays, &mut updates);
         }
         // Applied in order via direct mutation, not staged in a separate
         // map: every RHS above was already evaluated against the pre-tick
@@ -96,15 +128,31 @@ impl<'m> Simulation<'m> {
         // earlier one from this same tick (matching real hardware, where
         // multiple non-blocking writes to the same bits in one process is
         // "last write wins" and writes to disjoint bit ranges combine).
-        for (id, range, value) in updates {
-            match range {
-                None => self.values[id] = mask(value, self.module.signals[id].width),
-                Some((msb, lsb)) => {
+        for update in updates {
+            match update {
+                PendingWrite::Scalar { target, range: None, value } => {
+                    self.values[target] = mask(value, self.module.signals[target].width)
+                }
+                PendingWrite::Scalar { target, range: Some((msb, lsb)), value } => {
                     let width = msb - lsb + 1;
                     let clear_mask = mask(u64::MAX, width) << lsb;
-                    let current = self.values[id] & !clear_mask;
+                    let current = self.values[target] & !clear_mask;
                     let new_bits = (mask(value, width)) << lsb;
-                    self.values[id] = mask(current | new_bits, self.module.signals[id].width);
+                    self.values[target] =
+                        mask(current | new_bits, self.module.signals[target].width);
+                }
+                // An index past the end of the array drops the write --
+                // there's no element to update, and clamping or wrapping
+                // it would corrupt a *different* element, which is worse
+                // than doing nothing. See `ictus_ir::Stmt::ArrayAssign`.
+                PendingWrite::Array { array, index, value } => {
+                    let width = self.module.signals[array].width;
+                    if let Some(slot) = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| self.arrays[array].get_mut(index))
+                    {
+                        *slot = mask(value, width);
+                    }
                 }
             }
         }
@@ -116,15 +164,38 @@ impl<'m> Simulation<'m> {
     /// See this module's doc comment for when `tick()` calls this and why.
     fn settle_combinational(&mut self) {
         for assign in &self.module.assigns {
-            let value = eval_expr(&assign.value, &self.values);
+            let value = eval_expr(&assign.value, &self.values, &self.arrays);
             self.values[assign.target] = mask(value, self.module.signals[assign.target].width);
         }
     }
 }
 
-type PendingUpdate = (SignalId, Option<(u32, u32)>, u64);
+/// One write collected during a tick's evaluation phase, to be applied
+/// once every right-hand side (and every array index) has been evaluated
+/// against the pre-edge snapshot -- see `tick`'s commit loop.
+enum PendingWrite {
+    Scalar {
+        target: SignalId,
+        range: Option<(u32, u32)>,
+        value: u64,
+    },
+    /// The index is stored already-evaluated, not as an expression: it has
+    /// to be read from the same pre-edge snapshot as `value`, so
+    /// re-evaluating it at commit time (after earlier writes in this same
+    /// tick have landed) would be wrong.
+    Array {
+        array: SignalId,
+        index: u64,
+        value: u64,
+    },
+}
 
-fn eval_stmts(stmts: &[Stmt], values: &[u64], updates: &mut Vec<PendingUpdate>) {
+fn eval_stmts(
+    stmts: &[Stmt],
+    values: &[u64],
+    arrays: &[Vec<u64>],
+    updates: &mut Vec<PendingWrite>,
+) {
     for stmt in stmts {
         match stmt {
             Stmt::NonBlockingAssign {
@@ -132,85 +203,116 @@ fn eval_stmts(stmts: &[Stmt], values: &[u64], updates: &mut Vec<PendingUpdate>) 
                 target_range,
                 value,
             } => {
-                updates.push((*target, *target_range, eval_expr(value, values)));
+                updates.push(PendingWrite::Scalar {
+                    target: *target,
+                    range: *target_range,
+                    value: eval_expr(value, values, arrays),
+                });
+            }
+            Stmt::ArrayAssign {
+                array,
+                index,
+                value,
+            } => {
+                updates.push(PendingWrite::Array {
+                    array: *array,
+                    index: eval_expr(index, values, arrays),
+                    value: eval_expr(value, values, arrays),
+                });
             }
             Stmt::If {
                 cond,
                 then_branch,
                 else_branch,
             } => {
-                let branch = if eval_expr(cond, values) != 0 {
+                let branch = if eval_expr(cond, values, arrays) != 0 {
                     then_branch
                 } else {
                     else_branch
                 };
-                eval_stmts(branch, values, updates);
+                eval_stmts(branch, values, arrays, updates);
             }
             Stmt::Case {
                 selector,
                 arms,
                 default,
             } => {
-                let selector_value = eval_expr(selector, values);
+                let selector_value = eval_expr(selector, values, arrays);
                 let matched_arm = arms.iter().find(|arm| {
                     arm.values
                         .iter()
-                        .any(|v| case_value_matches(v, selector_value, values))
+                        .any(|v| case_value_matches(v, selector_value, values, arrays))
                 });
                 match matched_arm {
-                    Some(arm) => eval_stmts(&arm.body, values, updates),
-                    None => eval_stmts(default, values, updates),
+                    Some(arm) => eval_stmts(&arm.body, values, arrays, updates),
+                    None => eval_stmts(default, values, arrays, updates),
                 }
             }
         }
     }
 }
 
-fn case_value_matches(value: &ictus_ir::CaseValue, selector_value: u64, values: &[u64]) -> bool {
+fn case_value_matches(
+    value: &ictus_ir::CaseValue,
+    selector_value: u64,
+    values: &[u64],
+    arrays: &[Vec<u64>],
+) -> bool {
     match value {
-        ictus_ir::CaseValue::Exact(expr) => eval_expr(expr, values) == selector_value,
+        ictus_ir::CaseValue::Exact(expr) => eval_expr(expr, values, arrays) == selector_value,
         ictus_ir::CaseValue::Wildcard { value, care_mask } => {
             (selector_value ^ value) & care_mask == 0
         }
     }
 }
 
-fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
+fn eval_expr(expr: &Expr, values: &[u64], arrays: &[Vec<u64>]) -> u64 {
     let bool_val = |b: bool| u64::from(b);
     match expr {
         Expr::Literal { value, .. } => *value,
         Expr::Ref(id) => values[*id],
+        // An index past the end reads 0 -- see `ictus_ir::Expr::ArrayRead`
+        // for why that's the deliberate choice in a 2-state kernel rather
+        // than an oversight.
+        Expr::ArrayRead { array, index } => {
+            let index = eval_expr(index, values, arrays);
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| arrays[*array].get(index))
+                .copied()
+                .unwrap_or(0)
+        }
         // Verilog `!` is logical negation (result is 0 or 1), not a
         // bitwise complement across the operand's width -- that's `~`,
         // handled by `BitwiseNot` below.
-        Expr::Not(inner) => bool_val(eval_expr(inner, values) == 0),
-        Expr::BitwiseNot(inner, width) => mask(!eval_expr(inner, values), *width),
+        Expr::Not(inner) => bool_val(eval_expr(inner, values, arrays) == 0),
+        Expr::BitwiseNot(inner, width) => mask(!eval_expr(inner, values, arrays), *width),
         Expr::ReduceAnd(inner, width) => {
-            let value = mask(eval_expr(inner, values), *width);
+            let value = mask(eval_expr(inner, values, arrays), *width);
             bool_val(value == mask(u64::MAX, *width))
         }
-        Expr::ReduceOr(inner, width) => bool_val(mask(eval_expr(inner, values), *width) != 0),
+        Expr::ReduceOr(inner, width) => bool_val(mask(eval_expr(inner, values, arrays), *width) != 0),
         Expr::ReduceXor(inner, width) => {
-            let value = mask(eval_expr(inner, values), *width);
+            let value = mask(eval_expr(inner, values, arrays), *width);
             bool_val(value.count_ones() % 2 == 1)
         }
-        Expr::Add(lhs, rhs) => eval_expr(lhs, values).wrapping_add(eval_expr(rhs, values)),
-        Expr::Sub(lhs, rhs) => eval_expr(lhs, values).wrapping_sub(eval_expr(rhs, values)),
-        Expr::Mul(lhs, rhs) => eval_expr(lhs, values).wrapping_mul(eval_expr(rhs, values)),
+        Expr::Add(lhs, rhs) => eval_expr(lhs, values, arrays).wrapping_add(eval_expr(rhs, values, arrays)),
+        Expr::Sub(lhs, rhs) => eval_expr(lhs, values, arrays).wrapping_sub(eval_expr(rhs, values, arrays)),
+        Expr::Mul(lhs, rhs) => eval_expr(lhs, values, arrays).wrapping_mul(eval_expr(rhs, values, arrays)),
         // A shift amount of 64 or more shifts every bit out (0), rather
         // than panicking the way a bare `<<`/`>>` on a u64 would or
         // silently taking the amount modulo 64 the way `wrapping_shl`
         // would -- neither of which is what Verilog means.
         Expr::Shl(lhs, rhs) => {
-            let value = eval_expr(lhs, values);
-            match u32::try_from(eval_expr(rhs, values)) {
+            let value = eval_expr(lhs, values, arrays);
+            match u32::try_from(eval_expr(rhs, values, arrays)) {
                 Ok(shift) => value.checked_shl(shift).unwrap_or(0),
                 Err(_) => 0,
             }
         }
         Expr::Shr(lhs, rhs) => {
-            let value = eval_expr(lhs, values);
-            match u32::try_from(eval_expr(rhs, values)) {
+            let value = eval_expr(lhs, values, arrays);
+            match u32::try_from(eval_expr(rhs, values, arrays)) {
                 Ok(shift) => value.checked_shr(shift).unwrap_or(0),
                 Err(_) => 0,
             }
@@ -222,43 +324,43 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
         // already replicates the sign bit across every bit, so any larger
         // amount means the same thing.
         Expr::AShr(lhs, rhs) => {
-            let value = eval_expr(lhs, values) as i64;
-            let shift = u32::try_from(eval_expr(rhs, values)).unwrap_or(u32::MAX).min(63);
+            let value = eval_expr(lhs, values, arrays) as i64;
+            let shift = u32::try_from(eval_expr(rhs, values, arrays)).unwrap_or(u32::MAX).min(63);
             (value >> shift) as u64
         }
-        Expr::And(lhs, rhs) => eval_expr(lhs, values) & eval_expr(rhs, values),
-        Expr::Or(lhs, rhs) => eval_expr(lhs, values) | eval_expr(rhs, values),
-        Expr::Xor(lhs, rhs) => eval_expr(lhs, values) ^ eval_expr(rhs, values),
-        Expr::Eq(lhs, rhs) => bool_val(eval_expr(lhs, values) == eval_expr(rhs, values)),
-        Expr::Ne(lhs, rhs) => bool_val(eval_expr(lhs, values) != eval_expr(rhs, values)),
-        Expr::Lt(lhs, rhs) => bool_val(eval_expr(lhs, values) < eval_expr(rhs, values)),
-        Expr::Le(lhs, rhs) => bool_val(eval_expr(lhs, values) <= eval_expr(rhs, values)),
-        Expr::Gt(lhs, rhs) => bool_val(eval_expr(lhs, values) > eval_expr(rhs, values)),
-        Expr::Ge(lhs, rhs) => bool_val(eval_expr(lhs, values) >= eval_expr(rhs, values)),
+        Expr::And(lhs, rhs) => eval_expr(lhs, values, arrays) & eval_expr(rhs, values, arrays),
+        Expr::Or(lhs, rhs) => eval_expr(lhs, values, arrays) | eval_expr(rhs, values, arrays),
+        Expr::Xor(lhs, rhs) => eval_expr(lhs, values, arrays) ^ eval_expr(rhs, values, arrays),
+        Expr::Eq(lhs, rhs) => bool_val(eval_expr(lhs, values, arrays) == eval_expr(rhs, values, arrays)),
+        Expr::Ne(lhs, rhs) => bool_val(eval_expr(lhs, values, arrays) != eval_expr(rhs, values, arrays)),
+        Expr::Lt(lhs, rhs) => bool_val(eval_expr(lhs, values, arrays) < eval_expr(rhs, values, arrays)),
+        Expr::Le(lhs, rhs) => bool_val(eval_expr(lhs, values, arrays) <= eval_expr(rhs, values, arrays)),
+        Expr::Gt(lhs, rhs) => bool_val(eval_expr(lhs, values, arrays) > eval_expr(rhs, values, arrays)),
+        Expr::Ge(lhs, rhs) => bool_val(eval_expr(lhs, values, arrays) >= eval_expr(rhs, values, arrays)),
         // Correct as a plain `i64` comparison only because the frontend
         // only ever builds this with two already-sign-extended `Signed`
         // operands -- see `ictus_ir::Expr::SignedLt`'s doc comment.
         Expr::SignedLt(lhs, rhs) => {
-            bool_val((eval_expr(lhs, values) as i64) < (eval_expr(rhs, values) as i64))
+            bool_val((eval_expr(lhs, values, arrays) as i64) < (eval_expr(rhs, values, arrays) as i64))
         }
         Expr::LogicalAnd(lhs, rhs) => {
-            bool_val(eval_expr(lhs, values) != 0 && eval_expr(rhs, values) != 0)
+            bool_val(eval_expr(lhs, values, arrays) != 0 && eval_expr(rhs, values, arrays) != 0)
         }
         Expr::LogicalOr(lhs, rhs) => {
-            bool_val(eval_expr(lhs, values) != 0 || eval_expr(rhs, values) != 0)
+            bool_val(eval_expr(lhs, values, arrays) != 0 || eval_expr(rhs, values, arrays) != 0)
         }
         Expr::Select { base, msb, lsb } => {
-            mask(eval_expr(base, values) >> lsb, msb - lsb + 1)
+            mask(eval_expr(base, values, arrays) >> lsb, msb - lsb + 1)
         }
         Expr::Concat(parts) => {
             let mut result = 0u64;
             for (part, width) in parts {
-                result = (result << width) | mask(eval_expr(part, values), *width);
+                result = (result << width) | mask(eval_expr(part, values, arrays), *width);
             }
             result
         }
         Expr::DynamicBitSelect { base, index } => {
-            let index = eval_expr(index, values);
+            let index = eval_expr(index, values, arrays);
             // A `>= 64` shift on a u64 panics (it's undefined behavior
             // for the underlying shift instruction) -- and any index
             // beyond base's actual width is out of range regardless, so
@@ -267,7 +369,7 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
             if index >= 64 {
                 0
             } else {
-                (eval_expr(base, values) >> index) & 1
+                (eval_expr(base, values, arrays) >> index) & 1
             }
         }
         Expr::Ternary {
@@ -275,15 +377,15 @@ fn eval_expr(expr: &Expr, values: &[u64]) -> u64 {
             then_val,
             else_val,
         } => {
-            if eval_expr(cond, values) != 0 {
-                eval_expr(then_val, values)
+            if eval_expr(cond, values, arrays) != 0 {
+                eval_expr(then_val, values, arrays)
             } else {
-                eval_expr(else_val, values)
+                eval_expr(else_val, values, arrays)
             }
         }
         Expr::Signed(inner, width) => {
             let width = *width;
-            let value = eval_expr(inner, values);
+            let value = eval_expr(inner, values, arrays);
             // `width >= 64` (or, defensively, `== 0`) has no room to
             // extend into -- and shifting a u64 by 64 or more is
             // undefined behavior for the underlying shift instruction --
@@ -335,16 +437,19 @@ mod tests {
             name: "clk".to_string(),
             width: 1,
             direction: Some(Direction::Input),
+            depth: None,
         });
         let resetn = m.push_signal(Signal {
             name: "resetn".to_string(),
             width: 1,
             direction: Some(Direction::Input),
+            depth: None,
         });
         let count = m.push_signal(Signal {
             name: "count".to_string(),
             width: 8,
             direction: Some(Direction::Output),
+            depth: None,
         });
 
         m.clocked_processes.push(ClockedProcess {
@@ -414,6 +519,130 @@ mod tests {
         assert_eq!(sim.get("count"), 0);
     }
 
+    /// An out-of-range array index reads 0 and drops a write, rather than
+    /// panicking, wrapping, or clamping onto a *different* element. Both
+    /// are the deliberate 2-state choices documented on
+    /// `ictus_ir::Expr::ArrayRead`/`Stmt::ArrayAssign`, and both are
+    /// covered here rather than differentially: a 4-state reference
+    /// simulator answers an out-of-range read with 'x', which has no
+    /// comparable value in this kernel at all.
+    #[test]
+    fn out_of_range_array_access_reads_zero_and_drops_the_write() {
+        let mut m = Module {
+            name: "mem_module".to_string(),
+            ..Default::default()
+        };
+        let clk = m.push_signal(Signal {
+            name: "clk".to_string(),
+            width: 1,
+            direction: Some(Direction::Input),
+            depth: None,
+        });
+        let mem = m.push_signal(Signal {
+            name: "mem".to_string(),
+            width: 8,
+            direction: None,
+            depth: Some(2),
+        });
+        let out = m.push_signal(Signal {
+            name: "out".to_string(),
+            width: 8,
+            direction: Some(Direction::Output),
+            depth: None,
+        });
+
+        // mem[5] <= 0xAB;  (out of range -- dropped)
+        // out   <= mem[5];  (out of range -- reads 0)
+        m.clocked_processes.push(ClockedProcess {
+            clock: clk,
+            body: vec![
+                Stmt::ArrayAssign {
+                    array: mem,
+                    index: Expr::Literal { value: 5, width: 8 },
+                    value: Expr::Literal { value: 0xAB, width: 8 },
+                },
+                Stmt::NonBlockingAssign {
+                    target: out,
+                    target_range: None,
+                    value: Expr::ArrayRead {
+                        array: mem,
+                        index: Box::new(Expr::Literal { value: 5, width: 8 }),
+                    },
+                },
+            ],
+        });
+
+        let mut sim = Simulation::new(&m);
+        sim.tick();
+        assert_eq!(sim.get("out"), 0, "an out-of-range read yields 0");
+        // The in-range elements must be untouched -- a dropped write is
+        // the point, not a write that landed somewhere else.
+        assert_eq!(sim.get_array("mem", 0), 0);
+        assert_eq!(sim.get_array("mem", 1), 0);
+    }
+
+    /// An array write takes effect at the commit phase like any other
+    /// non-blocking assignment, so a read in the *same* tick sees the
+    /// pre-edge contents -- and the index is read from that same
+    /// snapshot, not re-evaluated after earlier writes have landed.
+    #[test]
+    fn array_write_is_visible_only_after_the_edge() {
+        let mut m = Module {
+            name: "mem_module".to_string(),
+            ..Default::default()
+        };
+        let clk = m.push_signal(Signal {
+            name: "clk".to_string(),
+            width: 1,
+            direction: Some(Direction::Input),
+            depth: None,
+        });
+        let mem = m.push_signal(Signal {
+            name: "mem".to_string(),
+            width: 8,
+            direction: None,
+            depth: Some(2),
+        });
+        let out = m.push_signal(Signal {
+            name: "out".to_string(),
+            width: 8,
+            direction: Some(Direction::Output),
+            depth: None,
+        });
+
+        // mem[0] <= 0x42;  out <= mem[0];  -- in that order, in one tick.
+        m.clocked_processes.push(ClockedProcess {
+            clock: clk,
+            body: vec![
+                Stmt::ArrayAssign {
+                    array: mem,
+                    index: Expr::Literal { value: 0, width: 8 },
+                    value: Expr::Literal { value: 0x42, width: 8 },
+                },
+                Stmt::NonBlockingAssign {
+                    target: out,
+                    target_range: None,
+                    value: Expr::ArrayRead {
+                        array: mem,
+                        index: Box::new(Expr::Literal { value: 0, width: 8 }),
+                    },
+                },
+            ],
+        });
+
+        let mut sim = Simulation::new(&m);
+        sim.tick();
+        assert_eq!(sim.get_array("mem", 0), 0x42, "the write landed this edge");
+        assert_eq!(
+            sim.get("out"),
+            0,
+            "but the same-edge read saw the pre-edge contents"
+        );
+
+        sim.tick();
+        assert_eq!(sim.get("out"), 0x42, "and sees it on the next edge");
+    }
+
     /// `~x` masks its complement to exactly `x`'s own declared width,
     /// rather than leaving the high bits of the underlying `u64` set --
     /// the reason `BitwiseNot` carries a width at all instead of relying
@@ -422,7 +651,7 @@ mod tests {
     #[test]
     fn bitwise_not_masks_to_its_own_width() {
         let expr = Expr::BitwiseNot(Box::new(Expr::Literal { value: 0b0101, width: 4 }), 4);
-        assert_eq!(eval_expr(&expr, &[]), 0b1010);
+        assert_eq!(eval_expr(&expr, &[], &[]), 0b1010);
     }
 
     /// A shift amount of 64 or more is the case a differential test can't
@@ -439,8 +668,8 @@ mod tests {
             let shift = Expr::Literal { value: amount, width: 32 };
             let shl = Expr::Shl(Box::new(value.clone()), Box::new(shift.clone()));
             let shr = Expr::Shr(Box::new(value.clone()), Box::new(shift));
-            assert_eq!(eval_expr(&shl, &[]), 0, "0xFF << {amount}");
-            assert_eq!(eval_expr(&shr, &[]), 0, "0xFF >> {amount}");
+            assert_eq!(eval_expr(&shl, &[], &[]), 0, "0xFF << {amount}");
+            assert_eq!(eval_expr(&shr, &[], &[]), 0, "0xFF >> {amount}");
         }
     }
 
@@ -462,12 +691,12 @@ mod tests {
                 Expr::AShr(Box::new(negative.clone()), Box::new(shift.clone()));
             let positive_shifted = Expr::AShr(Box::new(positive.clone()), Box::new(shift));
             assert_eq!(
-                mask(eval_expr(&negative_shifted, &[]), 8),
+                mask(eval_expr(&negative_shifted, &[], &[]), 8),
                 0xFF,
                 "-128 >>> {amount} stays all sign bits"
             );
             assert_eq!(
-                eval_expr(&positive_shifted, &[]),
+                eval_expr(&positive_shifted, &[], &[]),
                 0,
                 "+127 >>> {amount} reaches 0"
             );
@@ -482,21 +711,21 @@ mod tests {
         let odd_parity = Expr::Literal { value: 0b0111, width: 4 }; // 3 ones
         let even_parity = Expr::Literal { value: 0b0101, width: 4 }; // 2 ones
 
-        assert_eq!(eval_expr(&Expr::ReduceAnd(Box::new(all_ones.clone()), 4), &[]), 1);
-        assert_eq!(eval_expr(&Expr::ReduceAnd(Box::new(has_a_zero), 4), &[]), 0);
+        assert_eq!(eval_expr(&Expr::ReduceAnd(Box::new(all_ones.clone()), 4), &[], &[]), 1);
+        assert_eq!(eval_expr(&Expr::ReduceAnd(Box::new(has_a_zero), 4), &[], &[]), 0);
 
-        assert_eq!(eval_expr(&Expr::ReduceOr(Box::new(all_zeros.clone()), 4), &[]), 0);
-        assert_eq!(eval_expr(&Expr::ReduceOr(Box::new(all_ones.clone()), 4), &[]), 1);
+        assert_eq!(eval_expr(&Expr::ReduceOr(Box::new(all_zeros.clone()), 4), &[], &[]), 0);
+        assert_eq!(eval_expr(&Expr::ReduceOr(Box::new(all_ones.clone()), 4), &[], &[]), 1);
 
-        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(odd_parity), 4), &[]), 1);
-        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(even_parity), 4), &[]), 0);
-        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(all_zeros), 4), &[]), 0);
+        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(odd_parity), 4), &[], &[]), 1);
+        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(even_parity), 4), &[], &[]), 0);
+        assert_eq!(eval_expr(&Expr::ReduceXor(Box::new(all_zeros), 4), &[], &[]), 0);
 
         // Reduction NAND/NOR/XNOR are BitwiseNot(ReduceX(...), 1) at the
         // frontend level -- confirm that composition evaluates correctly
         // here too, not just that the frontend builds the right tree.
         let nand = Expr::BitwiseNot(Box::new(Expr::ReduceAnd(Box::new(all_ones), 4)), 1);
-        assert_eq!(eval_expr(&nand, &[]), 0, "NAND of all-ones is 0");
+        assert_eq!(eval_expr(&nand, &[], &[]), 0, "NAND of all-ones is 0");
     }
 
     /// Two non-blocking assignments to *disjoint* bit ranges of the same
@@ -517,16 +746,19 @@ mod tests {
             name: "clk".to_string(),
             width: 1,
             direction: Some(Direction::Input),
+            depth: None,
         });
         let hi_in = m.push_signal(Signal {
             name: "hi_in".to_string(),
             width: 4,
             direction: Some(Direction::Input),
+            depth: None,
         });
         let acc = m.push_signal(Signal {
             name: "acc".to_string(),
             width: 8,
             direction: Some(Direction::Output),
+            depth: None,
         });
 
         m.clocked_processes.push(ClockedProcess {
@@ -578,11 +810,13 @@ mod tests {
             name: "clk".to_string(),
             width: 1,
             direction: Some(Direction::Input),
+            depth: None,
         });
         let acc = m.push_signal(Signal {
             name: "acc".to_string(),
             width: 8,
             direction: Some(Direction::Output),
+            depth: None,
         });
 
         m.clocked_processes.push(ClockedProcess {
@@ -621,7 +855,7 @@ mod tests {
             Box::new(Expr::Literal { value: 0b011111, width: 6 }),
             6,
         );
-        assert_eq!(eval_expr(&expr, &[]), 31);
+        assert_eq!(eval_expr(&expr, &[], &[]), 31);
     }
 
     /// A negative value (sign bit set) gets its sign bit replicated
@@ -636,14 +870,14 @@ mod tests {
             Box::new(Expr::Literal { value: 0b100000, width: 6 }),
             6,
         );
-        let extended = eval_expr(&expr, &[]);
+        let extended = eval_expr(&expr, &[], &[]);
         // Masking down to exactly 12 bits (as a commit-time write to a
         // 12-bit target would) must show real sign extension, not a
         // truncated positive number.
         assert_eq!(mask(extended, 12), 0xFE0);
         // And -1 in 6 bits (all 1s) sign-extends to all 1s in 12 bits.
         let all_ones = Expr::Signed(Box::new(Expr::Literal { value: 0b111111, width: 6 }), 6);
-        assert_eq!(mask(eval_expr(&all_ones, &[]), 12), 0xFFF);
+        assert_eq!(mask(eval_expr(&all_ones, &[], &[]), 12), 0xFFF);
     }
 
     #[test]
@@ -658,7 +892,7 @@ mod tests {
                 base: Box::new(base.clone()),
                 index: Box::new(Expr::Literal { value: index, width: 3 }),
             };
-            assert_eq!(eval_expr(&expr, &[]), expected, "bit {index} of 0b1011_0010");
+            assert_eq!(eval_expr(&expr, &[], &[]), expected, "bit {index} of 0b1011_0010");
         }
     }
 
@@ -673,6 +907,6 @@ mod tests {
             base: Box::new(Expr::Literal { value: 0xFF, width: 8 }),
             index: Box::new(Expr::Literal { value: 100, width: 32 }),
         };
-        assert_eq!(eval_expr(&expr, &[]), 0);
+        assert_eq!(eval_expr(&expr, &[], &[]), 0);
     }
 }

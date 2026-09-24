@@ -943,3 +943,85 @@ rather than pass. Re-running the diagnostic after this fix reaches
 index on both read and write sides, the first blocker since the
 `localparam` work that genuinely can't be handled by widening expression
 lowering.
+
+## D22 — Arrays: a `depth` on `Signal`, a separate write statement, a side table
+
+**Decision**: array/memory signals (`reg [31:0] mem [0:31];`) are modelled
+by three choices made together:
+
+1. **`Signal` gains `depth: Option<u32>`** rather than arrays getting a
+   separate declaration kind or id space. `None` is everything that
+   existed before, unchanged; `Some(n)` is `n` elements of `width` bits.
+   Keeping `width` as the *element* width means every existing piece of
+   code that reasoned about a signal's width -- masking on write,
+   `expr_width`, the concatenation machinery -- kept working untouched.
+2. **A separate `Stmt::ArrayAssign`**, not another field on
+   `NonBlockingAssign`. The two really are different writes: one
+   addresses an element chosen at simulation time and replaces it whole,
+   the other a fixed signal and possibly just a constant bit range of it.
+   A combined statement would have made every scalar assignment carry a
+   `None` index, and would have made the nonsensical combination
+   (element index *and* bit range) representable and in need of a runtime
+   check. As a separate statement, "no bit range of an array element" is
+   structural. It also left every existing `NonBlockingAssign`
+   pattern-match in the test suite untouched.
+3. **Array contents live in a side table in the kernel**
+   (`arrays: Vec<Vec<u64>>`, indexed by the same `SignalId` as the scalar
+   values, an empty `Vec` for every scalar) rather than being packed into
+   the flat value buffer with per-signal offsets. `eval_expr` gained an
+   `arrays` parameter to reach it.
+
+**Why the side table, given architecture.md wants contiguous storage**:
+packing arrays into the one flat buffer would mean every signal access
+going through an offset table -- changing `values[id]` (the common case,
+every scalar read in the interpreter) into an indirection, to benefit a
+layout that *this* kernel doesn't need. D12 already settled that this
+interpreter exists to be a correctness baseline, not the fast path; the
+bit-packed contiguous layout is the compiled kernel's concern, and it
+will be replacing these internals wholesale rather than inheriting them.
+Choosing the layout that keeps the baseline simple and obviously correct
+is the right trade here; choosing the "eventually fast" one would be
+optimizing the thing that's explicitly slated for replacement.
+
+**The index is evaluated during the evaluation phase, not at commit**:
+`mem[addr] <= x;` has to use `addr`'s value from *before* the edge, the
+same as the right-hand side does -- so the pending write records an
+already-evaluated `u64` index, not the expression. Re-evaluating it at
+commit time would read `addr` after earlier writes in the same tick had
+landed, which is exactly the non-blocking-semantics bug D14's commit-loop
+reasoning was careful to avoid on the scalar side.
+
+**Out-of-range: read 0, drop the write.** The read half follows
+`DynamicBitSelect`'s existing precedent for an out-of-range bit index
+(D6-adjacent: a 2-state kernel has no 'x' to return). The write half is
+the one with a real alternative -- clamping or wrapping the index -- and
+both were rejected because they'd corrupt a *different*, innocent
+element. Doing nothing at least confines the damage to the write that was
+already out of range.
+
+**Deliberately rejected, each with a test**: an array as a module port
+(nothing in v1 can address it from outside), a bit-select of an array
+element (unrepresentable on the write side per (2), and allowing it only
+on reads would be a confusing asymmetry), an array declared alongside
+other names in one statement (the unpacked dimension is found by
+searching the declaration and can't be attributed to one name --
+`reg [7:0] a, mem [0:3];` would otherwise make `a` an array too), a
+continuous `assign` to an element (`ictus_ir::Assign` names one whole
+signal, and `settle_combinational` has no commit phase to resolve an
+index in), and any unpacked form other than `[high:low]`.
+
+**Why discovered / confirmed, not assumed**: the target shape came from
+reading picorv32's actual register file and every use of it before
+designing anything -- declaration, the runtime-indexed writes
+(`cpuregs[latched_rd] <= ...`, including one with an *expression* index,
+`cpuregs[latched_rd ^ 1]`), and both constant- and runtime-indexed reads.
+The differential test rewrites an element while reading it, so the
+pre-edge read timing is actually exercised rather than assumed, and reads
+a neighbour afterwards so writing the wrong slot would surface. It fills
+the array in an unsampled warm-up phase first, because a never-written
+element reads 'x' in Icarus and 0 here -- the same 2-state/4-state
+boundary D19 ran into, handled the same way. Re-running the diagnostic
+after this lands reaches blocking assignment (`=`), which is not another
+statement form but a second *write discipline* that has to coexist with
+this kernel's evaluate-then-commit model -- flagged in roadmap.md as
+needing its own decision.

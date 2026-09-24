@@ -696,20 +696,76 @@ ordinary `Expr::Lt`, plus a negative test for the rejected mixed case)
 and differentially against Icarus Verilog
 (`ictus-cli/tests/differential_signed_compare.rs`).
 
-**Next confirmed blocker**: array/memory signals -- and this is the big
-one the roadmap has been flagging as "distinct, likely-larger" since the
-very first bit-select work. Re-running the picorv32 diagnostic after the
-signed-comparison fix finally reaches `cpuregs`, picorv32's own register
-file: `reg [31:0] cpuregs [0:regfile_size-1];`, written as
-`cpuregs[latched_rd] <= ...` and read as `cpuregs[decoded_rs1]` -- a
-*runtime* index on both sides. Unlike every increment since the
-`localparam` work, this can't be done by widening expression lowering:
-it needs a new array-shaped `Signal`/IR representation, runtime-indexed
-reads *and* writes (the write side especially -- `Stmt::NonBlockingAssign`
-currently addresses exactly one `SignalId` with an optional *constant*
-bit range), and matching storage plus commit handling in the kernel. Not
-yet attempted; worth its own design pass (and decisions.md entry) rather
-than being started incrementally.
+**Array/memory signals**: done -- the one the roadmap had been flagging as
+"distinct, likely-larger" since the very first bit-select work, and the
+first increment since `localparam` that genuinely couldn't be done by
+widening expression lowering. picorv32's own register file is the target
+shape: `reg [31:0] cpuregs [0:regfile_size-1];`, written as
+`cpuregs[latched_rd] <= ...` at a *runtime* index. Design in
+decisions.md D22; the shape:
+
+- `Signal` gains `depth: Option<u32>` -- `None` is an ordinary
+  scalar/vector (everything that existed before, unchanged), `Some(n)` an
+  array of `n` elements of `width` bits. `width` stays the *element*
+  width, so nothing that already reasoned about it had to change.
+- `Expr::ArrayRead { array, index }` and `Stmt::ArrayAssign { array,
+  index, value }`. The write is a separate statement rather than another
+  field on `NonBlockingAssign` because the two really are different
+  writes -- one addresses an element chosen at simulation time and
+  replaces it whole, the other a fixed signal and possibly just a
+  constant bit range of it. That also makes "no bit range of an array
+  element" structural rather than a runtime check.
+- The kernel keeps array contents in a side table indexed by the same
+  `SignalId` as the scalar values (empty `Vec` for a scalar, so lookups
+  stay O(1) without a map), and `eval_expr` gained an `arrays` parameter.
+  Deliberately *not* packed into the flat value buffer: that leaves
+  scalar access -- the common case -- exactly as it was, and this
+  interpreter's layout isn't the one that has to be fast (D12; the
+  compiled kernel's bit-packed contiguous layout is architecture.md's
+  concern, not this one's).
+- An array index is evaluated in the same pre-edge snapshot as the
+  right-hand side, so `mem[addr] <= x;` uses `addr`'s value from *before*
+  the edge -- the pending write records the already-evaluated index, not
+  the expression, precisely so it can't be re-read after earlier writes
+  in the same tick have landed.
+- Out-of-range: a read yields 0, a write is dropped. Same 2-state
+  reasoning as `DynamicBitSelect`'s out-of-range bit index -- and
+  dropping beats clamping or wrapping, which would corrupt a *different*
+  element.
+- Rejected rather than guessed at, each with its own test: an array as a
+  module *port* (nothing in v1 can address it from outside), a
+  bit-select of an array element (`mem[i][3]` -- unrepresentable on the
+  write side, and allowing it only on reads would be a confusing
+  asymmetry), an array declared alongside other names in one statement
+  (the unpacked dimension is found by searching the declaration, which
+  can't tell which name it belongs to), a continuous `assign` to an
+  element, and any unpacked form other than `[high:low]`.
+
+Verified structurally (`ictus-frontend-verilog/tests/array.rs`, including
+that a *constant* index on an array is still an element read rather than
+a bit-select -- the array check has to come first or `mem[2]` would read
+bit 2) and differentially against Icarus Verilog
+(`ictus-cli/tests/differential_array.rs`), whose sequence rewrites an
+element while reading it (proving the read sees pre-edge contents) and
+then reads a neighbour (so writing the wrong slot would show up). That
+test fills the array in an *unsampled* warm-up phase first: a
+never-written element reads as 4-state 'x' in Icarus but 0 here, so
+sampling one would compare two different-but-both-valid answers rather
+than test anything -- the same discipline D19 established. The
+out-of-range read/write policies are covered by `ictus_kernel`'s own unit
+tests for that same reason.
+
+**Next confirmed blocker**: *blocking* assignment (`=` inside a clocked
+block). Re-running the diagnostic after the array work hits
+`StatementItem::BlockingAssignment`, which `lower_statement_item` has no
+case for -- only non-blocking `<=` is lowered. Not yet attempted, and it
+needs a real decision rather than a default: blocking assignment takes
+effect *immediately*, mid-statement-sequence, where every write this
+kernel currently models is deferred to the commit phase at the end of a
+tick. So it isn't another statement form to add alongside the others --
+it's a second write discipline that has to coexist with the
+evaluate-then-commit model in `tick()`, and getting the interaction
+wrong is exactly the kind of silent-wrong-answer this project rejects.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes and `assign`s but no
@@ -732,11 +788,11 @@ a logical right shift of a `$signed(...)` value, nor a *mixed*
 signed/unsigned comparison (and no other system function), a call to a
 provably-empty task but no other task/function calls, logical `!`,
 bitwise `~`, and the reduction operators, a 4-state `x`/`z` literal
-outside a case item (resolves to `0`), no array/memory signals (`reg
-[31:0] mem [0:31]` -- this is what picorv32's register file actually
-needs, it's now the confirmed next blocker, and it's a distinct,
-genuinely larger gap than anything since the `localparam` work), no
-module instantiation. Cranelift codegen and actually getting picorv32
+outside a case item (resolves to `0`), array/memory signals (`reg [31:0]
+mem [0:31]`) with one unpacked dimension, internal-only, one element at a
+time -- but no array port, no bit-select of an element, and no `assign`
+to one -- no *blocking* assignment (`=`, now the confirmed next blocker),
+no module instantiation. Cranelift codegen and actually getting picorv32
 fully through the pipeline are both still ahead of where this stands
 today.
 

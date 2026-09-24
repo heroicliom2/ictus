@@ -11,7 +11,11 @@
 //! own literal -- see `lower_case`/`lower_case_value`), non-blocking
 //! assignment, internal `wire`/`reg` declarations naming one or more
 //! signals per declaration (`reg a, b, c;` -- see `lower_internal_signal`)
-//! in addition to ports, `#(parameter [7:0] X = 1)` *and* `localparam`
+//! in addition to ports, array/memory signals (`reg [7:0] mem [0:3];` --
+//! one unpacked `[high:low]` dimension, internal signals only, read and
+//! written one element at a time at a runtime index; see
+//! `lower_array_index` and `ictus_ir::Signal::depth`), `#(parameter
+//! [7:0] X = 1)` *and* `localparam`
 //! (sharing one resolution pass and name table -- see `lower_parameters`;
 //! neither is a signal, and neither ever appears in `ictus_ir::Module` at
 //! all, since every reference is resolved to a plain `Expr::Literal`
@@ -88,15 +92,12 @@
 //! strategy) meaningless. Also lowers single-assignment continuous
 //! `assign target = expr;` statements (net-targeted only -- see
 //! `lower_continuous_assign`) into `ictus_ir::Assign`. Widen this as
-//! later phases need more of the language -- array/memory signals (`reg
-//! [31:0] mem [0:31]`, indexed with a *runtime* index on both sides:
-//! picorv32's own register file, `cpuregs[latched_rd] <= ...`, is what
-//! the diagnostic hits next, right after the signed-comparison support
-//! above; this is the big one, needing new IR for an array-shaped signal,
-//! runtime-indexed reads *and* writes, and matching storage in the
-//! kernel, not just another operator), `always_comb`, and module
-//! instantiation are the next-highest-value gaps toward running a real
-//! design like phase 0's picorv32 benchmark.
+//! later phases need more of the language -- *blocking* assignment (`=`
+//! inside a clocked block; only non-blocking `<=` is lowered today, and
+//! this is what the diagnostic hits next, right after the array support
+//! above), `always_comb`, and module instantiation are the
+//! next-highest-value gaps toward running a real design like phase 0's
+//! picorv32 benchmark.
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, Direction, Expr, Module, Signal, SignalId, Stmt,
@@ -553,7 +554,9 @@ fn try_const_fold(expr: &Expr) -> Option<u64> {
 
     match expr {
         Expr::Literal { value, .. } => Some(*value),
-        Expr::Ref(_) | Expr::DynamicBitSelect { .. } => None,
+        // An array element's value comes from simulation state, so it's
+        // never a compile-time constant -- not even with a constant index.
+        Expr::Ref(_) | Expr::DynamicBitSelect { .. } | Expr::ArrayRead { .. } => None,
         Expr::Not(inner) => Some(bool_val(try_const_fold(inner)? == 0)),
         Expr::BitwiseNot(inner, width) => Some(mask(!try_const_fold(inner)?, *width)),
         Expr::ReduceAnd(inner, width) => {
@@ -767,10 +770,20 @@ fn lower_port(
         None => 1,
     };
 
+    // An array *port* would need the array to be addressable from outside
+    // the module, which nothing in v1 (no instantiation) can do yet.
+    if unwrap_node!(port, UnpackedDimension).is_some() {
+        return Err(format!(
+            "port '{name}' is an array (an unpacked dimension), which v1 doesn't support -- \
+             only an internal `reg`/`wire` can be an array"
+        ));
+    }
+
     Ok(Signal {
         name,
         width,
         direction: Some(direction),
+        depth: None,
     })
 }
 
@@ -803,6 +816,30 @@ where
         None => 1,
     };
 
+    // An *unpacked* dimension (`reg [31:0] mem [0:31];`) makes this an
+    // array -- a distinct grammar node from the packed one above, so the
+    // width search can't confuse the two.
+    let depth = match unwrap_node!(decl, UnpackedDimensionRange) {
+        Some(RefNode::UnpackedDimensionRange(range)) => {
+            let bounds = &range.nodes.0.nodes.1;
+            let high = lower_constant_index(&bounds.nodes.0, tree, parameters)?;
+            let low = lower_constant_index(&bounds.nodes.2, tree, parameters)?;
+            Some(high.abs_diff(low) + 1)
+        }
+        // `mem [4]` (a size rather than a range) and the other unpacked
+        // forms aren't lowered; only `[high:low]` is.
+        Some(_) | None => match unwrap_node!(decl, UnpackedDimension) {
+            Some(_) => {
+                return Err(
+                    "only a `[high:low]` unpacked dimension is supported in v1 (not `[size]`, \
+                     an associative array, or a queue)"
+                        .to_string(),
+                )
+            }
+            None => None,
+        },
+    };
+
     let mut names = Vec::new();
     for node in decl {
         let is_declared_name = matches!(
@@ -824,12 +861,26 @@ where
         return Err("declaration has no identifier".to_string());
     }
 
+    // The unpacked dimension is found by searching the whole declaration,
+    // which can't tell *which* name it belongs to -- fine for the one-name
+    // case (every real array declaration found so far), but
+    // `reg [7:0] a, mem [0:3];` would wrongly make `a` an array too.
+    // Rejected rather than mis-lowered.
+    if depth.is_some() && names.len() > 1 {
+        return Err(format!(
+            "an array declaration that also declares other names in the same statement \
+             (`{}`) is not supported in v1 -- declare the array on its own",
+            names.join(", ")
+        ));
+    }
+
     Ok(names
         .into_iter()
         .map(|name| Signal {
             name,
             width,
             direction: None,
+            depth,
         })
         .collect())
 }
@@ -1193,6 +1244,28 @@ fn lower_nonblocking_assign(
     let target = module
         .signal_id(target_name)
         .ok_or_else(|| format!("assignment target '{target_name}' is not a known signal"))?;
+
+    // Writing an array element (`mem[i] <= v;`) addresses a chosen
+    // element rather than a bit range of a fixed signal, so it's its own
+    // statement -- see `ictus_ir::Stmt::ArrayAssign`.
+    if module.signals[target].depth.is_some() {
+        let select = unwrap_node!(&assign.nodes.0, Select)
+            .and_then(|node| match node {
+                RefNode::Select(select) => Some(select),
+                _ => None,
+            })
+            .ok_or_else(|| format!("array '{target_name}' is written without an index"))?;
+        let Expr::ArrayRead { array, index } = lower_array_index(select, target, tree, module)?
+        else {
+            unreachable!("lower_array_index always returns an ArrayRead");
+        };
+        return Ok(vec![Stmt::ArrayAssign {
+            array,
+            index: *index,
+            value: lower_expr(&assign.nodes.3, tree, module)?,
+        }]);
+    }
+
     let target_range =
         lower_select_target_range(&assign.nodes.0, target_name, tree, module)?;
     check_target_range(target_range, target, target_name, module)?;
@@ -1337,6 +1410,15 @@ fn lower_continuous_assign(
     let target = module
         .signal_id(target_name)
         .ok_or_else(|| format!("assign target '{target_name}' is not a known signal"))?;
+    // Same reasoning as the bit-select case just above: `ictus_ir::Assign`
+    // names one whole signal, with no element index to carry, and
+    // `settle_combinational` has no commit phase to resolve one in.
+    if module.signals[target].depth.is_some() {
+        return Err(format!(
+            "assign target '{target_name}' is an array element, which v1 doesn't support as a \
+             continuous-assignment write target (only for non-blocking `<=`)"
+        ));
+    }
 
     let value = lower_expr(&assignment.nodes.2, tree, module)?;
 
@@ -1723,6 +1805,16 @@ fn lower_select(
     tree: &SyntaxTree,
     module: &Ctx,
 ) -> Result<Expr, String> {
+    // An index on an *array* signal selects an element, not a bit -- and
+    // that's true whether or not the index is constant, unlike a
+    // bit-select. Checked before the bit-select handling below, which
+    // would otherwise read `mem[3]` as bit 3 of `mem`.
+    if let Expr::Ref(id) = base {
+        if module.signals[id].depth.is_some() {
+            return lower_array_index(select, id, tree, module);
+        }
+    }
+
     // Part-select: `x[msb:lsb]`.
     if let Some(bracket) = &select.nodes.2 {
         return match &bracket.nodes.1 {
@@ -1772,6 +1864,47 @@ fn lower_select(
     }
 }
 
+/// Lowers an index applied to an *array* signal (`mem[i]`) into an
+/// element read. Shared by the read side (`lower_select`) and the write
+/// side (`lower_array_target`), which need the same index expression and
+/// the same restrictions -- exactly one index (no multi-dimensional
+/// array), and no bit range layered on top of the element, since
+/// `Stmt::ArrayAssign` can't represent a partial element write and
+/// letting it lower on the read side alone would be a confusing
+/// asymmetry.
+fn lower_array_index(
+    select: &sv_parser::Select,
+    array: SignalId,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Expr, String> {
+    let name = &module.signals[array].name;
+    if select.nodes.2.is_some() {
+        return Err(format!(
+            "a bit-select/part-select of an array element (`{name}[i][n:m]`) is not supported \
+             in v1 -- read or write the whole element"
+        ));
+    }
+    match select.nodes.1.nodes.0.as_slice() {
+        [] => Err(format!(
+            "array '{name}' is used without an index -- v1 has no whole-array read or write, \
+             only `{name}[i]`"
+        )),
+        [only] => Ok(Expr::ArrayRead {
+            array,
+            index: Box::new(lower_expr(&only.nodes.1, tree, module)?),
+        }),
+        // A second index on a one-dimensional array is a bit-select of the
+        // chosen element (`mem[i][3]`) -- the parser can't tell that apart
+        // from a genuinely multi-dimensional array, and neither is
+        // supported, so the message covers both readings.
+        _ => Err(format!(
+            "indexing array element '{name}[i]' further (a bit-select of the element, or a \
+             multi-dimensional array) is not supported in v1"
+        )),
+    }
+}
+
 /// A bit-select/part-select bound (`x[7:0]`) is the same constant-
 /// expression grammar a `parameter`/`localparam` default or a
 /// packed-range bound uses -- see `lower_constant_expr`, which this
@@ -1785,7 +1918,9 @@ fn lower_constant_index(
     try_const_fold(&folded)
         .map(|value| value as u32)
         .ok_or_else(|| {
-            "bit-select/part-select bound does not reduce to a compile-time constant".to_string()
+            "a bit-select/part-select bound or array dimension does not reduce to a \
+             compile-time constant"
+                .to_string()
         })
 }
 
@@ -1873,6 +2008,8 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
         Expr::Ref(id) => Ok(module.signals[*id].width),
         Expr::Select { msb, lsb, .. } => Ok(msb - lsb + 1),
         Expr::DynamicBitSelect { .. } => Ok(1),
+        // One element of an array is as wide as the array's element width.
+        Expr::ArrayRead { array, .. } => Ok(module.signals[*array].width),
         Expr::Concat(parts) => Ok(parts.iter().map(|(_, w)| w).sum()),
         Expr::Ternary { then_val, else_val, .. } => {
             Ok(expr_width(then_val, module)?.max(expr_width(else_val, module)?))

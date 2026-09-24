@@ -96,10 +96,11 @@ bit) can be used as a concatenation operand. Shifts are supported
 including the arithmetic right shift (`$signed(x) >>> n`, which really
 does replicate the sign bit), as are signed ordering comparisons
 (`$signed(a) < $signed(b)`, which picorv32's ALU needs). Array/memory
-signals (`reg [31:0] mem [0:31]`, indexed at runtime — picorv32's
-register file needs these, and it's the next real milestone), module
-instantiation, and Cranelift JIT codegen are all still ahead of where
-this stands today.
+signals (`reg [31:0] mem [0:31]`, read and written one element at a time
+at a runtime index) are supported too — picorv32's register file is
+exactly this shape. Blocking assignment (`=` inside a clocked block),
+module instantiation, and Cranelift JIT codegen are all still ahead of
+where this stands today.
 
 ## Workspace layout
 

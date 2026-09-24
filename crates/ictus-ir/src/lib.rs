@@ -6,10 +6,11 @@
 //!
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
 //! interpreter-first sequencing this supports): a single flat module, no
-//! instances/hierarchy and no generate blocks (so no array/memory
-//! signals either -- `reg [31:0] mem [0:31]`-style declarations aren't
-//! lowered, a distinct and likely-larger gap from bit-select on a single
-//! signal), any number of clocked (`always @(posedge clk)`) processes
+//! instances/hierarchy and no generate blocks; array/memory signals
+//! (`reg [31:0] mem [0:31]`) *are* supported, with one unpacked
+//! dimension, read and written one element at a time at a runtime index
+//! (see `Signal::depth`, `Expr::ArrayRead`, `Stmt::ArrayAssign`), any
+//! number of clocked (`always @(posedge clk)`) processes
 //! and continuous `assign`s but no `always_comb` yet, `if`/`else`/
 //! `else if` and `case`/`casez`/`casex` (see `CaseValue`) alongside
 //! non-blocking assignment, `+ - * << >> >>> & | ^` and comparison/
@@ -70,10 +71,20 @@ pub enum Direction {
 #[derive(Debug, Clone)]
 pub struct Signal {
     pub name: String,
-    /// Bit width. 1 for a plain `wire`/`reg`; >1 for `[N:0]`-style vectors.
+    /// Bit width of one element. 1 for a plain `wire`/`reg`; >1 for
+    /// `[N:0]`-style vectors. For an array (see `depth`) this is the width
+    /// of each element, not of the array as a whole.
     pub width: u32,
     /// `None` for an internal signal (not a module port).
     pub direction: Option<Direction>,
+    /// `None` for an ordinary scalar/vector signal. `Some(n)` for an
+    /// array (`reg [31:0] mem [0:n-1];`, Verilog's *unpacked* dimension) --
+    /// `n` elements of `width` bits each, addressed by
+    /// `Expr::ArrayRead`/`Stmt::ArrayAssign` rather than read or written
+    /// whole. Only a single unpacked dimension is supported; a
+    /// multi-dimensional array is rejected by the frontend rather than
+    /// flattened behind the scenes.
+    pub depth: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +219,20 @@ pub enum Expr {
     /// out-of-range index (see `ictus_kernel`'s test for this rather than
     /// a differential one, for exactly that reason).
     DynamicBitSelect { base: Box<Expr>, index: Box<Expr> },
+    /// Reads one element of an array signal (`mem[i]`, where `mem` was
+    /// declared with an unpacked dimension -- see `Signal::depth`). The
+    /// index is evaluated at simulation time and may be any expression;
+    /// a *constant* index isn't a separate case, since unlike a
+    /// bit-select there's nothing to fold it into.
+    ///
+    /// An index outside the array's depth reads 0, the same
+    /// deliberate-and-documented choice `DynamicBitSelect` makes for an
+    /// out-of-range bit index and for the same reason: this kernel is
+    /// 2-state (decisions.md D6) and has no 'x' to return instead. Like
+    /// that case, it means an out-of-range read won't match a 4-state
+    /// reference simulator, so it's covered by `ictus_kernel`'s own unit
+    /// tests rather than differentially.
+    ArrayRead { array: SignalId, index: Box<Expr> },
     /// Concatenation (`{a, b, c}`), MSB-first (`a` occupies the highest
     /// bits of the result) -- matching Verilog's own left-to-right order.
     /// Each part carries its own bit width, computed by the frontend at
@@ -266,6 +291,28 @@ pub enum Stmt {
         /// `x[7:0] <= value;`); the rest of the signal is left unchanged.
         /// `None` means the whole signal is replaced.
         target_range: Option<(u32, u32)>,
+        value: Expr,
+    },
+    /// Non-blocking write to one element of an array signal
+    /// (`mem[i] <= value;` -- see `Signal::depth`). A separate statement
+    /// rather than an extra field on `NonBlockingAssign` because the two
+    /// really are different writes: this one addresses an element chosen
+    /// at simulation time and replaces it whole, where that one addresses
+    /// a fixed signal and may write just a constant bit range of it.
+    /// Writing a bit range *of an array element* (`mem[i][3:0] <= v;`) is
+    /// therefore not representable, and is rejected by the frontend
+    /// rather than silently dropping the range.
+    ///
+    /// `index` is evaluated in the same pre-edge snapshot as `value`,
+    /// matching Verilog's non-blocking rule -- so `mem[addr] <= x;` uses
+    /// `addr`'s value from *before* this clock edge even if something
+    /// else in the same edge assigns to `addr`. An index outside the
+    /// array's depth drops the write entirely (there is no element to
+    /// update, and 2-state storage has no way to record "this went
+    /// nowhere" -- see `ArrayRead` for the reading half of this policy).
+    ArrayAssign {
+        array: SignalId,
+        index: Expr,
         value: Expr,
     },
     If {
