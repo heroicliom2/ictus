@@ -1633,3 +1633,135 @@ builds its Icarus testbench in its own directory for the same reason.
 **Next**: module instantiation. It is now the largest gap by a distance,
 and the thing between Ictus and the multiply/divide tests, picorv32's own
 firmware, and running a testbench directly rather than replaying one.
+
+## D30 — Module instantiation by flattening; and a width defect it surfaced
+
+**Decision**: a module instance is **flattened into its parent at lowering
+time**. Each instantiated module is lowered on its own (recursively, with
+the parameter values the instantiation gives it) and then merged in: its
+signals become the parent's, named `<instance>.<name>`, its lowered IR is
+renumbered to match, and its ports are connected. The IR and the kernel
+don't change at all -- the result is one flat `Module`, as every design
+has been until now.
+
+**Why flatten rather than keep a hierarchy in the kernel.** A hierarchy
+would mean a netlist model in the kernel -- instances, port bindings,
+signals owned by scopes -- and every kernel feature so far (fixpoint
+settling, the one-driver rule, the commit phase) would have to be
+re-thought across instance boundaries. Flattening keeps all of that
+exactly as it is and puts the whole cost in one lowering step. It is
+what Verilator does, it is the natural shape for D12's baseline
+interpreter, and it suits the mixed-language goal (D11): a VHDL entity
+instantiated from Verilog would flatten into the same IR. What it gives
+up is sharing between repeated instances (memory, compile time) and the
+hierarchy as a runtime structure -- the names keep the hierarchy for
+anything that needs to display it, like a waveform viewer. If
+thousand-instance designs make the memory cost real, that is the point to
+revisit, and the compiled kernel is the natural place to do it.
+
+**Ports: aliased when possible, assigned otherwise.** A port connected
+straight to a whole parent signal of the same width is *aliased*: the
+child's references are pointed at the parent's signal, and no copy
+exists. Everything else goes through a continuous assignment, which is
+how IEEE 1800 describes a port connection anyway and which gives
+Verilog's width coercion for free, since the kernel masks every write to
+its target's width: an input connected to an expression (`.in(a + b)`)
+or to a signal of another width becomes a copy of the port driven by the
+connection; an output connected to a signal of another width becomes a
+copy with `signal = port` in the parent.
+
+The clock is why aliasing matters rather than being an optimization.
+Connecting `.clk(clk)` by copying would give the child's `always
+@(posedge clk)` a clock that is a *different signal* from the parent's,
+fed by an assignment. The kernel has always ticked every clocked process
+together, assuming one clock; with copies, "the design has one clock"
+would no longer be something the lowered module could be checked for.
+With aliasing it is exact, so it now *is* checked: a design whose
+clocked processes use more than one clock signal -- a child clocked by
+`clk & en`, say -- is rejected, where before instances it could only have
+been ticked together and been silently wrong.
+
+**Also newly checked**: a module's input port driven from inside it.
+Flattening makes this reachable -- a child's output wired onto the
+parent's own input port is aliased onto it -- and it would otherwise be
+silently overwritten by whatever drives the input. The one-driver check
+(D27) now runs after flattening at each level, so a conflict across an
+instance boundary is caught like any other.
+
+**Supported and rejected.** Named connections and named parameter values
+-- `child #(.P(v)) u (.port(expr), ...)`, several instances per statement
+-- which is what picorv32 and most real RTL use. Parameter values are
+expressions in the *parent's* scope, folded to constants and passed down
+through D29's override mechanism, so a child's `generate if` selection
+follows its instantiation exactly as a top-level override would.
+Rejected, each with a specific error: positional ports and parameters
+(they depend on declaration order, a real source of bugs, and nothing
+needs them yet); `.*` and implicit `.port`; instance arrays; an unknown
+module, port or duplicate; an output connected to a part-select or
+concatenation (that would need a continuous assignment to part of a
+signal, which v1 doesn't support); a module that instantiates itself;
+and an *unconnected input*, which Verilog leaves floating at `z` -- not
+representable in 2-state, and far more often a mistake than a choice.
+
+Renumbering the child's IR uses new `remap_signals` methods on `Expr` and
+`Stmt`, written as exhaustive matches with no wildcard arm: a future
+variant that carries a signal must fail to compile there until it is
+handled, rather than being silently left pointing at the wrong signal.
+
+**Unary minus came along**, because picorv32's divider needs it: `-x` is
+lowered as `0 - x` with the zero at the operand's width, sharing
+subtraction's evaluation exactly (unary `+` is the identity).
+
+**Result: picorv32 with `ENABLE_DIV=1` runs its divide and remainder
+tests.** The divider, `picorv32_pcpi_div`, is a separate module picorv32
+instantiates -- the first instance in a real design Ictus has flattened,
+doing real work over the co-processor interface across many cycles. All
+four programs (`div`, `divu`, `rem`, `remu`, rv32im images from a third
+image set) match Icarus on every port, every cycle, and the register
+file. Checked by breaking it: making unary minus compute `x - 0` failed
+exactly `div` and `rem` -- the signed ones, which negate -- while `divu`
+and `remu` passed. Separately, a differential test on a three-level
+fixture (`instance_test.v`) checks aliasing, per-instance state, an
+expression-driven input, a truncating narrow output and a parameter
+passed down two levels against Icarus's own handling of the hierarchy.
+
+The ISA test's floor on how many points were comparable was an absolute
+count calibrated for 37 programs, and the four-program divider run
+failed it while agreeing with Icarus on every point. It is now a
+proportion (at least 98%; measured at 99.1-99.5%), which is what it was
+meant to guard in the first place.
+
+**A correction to D29.** It said instantiation would let Ictus "run a
+testbench directly rather than replaying one". It doesn't: a testbench
+needs `initial` blocks, delays, event waits and `$display`, none of which
+Ictus models. The trace-replay harness stays, and the comments that gave
+instantiation as the reason for it now give the real one.
+
+**A defect this surfaced, which is now the most important open item.**
+Because unary minus is lowered as subtraction, it inherits how the kernel
+evaluates subtraction: on a 64-bit word, relying on masking at the final
+write. That is correct for operators whose low bits depend only on their
+operands' low bits -- add, subtract, multiply, left shift, bitwise -- and
+**wrong for operators that look at high bits**, applied to an arithmetic
+result that wrapped. Probed against Icarus with 8-bit `a = 3`, `b = 5`:
+
+| expression         | Icarus | Ictus |
+|--------------------|--------|-------|
+| `(a - b) >> 1`     | 127    | 255   |
+| `(a - b) < 8'hFF`  | 1      | 0     |
+| `(-a) >> 1`        | 126    | 254   |
+| `(a - b) == 8'hFE` | 1      | 0     |
+
+Verilog evaluates the subtraction at 8 bits (IEEE 1800 §11.6,
+context-determined width), so the wrap happens *before* the shift or
+comparison. This is not new with unary minus -- subtraction, addition and
+multiplication have always behaved this way -- and nothing in the suite
+caught it, picorv32 included, because its arithmetic results go straight
+into registers where the final mask makes them right. It is exactly the
+kind of silent wrong answer this project exists to avoid, so it is kept
+as a runnable reproduction, `differential_width_context.rs`, marked
+`#[ignore]` with the reason, rather than only described here. Fixing it
+means implementing Verilog's context-determined expression widths
+properly, which needs its own design pass: it interacts with `$signed`
+sign extension, concatenation's self-determined operands, the ternary
+operator and assignment width.

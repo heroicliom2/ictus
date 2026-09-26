@@ -10,8 +10,9 @@
 //! dependencies), about 49,000 cycles in all.
 //!
 //! **How it runs.** The same trace replay as `differential_picorv32.rs`,
-//! for the same reason: Ictus can't instantiate modules, so it can't run a
-//! testbench, and writing the memory model twice would put two
+//! for the same reason: Ictus can't run a testbench (it doesn't model
+//! `initial` blocks, delays or `$display`), and writing the memory model
+//! twice would put two
 //! hand-written models on the two sides of the comparison. Icarus runs
 //! `picorv32_isa_tb.v` with the program chosen by `+program=`, recording
 //! its inputs and outputs every cycle; each run is replayed into a fresh
@@ -30,7 +31,7 @@
 //!      can't make (see `differential_picorv32.rs` on a core that
 //!      reproduced every bus cycle while executing nothing).
 //!
-//! **Configurations.** The programs run against four configurations of
+//! **Configurations.** The programs run against five configurations of
 //! picorv32, each applied to Ictus with `lower_file_with_parameters` and
 //! to Icarus with generated `defparam`s. Two questions about them are easy
 //! to conflate, and were measured separately:
@@ -50,11 +51,13 @@
 //!     instead. That the override mechanism itself works is established
 //!     directly, by ictus-frontend-verilog's own tests.
 //!
-//! **What isn't covered**: the multiply, divide and remainder tests, which
-//! need `ENABLE_MUL`/`ENABLE_DIV` -- separate modules picorv32
-//! instantiates, which Ictus doesn't support yet. The images are built
-//! by `bench/isa/build.sh` and committed, so this test needs no RISC-V
-//! toolchain. See docs/decisions.md D28 and D29.
+//! **What isn't covered**: the four multiply tests, which need
+//! `ENABLE_MUL`. The multiplier is a separate module picorv32 instantiates
+//! -- instantiation works (the `divider` configuration runs the divide and
+//! remainder tests through one) -- but its body uses `for` loops Ictus
+//! can't lower yet. The images are built by `bench/isa/build.sh` and
+//! committed, so this test needs no RISC-V toolchain. See
+//! docs/decisions.md D28, D29 and D30.
 
 use ictus_ir::Module;
 use ictus_kernel::Simulation;
@@ -148,11 +151,30 @@ fn compressed_configuration_matches_icarus_verilog() {
     );
 }
 
+/// picorv32's hardware divider, which is a separate module
+/// (`picorv32_pcpi_div`) that picorv32 instantiates when `ENABLE_DIV` is
+/// set -- so this is the first run of the design in which Ictus has
+/// flattened an instance, and the instance is doing real work: every
+/// `div`, `divu`, `rem` and `remu` in these programs is computed by it,
+/// over the co-processor interface, across many cycles. See
+/// docs/decisions.md D30.
+///
+/// Only the four divide/remainder programs run; the multiply ones need
+/// `ENABLE_MUL`, whose multiplier uses `for` loops Ictus can't lower yet.
+#[test]
+fn divider_configuration_matches_icarus_verilog() {
+    run_configuration("divider", RV32IM, &[("ENABLE_DIV", 1)]);
+}
+
 /// The image sets `bench/isa/build.sh` produces.
 const RV32I: &str = "picorv32_isa";
 const RV32IC: &str = "picorv32_isa_c";
+const RV32IM: &str = "picorv32_isa_m";
 
-/// Runs all 37 programs against picorv32 with `overrides` applied -- to
+/// The programs in the rv32im set that the divider alone can run.
+const DIVIDER_PROGRAMS: [&str; 4] = ["div", "divu", "rem", "remu"];
+
+/// Runs a set of programs against picorv32 with `overrides` applied -- to
 /// Ictus through `lower_file_with_parameters`, and to Icarus through a
 /// generated module of `defparam`s, built from the same list so the two
 /// can't describe different configurations.
@@ -173,17 +195,33 @@ fn run_configuration(label: &str, image_set: &str, overrides: &[(&str, u64)]) {
         .filter(|path| path.extension().is_some_and(|ext| ext == "hex"))
         .collect();
     images.sort();
-    assert_eq!(
-        images.len(),
-        37,
-        "expected all 37 base-ISA test images; rebuild them with bench/isa/build.sh"
-    );
+    match image_set {
+        // The divide/remainder programs are only half the M set; the
+        // multiply half needs a multiplier this configuration doesn't have.
+        RV32IM => {
+            images.retain(|path| {
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                DIVIDER_PROGRAMS.contains(&name)
+            });
+            assert_eq!(
+                images.len(),
+                DIVIDER_PROGRAMS.len(),
+                "expected the divide/remainder images; rebuild them with bench/isa/build.sh"
+            );
+        }
+        _ => assert_eq!(
+            images.len(),
+            37,
+            "expected all 37 base-ISA test images; rebuild them with bench/isa/build.sh"
+        ),
+    }
 
     let compiled = compile_testbench(&design, &testbench, label, overrides);
     let module = ictus_frontend_verilog::lower_file_with_parameters(&design, overrides)
         .unwrap_or_else(|e| panic!("picorv32 should lower in the {label} configuration: {e}"));
 
     let mut compared = 0usize;
+    let mut total = 0usize;
     let mut failures = Vec::new();
     for image in &images {
         let name = image
@@ -202,6 +240,7 @@ fn run_configuration(label: &str, image_set: &str, overrides: &[(&str, u64)]) {
             continue;
         }
 
+        total += run.rows.len().saturating_sub(1) * OUTPUTS.len();
         match replay(&module, &run) {
             Ok(points) => compared += points,
             Err(reason) => failures.push(format!("{name}: {reason}")),
@@ -216,12 +255,17 @@ fn run_configuration(label: &str, image_set: &str, overrides: &[(&str, u64)]) {
         images.len(),
         failures.join("\n  ")
     );
-    // The same floor as the other picorv32 test: a field Icarus reports as
-    // `x` is skipped, and this makes sure skipping can't quietly grow
-    // until nothing is being checked.
+    // A field Icarus reports as `x` is skipped rather than compared. This
+    // makes sure skipping can't quietly grow until little is being
+    // checked. It is a *proportion* on purpose -- an absolute count would
+    // depend on how many programs a configuration runs, which is how the
+    // first version of it (a flat 300,000) failed the four-program divider
+    // run while that run was agreeing with Icarus on every point. Measured
+    // at 99.1-99.5% across the configurations; almost all of the rest is
+    // `mem_wdata` before a program's first store.
     assert!(
-        compared > 300_000,
-        "only {compared} output points were comparable across all tests"
+        compared * 100 >= total * 98,
+        "only {compared} of {total} output points were comparable in the {label} \n         configuration -- too many were skipped as unknown"
     );
 }
 

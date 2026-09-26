@@ -57,8 +57,9 @@ sequencing.
 
 ## Status
 
-Phase 1 in progress (see docs/roadmap.md). A narrow Verilog subset (single
-module, ports that may inherit direction in a list, any number of clocked
+Phase 1 in progress (see docs/roadmap.md). A narrow Verilog subset (modules
+instantiated by name and flattened into one, ports that may inherit
+direction in a list, any number of clocked
 `always @(posedge clk)` blocks, combinational `always @*` blocks, and
 continuous `assign`s, `if`/`else`/`else
 if`, `case`/`casez`/`casex` with wildcard bits, both non-blocking (`<=`) and
@@ -148,9 +149,18 @@ Top-level parameters can be overridden too (the equivalent of Icarus's
 picorv32 — tuned for speed, tuned for area, and with compressed
 instructions — 148 runs in all, every one matching Icarus.
 
-Module instantiation is the next large piece, and the first that changes
-what a design is to Ictus (so far, always one flat module); Cranelift JIT
-codegen comes after it.
+Modules can now instantiate other modules, by name. Each instance is
+flattened into its parent when the design is lowered, so the simulator
+itself still sees one flat module. With that and unary minus,
+picorv32's hardware divider — a separate module it instantiates — runs
+the divide and remainder tests, matching Icarus.
+
+Adding unary minus also exposed a defect that predates it, and fixing it
+comes before any new language support: an arithmetic result that wraps
+around its bit width isn't reduced to that width before a right shift or
+comparison reads it. With 8-bit values, Verilog gives `(3 - 5) >> 1` as
+127; Ictus gives 255. It's kept as a runnable reproduction in the test
+suite until it's fixed. Cranelift JIT codegen comes after that.
 
 ## Workspace layout
 

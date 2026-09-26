@@ -1,7 +1,8 @@
 // Reference testbench for tests/differential_picorv32.rs -- the whole
 // vendored picorv32 design, not a hand-written fixture.
 //
-// Ictus can't instantiate modules, so it cannot run this testbench. That
+// Ictus can't run this testbench -- it doesn't model `initial` blocks,
+// delays, event waits or `$display`. That
 // is the point of the arrangement: this side runs in Icarus and *records*
 // what it drove into picorv32 and what picorv32 produced, and the Rust
 // side replays the recorded inputs into Ictus and compares the outputs.

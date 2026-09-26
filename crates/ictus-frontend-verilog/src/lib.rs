@@ -2,9 +2,12 @@
 //! into `ictus_ir`.
 //!
 //! v1 scope, matching `ictus_ir`'s current shape (see that crate's doc
-//! comment): a single ANSI-style module (`module foo (input wire clk,
-//! ...)`, ports may inherit direction from the previous one in the list
-//! -- `input clk, resetn,` -- see `lower_port`), any number of clocked
+//! comment): ANSI-style modules (`module foo (input wire clk, ...)`) --
+//! the first in the file is the top, and any other can be instantiated by
+//! name and is flattened into its parent (see `lower_instances` and
+//! `flatten_instance`, decisions.md D30) -- where ports may inherit
+//! direction from the previous one in the list (`input clk, resetn,` --
+//! see `lower_port`), any number of clocked
 //! `always @(posedge clk) begin ... end` blocks, combinational
 //! `always @*`/`always @(*)`/`always_comb` blocks (see
 //! `lower_comb_process`; an *explicit* sensitivity list, `negedge`,
@@ -210,24 +213,61 @@ pub fn lower_file_with_parameters(
     let (tree, _) = parse_sv(path, &defines, &includes, false, false)
         .map_err(|e| format!("parse error: {e}"))?;
 
-    let module_node = tree
-        .into_iter()
-        .find_map(|n| match n {
-            RefNode::ModuleDeclarationAnsi(x) => Some(x),
-            _ => None,
-        })
-        .ok_or("no ANSI-style module declaration found")?;
+    // Every ANSI-style module in the file, by name. The first one is the
+    // design's top, as it has always been; the rest are there to be
+    // instantiated.
+    let mut library: Library = HashMap::new();
+    let mut top = None;
+    for node in tree.into_iter() {
+        if let RefNode::ModuleDeclarationAnsi(declaration) = node {
+            let name = module_name(declaration, &tree)?;
+            top.get_or_insert(declaration);
+            if library.insert(name.clone(), declaration).is_some() {
+                return Err(format!("module '{name}' is declared more than once"));
+            }
+        }
+    }
+    let top = top.ok_or("no ANSI-style module declaration found")?;
 
+    let module = lower_module(top, &tree, &override_map, &library, &mut Vec::new())?;
+    reject_multiple_clocks(&module)?;
+    Ok(module)
+}
+
+/// Every ANSI-style module declared in the file being lowered, by name --
+/// what an instantiation can refer to.
+type Library<'a> = HashMap<String, &'a sv_parser::ModuleDeclarationAnsi>;
+
+fn module_name(
+    declaration: &sv_parser::ModuleDeclarationAnsi,
+    tree: &SyntaxTree,
+) -> Result<String, String> {
     let name_node =
-        unwrap_node!(module_node, ModuleIdentifier).ok_or("module has no identifier")?;
+        unwrap_node!(declaration, ModuleIdentifier).ok_or("module has no identifier")?;
     let name_simple =
         unwrap_node!(name_node, SimpleIdentifier).ok_or("module identifier unreadable")?;
-    let name = ident_str(name_simple, &tree)
+    Ok(ident_str(name_simple, tree)
         .ok_or("could not read module identifier")?
-        .to_string();
+        .to_string())
+}
 
+/// Lowers one module, with its parameters overridden by `override_map`,
+/// into a flat `ictus_ir::Module` -- flat including every module it
+/// instantiates, which are lowered by calling this recursively and then
+/// merged in by `flatten_instance`. See docs/decisions.md D30.
+///
+/// `stack` holds the names of the modules currently being lowered, outer
+/// to inner, so a module that (directly or indirectly) instantiates itself
+/// is reported instead of recursing forever.
+fn lower_module<'a>(
+    module_node: &'a sv_parser::ModuleDeclarationAnsi,
+    tree: &SyntaxTree,
+    override_map: &HashMap<String, u64>,
+    library: &Library<'a>,
+    stack: &mut Vec<String>,
+) -> Result<Module, String> {
     let mut module = Module {
-        name,
+        name: module_name(module_node, tree)?,
         ..Default::default()
     };
 
@@ -236,20 +276,20 @@ pub fn lower_file_with_parameters(
     // reference an *earlier* parameter, per real Verilog elaboration
     // order -- see lower_parameters. Overrides are applied as each
     // parameter is reached, so later defaults see the overridden value.
-    let parameters = lower_parameters(module_node, &tree, &override_map)?;
+    let parameters = lower_parameters(module_node, tree, override_map)?;
 
     // Decides which branch of every `generate if` exists, now that the
     // parameters its conditions read are known. Every walk below consults
     // it and skips anything inside a branch that wasn't selected -- see
     // `elaborate_generates` for why that has to be a filter on every walk
     // rather than something done once.
-    let elab = elaborate_generates(module_node, &tree, &parameters)?;
+    let elab = elaborate_generates(module_node, tree, &parameters)?;
 
     // Scanned up front, same reasoning as parameters: a task-call
     // statement (see lower_task_call_statement) needs to know whether the
     // task it names has a provably-empty body before it can decide
     // whether to accept the call as a no-op.
-    let empty_tasks = lower_task_declarations(module_node, &tree, &elab)?;
+    let empty_tasks = lower_task_declarations(module_node, tree, &elab)?;
 
     // A port that omits its own `input`/`output` keyword (`input clk,
     // resetn,` -- resetn has no keyword of its own) inherits the
@@ -259,7 +299,7 @@ pub fn lower_file_with_parameters(
     let mut last_direction: Option<Direction> = None;
     for port_node in module_node.into_iter() {
         if let RefNode::AnsiPortDeclaration(port) = port_node {
-            module.push_signal(lower_port(port, &tree, &mut last_direction, &parameters)?);
+            module.push_signal(lower_port(port, tree, &mut last_direction, &parameters)?);
         }
     }
 
@@ -268,13 +308,13 @@ pub fn lower_file_with_parameters(
             RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net))
                 if !elab.excludes(&**net) =>
             {
-                for signal in lower_internal_signal(&**net, &tree, &parameters)? {
+                for signal in lower_internal_signal(&**net, tree, &parameters)? {
                     module.push_signal(signal);
                 }
             }
             RefNode::DataDeclaration(DataDeclaration::Variable(var)) if !elab.excludes(&**var) => {
-                reject_variable_initializer(var, &tree)?;
-                for signal in lower_internal_signal(&**var, &tree, &parameters)? {
+                reject_variable_initializer(var, tree)?;
+                for signal in lower_internal_signal(&**var, tree, &parameters)? {
                     module.push_signal(signal);
                 }
             }
@@ -302,7 +342,7 @@ pub fn lower_file_with_parameters(
             if elab.excludes(always) {
                 continue;
             }
-            match lower_always(always, &tree, &ctx)? {
+            match lower_always(always, tree, &ctx)? {
                 LoweredAlways::Clocked(process) => clocked_processes.push(process),
                 LoweredAlways::Combinational(process) => comb_processes.push(process),
             }
@@ -330,24 +370,379 @@ pub fn lower_file_with_parameters(
             RefNode::ContinuousAssign(sv_parser::ContinuousAssign::Net(net))
                 if !elab.excludes(&**net) =>
             {
-                assigns.push(lower_continuous_assign(net, &tree, &ctx)?);
+                assigns.push(lower_continuous_assign(net, tree, &ctx)?);
             }
             RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net))
                 if !elab.excludes(&**net) =>
             {
-                assigns.extend(lower_net_decl_assigns(net, &tree, &ctx)?);
+                assigns.extend(lower_net_decl_assigns(net, tree, &ctx)?);
             }
             _ => {}
         }
     }
 
+    // Instances are lowered while `ctx` is still available, because what a
+    // port is connected to is an expression in *this* module's scope. Each
+    // child is lowered completely -- its own instances included -- and
+    // merged in once `ctx`'s borrow of `module` has ended.
+    let instances = lower_instances(module_node, tree, &ctx, &elab, library, stack)?;
+
     module.clocked_processes = clocked_processes;
     module.comb_processes = comb_processes;
     module.assigns = assigns;
+    for instance in instances {
+        flatten_instance(&mut module, instance)?;
+    }
 
+    // After flattening, so a conflict across an instance boundary -- a
+    // child's output driving a signal the parent also drives -- is caught
+    // like any other.
     reject_multiple_drivers(&module)?;
 
     Ok(module)
+}
+
+/// An instance whose module has been lowered and whose port connections
+/// have been resolved in the parent's scope, waiting to be merged into
+/// the parent by `flatten_instance`.
+struct PendingInstance {
+    name: String,
+    child: Module,
+    /// What each of the child's ports (keyed by its id in `child`) is
+    /// connected to, as an expression already lowered in the *parent's*
+    /// scope. An entry of `None` is an explicitly empty connection,
+    /// `.port()`; a port with no entry at all wasn't mentioned. The two
+    /// mean the same thing -- the port is unconnected.
+    connections: HashMap<SignalId, Option<Expr>>,
+}
+
+/// Finds every module instantiation in the parts of `module_node` that
+/// elaboration kept, lowers the instantiated module (recursively, with the
+/// parameter values the instantiation gives it), and resolves each port
+/// connection in this module's scope.
+///
+/// Supported: `child #(.P(value), ...) name (.port(expr), ...);`, the
+/// named form picorv32 and most real RTL use, with any number of
+/// instances per statement. Rejected, each loudly: positional parameters
+/// and positional ports (they depend on declaration order, which is a
+/// real source of bugs and not needed yet); `.*` and the implicit `.port`
+/// shorthand; instance arrays (`child u[3:0] (...)`); an unknown module
+/// or port; a duplicate instance name or port connection; and a module
+/// that instantiates itself.
+fn lower_instances<'a>(
+    module_node: &'a sv_parser::ModuleDeclarationAnsi,
+    tree: &SyntaxTree,
+    ctx: &Ctx,
+    elab: &Elaboration,
+    library: &Library<'a>,
+    stack: &mut Vec<String>,
+) -> Result<Vec<PendingInstance>, String> {
+    let ident_of = |node: RefNode| -> Result<String, String> {
+        let simple = unwrap_node!(node, SimpleIdentifier).ok_or("identifier unreadable")?;
+        Ok(ident_str(simple, tree).ok_or("identifier unreadable")?.to_string())
+    };
+
+    let mut pending = Vec::new();
+    let mut instance_names = HashSet::new();
+
+    for node in module_node.into_iter() {
+        let RefNode::ModuleInstantiation(instantiation) = node else {
+            continue;
+        };
+        if elab.excludes(instantiation) {
+            continue;
+        }
+
+        let child_name = ident_of(RefNode::from(&instantiation.nodes.0))?;
+        let child_node = *library.get(&child_name).ok_or_else(|| {
+            format!(
+                "instantiation of '{child_name}': no ANSI-style module by that name is \
+                 declared in this file"
+            )
+        })?;
+        if stack.contains(&child_name) {
+            return Err(format!(
+                "module '{child_name}' instantiates itself (through {}), which would never \
+                 finish elaborating",
+                stack.join(" -> ")
+            ));
+        }
+
+        // Parameter values are expressions in *this* module's scope --
+        // they may name this module's own parameters -- and must fold to
+        // constants, since they select generate branches and widths in the
+        // child exactly as a top-level override does.
+        let mut child_overrides: HashMap<String, u64> = HashMap::new();
+        if let Some(assignment) = &instantiation.nodes.1 {
+            match &assignment.nodes.1.nodes.1 {
+                None => {}
+                Some(sv_parser::ListOfParameterAssignments::Ordered(_)) => {
+                    return Err(format!(
+                        "instantiation of '{child_name}' passes parameters by position, which \
+                         v1 doesn't support -- name them: `#(.NAME(value))`"
+                    ));
+                }
+                Some(sv_parser::ListOfParameterAssignments::Named(named)) => {
+                    for parameter in named.nodes.0.contents() {
+                        let name = ident_of(RefNode::from(&parameter.nodes.1))?;
+                        // `.NAME()` -- present but empty -- keeps the default.
+                        let Some(value_node) = &parameter.nodes.2.nodes.1 else {
+                            continue;
+                        };
+                        let sv_parser::ParamExpression::MintypmaxExpression(mintypmax) =
+                            value_node
+                        else {
+                            return Err(format!(
+                                "parameter '{name}' of '{child_name}' is given a type or `$`, \
+                                 which v1 doesn't support"
+                            ));
+                        };
+                        let sv_parser::MintypmaxExpression::Expression(expr) = &**mintypmax
+                        else {
+                            return Err(format!(
+                                "parameter '{name}' of '{child_name}' is given a min:typ:max \
+                                 value, which v1 doesn't support"
+                            ));
+                        };
+                        let lowered = lower_expr(expr, tree, ctx)?;
+                        let value = try_const_fold(&lowered).ok_or_else(|| {
+                            format!(
+                                "parameter '{name}' of '{child_name}' must be a compile-time \
+                                 constant, but is {lowered:?}"
+                            )
+                        })?;
+                        if child_overrides.insert(name.clone(), value).is_some() {
+                            return Err(format!(
+                                "parameter '{name}' of '{child_name}' is given more than once"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        for instance in instantiation.nodes.2.contents() {
+            let instance_name = ident_of(RefNode::from(&instance.nodes.0.nodes.0))?;
+            if !instance.nodes.0.nodes.1.is_empty() {
+                return Err(format!(
+                    "instance array '{instance_name}' of '{child_name}' is not supported in v1"
+                ));
+            }
+            if !instance_names.insert(instance_name.clone()) {
+                return Err(format!(
+                    "two instances in module '{}' are both named '{instance_name}'",
+                    ctx.name
+                ));
+            }
+
+            stack.push(ctx.name.clone());
+            let child = lower_module(child_node, tree, &child_overrides, library, stack)
+                .map_err(|e| format!("in instance '{instance_name}' of '{child_name}': {e}"))?;
+            stack.pop();
+
+            let mut connections = HashMap::new();
+            match &instance.nodes.1.nodes.1 {
+                None => {}
+                Some(sv_parser::ListOfPortConnections::Ordered(_)) => {
+                    return Err(format!(
+                        "instance '{instance_name}' of '{child_name}' connects ports by \
+                         position, which v1 doesn't support -- name them: `.port(signal)`"
+                    ));
+                }
+                Some(sv_parser::ListOfPortConnections::Named(named)) => {
+                    for connection in named.nodes.0.contents() {
+                        let sv_parser::NamedPortConnection::Identifier(connection) = connection
+                        else {
+                            return Err(format!(
+                                "instance '{instance_name}' uses `.*`, which v1 doesn't support"
+                            ));
+                        };
+                        let port = ident_of(RefNode::from(&connection.nodes.2))?;
+                        let port_id = child
+                            .signal_id(&port)
+                            .filter(|&id| child.signals[id].direction.is_some())
+                            .ok_or_else(|| {
+                                format!("'{child_name}' has no port named '{port}'")
+                            })?;
+                        let Some(paren) = &connection.nodes.3 else {
+                            return Err(format!(
+                                "instance '{instance_name}' connects `.{port}` implicitly, \
+                                 which v1 doesn't support -- write `.{port}({port})`"
+                            ));
+                        };
+                        let expr = match &paren.nodes.1 {
+                            Some(expr) => Some(lower_expr(expr, tree, ctx)?),
+                            None => None,
+                        };
+                        if connections.insert(port_id, expr).is_some() {
+                            return Err(format!(
+                                "instance '{instance_name}' connects port '{port}' twice"
+                            ));
+                        }
+                    }
+                }
+            }
+
+            pending.push(PendingInstance {
+                name: instance_name,
+                child,
+                connections,
+            });
+        }
+    }
+
+    Ok(pending)
+}
+
+/// Merges a lowered instance into its parent -- the flattening step
+/// docs/decisions.md D30 chooses over keeping a hierarchy in the kernel.
+///
+/// Every signal of the child becomes a signal of the parent named
+/// `<instance>.<name>` (nested instances nest the prefix), with one
+/// exception that matters: a port connected straight to a whole parent
+/// signal of the same width is *not* copied -- the child's references to
+/// the port are pointed at the parent's signal instead. A clock is the
+/// case that shows why. Connecting `.clk(clk)` by copying would give the
+/// child's `always @(posedge clk)` a clock that is a *different signal*
+/// from the parent's, fed by a continuous assignment; aliasing makes it
+/// the same signal, so "the whole design has one clock" stays a fact the
+/// lowered module can be checked for (`reject_multiple_clocks`).
+///
+/// Anything else is connected by a continuous assignment, which is how
+/// IEEE 1800 describes a port connection anyway, and which gives Verilog's
+/// width coercion for free (the kernel masks every write to its target's
+/// width):
+///
+/// * an input connected to an expression, or to a signal of a different
+///   width: a copy of the port, driven by `port = expression`;
+/// * an output connected to a parent signal of a different width: a copy
+///   of the port, with `signal = port` in the parent.
+///
+/// Rejected: an output connected to anything but a whole signal (a
+/// part-select or concatenation would need a continuous assignment to
+/// part of a signal, which v1 doesn't support), and an *input* left
+/// unconnected -- Verilog lets it float to `z`, which this 2-state kernel
+/// can't represent, and it is far more often a mistake than a choice. An
+/// output left unconnected is simply a signal nothing reads.
+fn flatten_instance(parent: &mut Module, instance: PendingInstance) -> Result<(), String> {
+    let PendingInstance {
+        name: instance_name,
+        child,
+        mut connections,
+    } = instance;
+
+    let same_shape = |a: &Signal, b: &Signal| a.width == b.width && a.depth == b.depth;
+    let mut remap: Vec<SignalId> = Vec::with_capacity(child.signals.len());
+    let mut port_assigns = Vec::new();
+
+    for (child_id, signal) in child.signals.iter().enumerate() {
+        let copy = |parent: &mut Module| {
+            parent.push_signal(Signal {
+                name: format!("{instance_name}.{}", signal.name),
+                width: signal.width,
+                direction: None,
+                depth: signal.depth,
+            })
+        };
+
+        let id = match signal.direction {
+            None => copy(parent),
+            Some(Direction::Input) => match connections.remove(&child_id).flatten() {
+                Some(Expr::Ref(target)) if same_shape(&parent.signals[target], signal) => target,
+                Some(expr) => {
+                    let id = copy(parent);
+                    port_assigns.push(Assign {
+                        target: id,
+                        value: expr,
+                    });
+                    id
+                }
+                None => {
+                    return Err(format!(
+                        "input port '{}' of instance '{instance_name}' is not connected -- \
+                         Verilog would leave it floating at z, which this 2-state kernel \
+                         can't represent",
+                        signal.name
+                    ));
+                }
+            },
+            Some(Direction::Output) => match connections.remove(&child_id).flatten() {
+                Some(Expr::Ref(target)) if same_shape(&parent.signals[target], signal) => target,
+                Some(Expr::Ref(target)) => {
+                    let id = copy(parent);
+                    port_assigns.push(Assign {
+                        target,
+                        value: Expr::Ref(id),
+                    });
+                    id
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "output port '{}' of instance '{instance_name}' is connected to \
+                         something other than a whole signal ({other:?}), which v1 doesn't \
+                         support",
+                        signal.name
+                    ));
+                }
+                None => copy(parent),
+            },
+        };
+        remap.push(id);
+    }
+
+    let map = |id: SignalId| remap[id];
+    for mut process in child.clocked_processes {
+        process.clock = map(process.clock);
+        for stmt in &mut process.body {
+            stmt.remap_signals(&map);
+        }
+        parent.clocked_processes.push(process);
+    }
+    for mut process in child.comb_processes {
+        for stmt in &mut process.body {
+            stmt.remap_signals(&map);
+        }
+        parent.comb_processes.push(process);
+    }
+    for mut assign in child.assigns {
+        assign.target = map(assign.target);
+        assign.value.remap_signals(&map);
+        parent.assigns.push(assign);
+    }
+    // Already in the parent's numbering: their expressions were lowered in
+    // the parent's scope, and their child-side ends were given parent ids
+    // above.
+    parent.assigns.extend(port_assigns);
+
+    Ok(())
+}
+
+/// Rejects a design whose clocked processes are not all clocked by the
+/// same signal.
+///
+/// The kernel's `tick()` is one rising edge of *every* clocked process at
+/// once, so it has always assumed a single clock -- and before instances
+/// that was nearly always true by construction. With them, a child's
+/// clock is whatever its `clk` port is connected to, which could be a
+/// divided or gated version of the parent's, and ticking it together with
+/// everything else would be silently wrong. Aliasing a port connected
+/// straight to the parent's clock (see `flatten_instance`) is what keeps
+/// an ordinary hierarchy on one clock *signal*, so this check can be exact.
+fn reject_multiple_clocks(module: &Module) -> Result<(), String> {
+    let mut clocks: Vec<SignalId> = module.clocked_processes.iter().map(|p| p.clock).collect();
+    clocks.sort_unstable();
+    clocks.dedup();
+    if clocks.len() > 1 {
+        let names: Vec<&str> = clocks
+            .iter()
+            .map(|&id| module.signals[id].name.as_str())
+            .collect();
+        return Err(format!(
+            "the design's clocked processes use more than one clock ({names:?}); v1 simulates \
+             a single clock domain, and ticking these together would be silently wrong"
+        ));
+    }
+    Ok(())
 }
 
 /// Rejects a signal driven from more than one place -- more than one
@@ -418,9 +813,27 @@ fn reject_multiple_drivers(module: &Module) -> Result<(), String> {
     }
 
     // Reported in signal order, so the error is the same on every run.
-    let mut multiply_driven: Vec<_> = drivers.into_iter().filter(|(_, d)| d.len() > 1).collect();
-    multiply_driven.sort_by_key(|(id, _)| *id);
-    if let Some((id, sources)) = multiply_driven.first() {
+    let mut driven: Vec<_> = drivers.into_iter().collect();
+    driven.sort_by_key(|(id, _)| *id);
+
+    // A module's own input is driven from outside it, by definition, so
+    // anything inside driving one is a second driver the lists above can't
+    // see. Flattening makes this reachable -- a child's output connected to
+    // the parent's input port is aliased onto it -- and it would otherwise
+    // be silently overwritten by whatever drives the input.
+    if let Some((id, sources)) = driven
+        .iter()
+        .find(|(id, _)| module.signals[*id].direction == Some(Direction::Input))
+    {
+        return Err(format!(
+            "input port '{}' is driven from inside the module ({}), which can't be right: an \
+             input is driven by whatever the module is connected to",
+            module.signals[*id].name,
+            sources.join(", ")
+        ));
+    }
+
+    if let Some((id, sources)) = driven.iter().find(|(_, sources)| sources.len() > 1) {
         return Err(format!(
             "signal '{}' is driven from more than one place ({}), which v1 does not support: \
              two continuous drivers need a resolution rule a 2-state kernel doesn't have, and \
@@ -510,13 +923,16 @@ where
 /// doesn't exist in the elaborated design would be as wrong as lowering
 /// it.
 ///
+/// A module instantiation inside a *selected* branch is lowered like any
+/// other (see `lower_instances`); one in an unselected branch doesn't
+/// exist, which is what lets picorv32 name `picorv32_pcpi_fast_mul` in a
+/// branch its configuration doesn't take. (Before instantiation was
+/// supported, one in a selected branch was rejected here -- and before
+/// *that*, silently dropped, the D25 failure: picorv32 with `ENABLE_MUL=1`
+/// would have lowered with no multiplier and no error.)
+///
 /// Rejected, when they lie in code that *does* exist:
 ///
-/// * **Module instantiation.** Previously these were silently dropped,
-///   which is the same failure docs/decisions.md D25 is about: picorv32
-///   with `ENABLE_MUL=1` would have lowered cleanly and simply had no
-///   multiplier. Instantiation is a real, planned feature, not something
-///   to approximate by omission.
 /// * **`generate for` and `generate case`.** Both are legitimate and
 ///   neither is needed yet; a `for` would also need genvar scoping.
 /// * **A parameter declared inside any `generate if`**, selected or not.
@@ -563,17 +979,6 @@ fn elaborate_generates(
             }
             RefNode::CaseGenerateConstruct(generate) if !elab.excludes(generate) => {
                 return Err("`generate case` is not supported in v1".to_string());
-            }
-            RefNode::ModuleInstantiation(instance) if !elab.excludes(instance) => {
-                let module_name = unwrap_node!(instance, ModuleIdentifier)
-                    .and_then(|n| unwrap_node!(n, SimpleIdentifier))
-                    .and_then(|n| ident_str(n, tree))
-                    .unwrap_or("<unreadable>");
-                return Err(format!(
-                    "module instantiation (of '{module_name}') is not supported in v1 -- \
-                     rejected rather than skipped, since skipping it would lower a design that \
-                     is silently missing whatever that instance does"
-                ));
             }
             _ => {}
         }
@@ -2148,6 +2553,21 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
             let operand = lower_primary(&unary.nodes.2, tree, module)?;
             match op_text {
                 "!" => Ok(Expr::Not(Box::new(operand))),
+                // Unary minus is two's-complement negation: exactly
+                // `0 - x`, with the zero taking the operand's width so the
+                // result's self-determined width is the operand's (see
+                // `expr_width`'s arithmetic arm). No new IR variant -- it
+                // is subtraction, and shares subtraction's evaluation
+                // exactly, including how the kernel wraps it on a `u64`.
+                "-" => {
+                    let width = expr_width(&operand, module)?;
+                    Ok(Expr::Sub(
+                        Box::new(Expr::Literal { value: 0, width }),
+                        Box::new(operand),
+                    ))
+                }
+                // Unary plus changes nothing.
+                "+" => Ok(operand),
                 "~" => {
                     let width = expr_width(&operand, module)?;
                     Ok(Expr::BitwiseNot(Box::new(operand), width))

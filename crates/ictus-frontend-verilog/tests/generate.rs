@@ -71,17 +71,21 @@ fn ignores_an_instance_in_an_unselected_branch() {
     assert_eq!(drivers(&module, "y"), (0, 0, 1));
 }
 
-/// The same instance in the branch that *is* selected is rejected. It
-/// used to be dropped silently, leaving a design that lowered cleanly
-/// and was missing whatever the instance did -- picorv32 with
-/// `ENABLE_MUL=1` would have had no multiplier and no error.
+/// The same instance in the branch that *is* selected is real, so it is
+/// lowered -- and here that fails, because `some_extra_unit` isn't
+/// declared anywhere. The point is the contrast with the test above: the
+/// identical instantiation is ignored in an unselected branch and must
+/// resolve in a selected one. (Before instantiation was supported, this
+/// was rejected as an instantiation; before *that*, it was dropped
+/// silently, and picorv32 with `ENABLE_MUL=1` would have lowered with no
+/// multiplier and no error.)
 #[test]
-fn rejects_an_instance_in_the_selected_branch() {
+fn resolves_an_instance_in_the_selected_branch() {
     let err = ictus_frontend_verilog::lower_file(&fixture("generate_selected_instance_test.v"))
-        .expect_err("an instance in the selected branch must be rejected, not skipped");
+        .expect_err("the selected branch instantiates a module that doesn't exist");
     assert!(
-        err.contains("module instantiation") && err.contains("some_extra_unit"),
-        "expected the error to name the instantiated module, got: {err}"
+        err.contains("some_extra_unit") && err.contains("no ANSI-style module"),
+        "expected the error to name the missing module, got: {err}"
     );
 }
 

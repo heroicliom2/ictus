@@ -13,15 +13,17 @@
 #   picorv32_isa_c/  -march=rv32ic  the assembler also emits compressed
 #                                   (16-bit) instructions wherever it can,
 #                                   about half of them
+#   picorv32_isa_m/  -march=rv32im  the multiply/divide/remainder tests
+#                                   only, which need ENABLE_MUL/ENABLE_DIV
 #
 # The second set exists because a picorv32 configured with COMPRESSED_ISA
 # runs plain rv32i code with a bus trace *identical* to the default's --
 # measured, not assumed -- so without compressed instructions in the
 # program, the compressed-instruction decoder never runs at all.
 #
-# The multiply, divide and remainder tests are excluded from both: they
+# The multiply, divide and remainder tests go only in the third set: they
 # need ENABLE_MUL/ENABLE_DIV, whose units are separate modules picorv32
-# instantiates, which Ictus doesn't support yet.
+# instantiates.
 #
 # Output format: one 32-bit little-endian word per line in hex, which is
 # what the testbench's `$readmemh` into a 32-bit-wide memory expects.
@@ -38,15 +40,17 @@ CC="${CC:-riscv64-unknown-elf-gcc}"
 OBJCOPY="${OBJCOPY:-riscv64-unknown-elf-objcopy}"
 
 build_set() {
-	local march="$1" out="$2"
+	local march="$1" out="$2" want="$3"
 	mkdir -p "$out"
 	rm -f "$out"/*.hex
 
 	for src in "$tests"/*.S; do
 		local name
 		name="$(basename "$src" .S)"
-		case "$name" in
-			mul*|div*|rem*) continue ;;
+		case "$want:$name" in
+			base:mul*|base:div*|base:rem*) continue ;;
+			muldiv:mul*|muldiv:div*|muldiv:rem*) ;;
+			muldiv:*) continue ;;
 		esac
 
 		"$CC" -march="$march" -mabi=ilp32 -nostdlib -nostartfiles -Wl,--no-relax \
@@ -61,5 +65,6 @@ build_set() {
 	echo "built $(ls "$out"/*.hex | wc -l) $march images into $out"
 }
 
-build_set rv32i  "$fixtures/picorv32_isa"
-build_set rv32ic "$fixtures/picorv32_isa_c"
+build_set rv32i  "$fixtures/picorv32_isa"   base
+build_set rv32ic "$fixtures/picorv32_isa_c" base
+build_set rv32im "$fixtures/picorv32_isa_m" muldiv

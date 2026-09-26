@@ -2,8 +2,11 @@
 //! a fixture written to exercise one feature, but a real 32-bit RISC-V
 //! CPU core running a real program.
 //!
-//! **Why this is shaped as a trace replay.** Ictus can't instantiate
-//! modules, so it cannot run a testbench that wraps the core in a memory.
+//! **Why this is shaped as a trace replay.** Ictus can't run a testbench
+//! -- that needs `initial` blocks, delays, event waits and `$display`,
+//! which it doesn't model -- so it can't run one that wraps the core in a
+//! memory. (When this was written it couldn't instantiate modules either;
+//! it now can, but that was never the whole obstacle.)
 //! Reimplementing that memory in Rust would mean two hand-written models
 //! that are *supposed* to match cycle for cycle, and any disagreement
 //! between them would look exactly like a simulator bug. Instead Icarus

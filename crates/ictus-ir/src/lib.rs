@@ -5,12 +5,14 @@
 //! frontend's own AST.
 //!
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
-//! interpreter-first sequencing this supports): a single flat module, no
-//! instances/hierarchy (a `generate if` is resolved by the frontend, so
-//! only its selected branch ever reaches this IR, and nothing here needs
-//! to know it existed); array/memory signals
-//! (`reg [31:0] mem [0:31]`) *are* supported, with one unpacked
-//! dimension, read and written one element at a time at a runtime index
+//! interpreter-first sequencing this supports): a single flat module. A
+//! design with instances is flattened by the frontend before it gets here
+//! -- each instance's signals renamed `<instance>.<name>` and its IR
+//! renumbered with `Expr::remap_signals`/`Stmt::remap_signals` -- and a
+//! `generate if` is resolved there too, so only its selected branch ever
+//! reaches this IR; nothing here needs to know either existed.
+//! Array/memory signals (`reg [31:0] mem [0:31]`) *are* supported, with
+//! one unpacked dimension, read and written one element at a time at a runtime index
 //! (see `Signal::depth`, `Expr::ArrayRead`, `Stmt::ArrayAssign`), any
 //! number of clocked (`always @(posedge clk)`) processes, combinational
 //! ones (`always @*`/`always_comb`, see `CombProcess`), and continuous
@@ -467,5 +469,133 @@ impl Module {
     pub fn push_signal(&mut self, signal: Signal) -> SignalId {
         self.signals.push(signal);
         self.signals.len() - 1
+    }
+}
+
+// Renumbering signals. Flattening a module instance into its parent gives
+// every one of the instance's signals a new id in the parent -- or, for a
+// port connected straight to a parent signal, *that* signal's id -- so
+// every reference in the instance's lowered IR has to be rewritten. These
+// matches are exhaustive on purpose, with no wildcard arm: a new `Expr` or
+// `Stmt` variant that carries a signal must fail to compile here until it
+// is handled, rather than being silently left pointing at the wrong
+// signal after flattening.
+
+impl Expr {
+    /// Rewrites every signal this expression refers to through `map`.
+    pub fn remap_signals<F: Fn(SignalId) -> SignalId>(&mut self, map: &F) {
+        match self {
+            Expr::Literal { .. } => {}
+            Expr::Ref(id) => *id = map(*id),
+            Expr::Not(inner)
+            | Expr::BitwiseNot(inner, _)
+            | Expr::ReduceAnd(inner, _)
+            | Expr::ReduceOr(inner, _)
+            | Expr::ReduceXor(inner, _)
+            | Expr::Signed(inner, _) => inner.remap_signals(map),
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::Shl(lhs, rhs)
+            | Expr::Shr(lhs, rhs)
+            | Expr::AShr(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Xor(lhs, rhs)
+            | Expr::Eq(lhs, rhs)
+            | Expr::Ne(lhs, rhs)
+            | Expr::Lt(lhs, rhs)
+            | Expr::Le(lhs, rhs)
+            | Expr::Gt(lhs, rhs)
+            | Expr::Ge(lhs, rhs)
+            | Expr::SignedLt(lhs, rhs)
+            | Expr::LogicalAnd(lhs, rhs)
+            | Expr::LogicalOr(lhs, rhs) => {
+                lhs.remap_signals(map);
+                rhs.remap_signals(map);
+            }
+            Expr::Select { base, .. } => base.remap_signals(map),
+            Expr::DynamicBitSelect { base, index } => {
+                base.remap_signals(map);
+                index.remap_signals(map);
+            }
+            Expr::ArrayRead { array, index } => {
+                *array = map(*array);
+                index.remap_signals(map);
+            }
+            Expr::Concat(parts) => {
+                for (part, _width) in parts {
+                    part.remap_signals(map);
+                }
+            }
+            Expr::Ternary {
+                cond,
+                then_val,
+                else_val,
+            } => {
+                cond.remap_signals(map);
+                then_val.remap_signals(map);
+                else_val.remap_signals(map);
+            }
+        }
+    }
+}
+
+impl Stmt {
+    /// Rewrites every signal this statement reads or writes through `map`,
+    /// including inside nested `if`/`case` bodies.
+    pub fn remap_signals<F: Fn(SignalId) -> SignalId>(&mut self, map: &F) {
+        match self {
+            Stmt::NonBlockingAssign { target, value, .. }
+            | Stmt::BlockingAssign { target, value, .. } => {
+                *target = map(*target);
+                value.remap_signals(map);
+            }
+            Stmt::ArrayAssign {
+                array,
+                index,
+                value,
+            }
+            | Stmt::BlockingArrayAssign {
+                array,
+                index,
+                value,
+            } => {
+                *array = map(*array);
+                index.remap_signals(map);
+                value.remap_signals(map);
+            }
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                cond.remap_signals(map);
+                for stmt in then_branch.iter_mut().chain(else_branch.iter_mut()) {
+                    stmt.remap_signals(map);
+                }
+            }
+            Stmt::Case {
+                selector,
+                arms,
+                default,
+            } => {
+                selector.remap_signals(map);
+                for arm in arms {
+                    for value in &mut arm.values {
+                        match value {
+                            CaseValue::Exact(expr) => expr.remap_signals(map),
+                            CaseValue::Wildcard { .. } => {}
+                        }
+                    }
+                    for stmt in &mut arm.body {
+                        stmt.remap_signals(map);
+                    }
+                }
+                for stmt in default {
+                    stmt.remap_signals(map);
+                }
+            }
+        }
     }
 }

@@ -1083,30 +1083,84 @@ D29.
   with it, in both simulators. With overrides dropped, `compressed` now
   fails all 37 too.
 
-**Next: module instantiation.** It is the largest remaining gap by a
-distance, and the one thing between Ictus and the multiply/divide tests,
-picorv32's prebuilt firmware, and running a testbench directly instead of
-replaying a recorded one. It is also the first increment that changes
-what a *design* is to this codebase -- until now everything has been one
-flat module -- so it needs a real design pass before any code: whether
-instances are flattened into one `Module` at lowering time or kept as a
-hierarchy the kernel understands, how ports connect (by name, by
-position, to expressions rather than plain signals), how parameters pass
-down (the mechanism above is most of it), and how signal names stay
-unambiguous once two instances of one module both have a `count`.
+**Module instantiation is done, by flattening -- and picorv32's hardware
+divider, a separate module it instantiates, now runs.** Design in
+decisions.md D30.
 
-After that, **Cranelift codegen**, whose precondition from D12 -- a
-correctness baseline with a real design behind it -- is now met.
+- Each instantiated module is lowered on its own, recursively, with the
+  parameter values the instantiation gives it (D29's override mechanism,
+  evaluated in the parent's scope), then merged into the parent: signals
+  renamed `<instance>.<name>`, IR renumbered, ports connected. The IR and
+  kernel are unchanged -- the result is still one flat module. It is what
+  Verilator does, it keeps every kernel invariant intact, and it suits
+  mixed-language later.
+- A port connected straight to a whole same-width signal is *aliased*;
+  anything else goes through a continuous assignment, which is how IEEE
+  1800 describes a port connection and gives width coercion for free.
+  Aliasing is what keeps a hierarchy on one clock *signal*, so "one clock
+  domain" -- always assumed by the kernel -- is now checked: a child
+  clocked by `clk & en` is rejected rather than silently ticked with
+  everything else. A module's input driven from inside it is rejected
+  too, and the one-driver check runs after flattening.
+- Named ports and named parameter values, which is what picorv32 and most
+  RTL use. Positional forms, `.*`, instance arrays, an output wired to a
+  part-select, self-instantiation and an unconnected *input* (it would
+  float at `z`) are all rejected by name.
+- Unary minus (`-x` as `0 - x`) came along because the divider needs it.
 
-The supported language subset is still intentionally narrow: single
-ANSI-style module, any number of clocked processes, combinational
+picorv32 with `ENABLE_DIV=1` runs `div`, `divu`, `rem` and `remu` (from a
+new rv32im image set) and matches Icarus on every port, every cycle, and
+the register file. Breaking unary minus fails exactly `div` and `rem`, the
+signed ones. A three-level fixture checks aliasing, per-instance state,
+an expression-driven input, a truncating output and a parameter passed
+down two levels against Icarus's own handling of the hierarchy.
+
+A correction: the previous entry said instantiation would let Ictus run a
+testbench directly. It doesn't -- a testbench needs `initial` blocks,
+delays, event waits and `$display` -- so the trace-replay harness stays.
+
+**Next: a silent-wrong-answer defect in expression widths, found while
+adding unary minus.** The kernel evaluates every expression on a 64-bit
+word and relies on masking at the final write. That is correct for
+operators whose low bits depend only on low bits -- add, subtract,
+multiply, left shift, bitwise -- and wrong for operators that read *high*
+bits -- right shifts, comparisons, equality -- applied to an arithmetic
+result that wrapped. With 8-bit `a = 3`, `b = 5`, Verilog gives
+`(a - b) >> 1` as 127 and Ictus gives 255; `(a - b) < 8'hFF` is 1 in
+Verilog and 0 in Ictus. It predates this work -- addition, subtraction and
+multiplication have always behaved this way -- and nothing in the suite
+caught it, picorv32 included, because picorv32's arithmetic goes straight
+into registers. It is preserved as a runnable reproduction,
+`ictus-cli/tests/differential_width_context.rs`, marked `#[ignore]`.
+
+The fix is Verilog's context-determined expression widths (IEEE 1800
+§11.6): an operator's operands are evaluated at a width decided by the
+whole expression and its destination, not just the operator. That needs a
+design pass before code -- it interacts with `$signed` sign extension,
+concatenation's self-determined operands, the ternary operator and
+assignment width -- and it takes priority over new language coverage,
+because a simulator that gives quietly wrong answers is worse than one
+that refuses to run.
+
+After it, the multiplier: `picorv32_pcpi_mul` uses nested `for` loops over
+`integer` variables, indexed part-selects (`next_rd[j +: CARRY_CHAIN]`) on
+both sides of an assignment, and `$unsigned`. The loops have constant
+bounds, so they can be unrolled at lowering time, which turns the indexed
+part-selects into ordinary constant ones. That completes picorv32's M
+extension; `picorv32_pcpi_fast_mul` additionally needs `$unsigned`. Then
+**Cranelift codegen**, whose precondition from D12 is met.
+
+The supported language subset is still intentionally narrow:
+ANSI-style modules -- the first in the file is the top, and the rest can
+be instantiated by name and are flattened into it -- any number of
+clocked processes, combinational
 `always @*`/`always_comb` blocks, and `assign`s (in both spellings -- a
 standalone `assign` and a net declaration carrying an initializer),
 `#(parameter ...)` *and* `localparam` sharing one
 resolution pass (value expressions may reference an earlier parameter/
 localparam, and use `+ - * << >> >>> & | ^ == != < <= > >= && ||`, the
-ternary operator, and concatenation; no overriding a `parameter` at
-instantiation), constant/variable bit-select and constant part-select,
+ternary operator, and concatenation; a `parameter` can be overridden at
+the top or at a named instantiation), constant/variable bit-select and constant part-select,
 concatenation (plain and replication) and ternary on reads only -- with
 comparison/logical/reduction results and binary bitwise/arithmetic
 results, not just literals/refs/selects, valid as concatenation operands
@@ -1123,21 +1177,23 @@ real signed ordering comparison (`$signed(a) < $signed(b)`) -- but *not*
 a logical right shift of a `$signed(...)` value, nor a *mixed*
 signed/unsigned comparison (and no other system function), a call to a
 provably-empty task but no other task/function calls, logical `!`,
-bitwise `~`, and the reduction operators, a 4-state `x`/`z` literal
+bitwise `~`, unary `-` and `+`, and the reduction operators, a 4-state `x`/`z` literal
 outside a case item (resolves to `0`), array/memory signals (`reg [31:0]
 mem [0:31]`) with one unpacked dimension, internal-only, one element at a
 time -- but no array port, no bit-select of an element, and no `assign`
 to one -- and both `<=` and `=` inside a clocked block, but no compound
 assignment (`+=` and friends), no explicit sensitivity list, no `negedge`
-block, `generate if` but not `generate for`/`generate case`, no module
-instantiation, and at most one driving process or assignment per signal.
-The whole of picorv32.v lowers within
-this subset, and it runs picorv32's complete base-ISA test suite -- in
-four configurations, including compressed instructions -- with every
-traced port and the final register file matching Icarus; Cranelift
-codegen is further out still. Top-level parameters can be overridden
-(`lower_file_with_parameters`); parameters of an instance can't, since
-there are no instances.
+block, `generate if` but not `generate for`/`generate case`, named
+module instantiation but no positional ports or parameters and no
+instance arrays, a single clock domain, and at most one driving process
+or assignment per signal. One known defect sits inside this subset (see
+above): an arithmetic result that wraps is not reduced to its Verilog
+width before a right shift or comparison reads it. The whole of
+picorv32.v lowers within this subset, and it runs picorv32's complete
+base-ISA test suite -- in four configurations, including compressed
+instructions -- plus the divide and remainder tests through its
+instantiated hardware divider, with every traced port and the final
+register file matching Icarus; Cranelift codegen is further out still.
 
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
