@@ -1550,3 +1550,86 @@ overrides**: picorv32's other single-module configurations --
 run against each configuration. Module instantiation is the larger step,
 unlocking the multiply and divide tests and the prebuilt firmware.
 Cranelift codegen now has the correctness baseline D12 required.
+
+## D29 — Top-level parameter overrides, and measuring what a test can see
+
+**Decision**: `ictus_frontend_verilog::lower_file_with_parameters(path,
+&[(name, value)])` overrides a module's top-level parameters -- what
+Icarus's `-P` and Verilator's `-G` do -- and the picorv32 instruction
+tests now run against four configurations of the core instead of one.
+`lower_file` is the same call with no overrides.
+
+**Semantics.** An override replaces a parameter's default at the point the
+parameter is resolved, in source order, so everything after it that
+depends on it follows: a later parameter or `localparam` computed from
+it, a packed range sized by it, and which branch of every `generate if`
+is selected. The default expression isn't evaluated at all when
+overridden, as in Verilog. Rejected, each with an error naming the
+problem: a name that isn't a parameter (a typo would otherwise run the
+default configuration and look like success); a `localparam`, which
+Verilog forbids overriding; a value wider than the parameter's declared
+width; and the same name twice. The width check is a deliberate
+departure from Icarus, which silently truncates -- `BARREL_SHIFTER=2` on
+a `[0:0]` parameter gives 0 there -- and a configuration flag that
+silently means something else is not a reasonable thing to reproduce.
+
+**Driving Icarus with the same configuration was the awkward part.**
+`-P` only reaches *root* modules, and picorv32 is instantiated inside the
+testbench. Hardcoding picorv32's parameters into the testbench would
+duplicate its defaults, and a drift between the copies would make the
+"default" run quietly not be one. Instead the test writes a small module
+of hierarchical `defparam`s from the same list it hands Ictus, and
+compiles it alongside the testbench -- one source of truth for what the
+configuration is.
+
+**The configurations**, grouped the way picorv32 is configured in
+practice so four runs cover nine parameters: *default*; *fast*
+(`BARREL_SHIFTER`, `TWO_CYCLE_ALU`, `TWO_CYCLE_COMPARE`); *small* (one
+register-file read port, one-bit-per-cycle shifts, no counters, no
+misalignment trap); and *compressed* (`COMPRESSED_ISA`,
+`LATCHED_MEM_RDATA`). Every configuration's own reference run was checked
+first. `ENABLE_REGS_16_31=0` was excluded because it fails 36 of 37 in
+Icarus -- the tests use registers up to x28, which that configuration
+removes -- which is the reference check doing its job. `fast` is the first
+run in which the clocked branch of `generate if (TWO_CYCLE_ALU)` -- the
+one D27 found being lowered alongside the other -- is the live one.
+
+**All 148 runs pass**, about 200,000 cycles. Again no Ictus defect.
+
+**The more useful result is about the test, not the simulator.** Two
+questions about a configuration are easy to conflate. *Does it exercise
+different logic?* Yes, whenever the override is applied: that logic runs
+in Ictus and must match Icarus. *Would the test notice if Ictus silently
+ignored the override?* Only if the override changes the bus trace --
+and that was measured rather than assumed, one parameter at a time, by
+diffing Icarus's traces against the default's: `BARREL_SHIFTER` and
+`TWO_STAGE_SHIFT` change 7 of 37 programs, `ENABLE_REGS_DUALPORT` 3,
+`TWO_CYCLE_ALU` 1, and `TWO_CYCLE_COMPARE`, the counters,
+`CATCH_MISALIGN`, `LATCHED_MEM_RDATA` and `COMPRESSED_ISA` none at all.
+
+Then the check that matters: drop every override on the Ictus side only.
+`fast` failed all 37, `small` 7 -- and **`compressed` passed.** On plain
+rv32i programs a picorv32 with `COMPRESSED_ISA` behaves identically to
+one without, so its compressed-instruction decoder -- a large, intricate
+part of the core -- never ran, and the test could not have told whether
+Ictus applied the override. The fix was to give it programs that need
+it: `bench/isa/build.sh` now also assembles the same tests for `rv32ic`,
+where about half the instructions come out 16-bit and 32-bit ones land on
+2-byte boundaries. Those fail 35 of 37 in Icarus on a core *without*
+`COMPRESSED_ISA`, pass all 37 with it, and pass all 37 in Ictus. Rerun
+with Ictus dropping its overrides, `compressed` now fails all 37.
+
+That the override *mechanism* works is established directly, not
+inferred from the ISA runs: the frontend's own tests check that a port
+width and a derived `localparam` follow an override, that overriding the
+conditions of three `generate if`s swaps all three branches, that
+picorv32 with `TWO_CYCLE_ALU=1` has its ALU in a clocked process and no
+combinational one, and each rejection.
+
+**Cost**: the four configurations are separate test functions so cargo
+runs them in parallel -- about 22 seconds of wall time, 80 of CPU. Each
+builds its Icarus testbench in its own directory for the same reason.
+
+**Next**: module instantiation. It is now the largest gap by a distance,
+and the thing between Ictus and the multiply/divide tests, picorv32's own
+firmware, and running a testbench directly rather than replaying one.

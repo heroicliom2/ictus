@@ -30,11 +30,31 @@
 //!      can't make (see `differential_picorv32.rs` on a core that
 //!      reproduced every bus cycle while executing nothing).
 //!
+//! **Configurations.** The programs run against four configurations of
+//! picorv32, each applied to Ictus with `lower_file_with_parameters` and
+//! to Icarus with generated `defparam`s. Two questions about them are easy
+//! to conflate, and were measured separately:
+//!
+//!   * *Does a configuration exercise different logic?* Yes, whenever an
+//!     override is applied: that configuration's logic then runs in Ictus
+//!     and has to match Icarus, whether or not its bus trace happens to
+//!     differ from the default's.
+//!   * *Would this test notice if Ictus silently ignored an override?*
+//!     Only when the override changes the bus trace. Measured one at a
+//!     time on these programs: `BARREL_SHIFTER` and `TWO_STAGE_SHIFT`
+//!     change 7 of 37 traces, `ENABLE_REGS_DUALPORT` 3, `TWO_CYCLE_ALU` 1,
+//!     and `TWO_CYCLE_COMPARE`, the counters, `CATCH_MISALIGN`,
+//!     `LATCHED_MEM_RDATA` and `COMPRESSED_ISA` none. With every override
+//!     dropped on the Ictus side, `fast` fails all 37 and `small` 7 --
+//!     and `compressed` passed, which is why it now runs rv32ic programs
+//!     instead. That the override mechanism itself works is established
+//!     directly, by ictus-frontend-verilog's own tests.
+//!
 //! **What isn't covered**: the multiply, divide and remainder tests, which
 //! need `ENABLE_MUL`/`ENABLE_DIV` -- separate modules picorv32
-//! instantiates, and a non-default parameter Ictus can't set yet. The
-//! images are built by `bench/isa/build.sh` and committed, so this test
-//! needs no RISC-V toolchain. See docs/decisions.md D28.
+//! instantiates, which Ictus doesn't support yet. The images are built
+//! by `bench/isa/build.sh` and committed, so this test needs no RISC-V
+//! toolchain. See docs/decisions.md D28 and D29.
 
 use ictus_ir::Module;
 use ictus_kernel::Simulation;
@@ -66,8 +86,77 @@ struct IcarusRun {
     registers: Vec<(usize, u64)>,
 }
 
+/// picorv32 exactly as vendored, every parameter at its default.
 #[test]
-fn picorv32_isa_tests_match_icarus_verilog() {
+fn default_configuration_matches_icarus_verilog() {
+    run_configuration("default", RV32I, &[]);
+}
+
+/// The "optimize for speed" direction: single-cycle barrel shifts, and a
+/// registered ALU and comparator. `TWO_CYCLE_ALU` selects the *other*
+/// branch of picorv32's `generate if (TWO_CYCLE_ALU)` -- the clocked ALU
+/// that decisions.md D27 found being lowered alongside the combinational
+/// one -- so this is the first run in which that branch is the live one.
+#[test]
+fn fast_configuration_matches_icarus_verilog() {
+    run_configuration(
+        "fast",
+        RV32I,
+        &[
+            ("BARREL_SHIFTER", 1),
+            ("TWO_CYCLE_ALU", 1),
+            ("TWO_CYCLE_COMPARE", 1),
+        ],
+    );
+}
+
+/// The "optimize for area" direction: one register-file read port, a
+/// one-bit-per-cycle shifter, no cycle/instruction counters, and no
+/// misalignment trap.
+#[test]
+fn small_configuration_matches_icarus_verilog() {
+    run_configuration(
+        "small",
+        RV32I,
+        &[
+            ("ENABLE_REGS_DUALPORT", 0),
+            ("TWO_STAGE_SHIFT", 0),
+            ("ENABLE_COUNTERS", 0),
+            ("ENABLE_COUNTERS64", 0),
+            ("CATCH_MISALIGN", 0),
+        ],
+    );
+}
+
+/// The compressed-instruction (RVC) front end, and reading memory data
+/// directly rather than latching it.
+///
+/// This runs the *rv32ic* images, not the rv32i ones, and the reason was
+/// measured rather than assumed: on plain rv32i programs a picorv32 with
+/// `COMPRESSED_ISA` produces a bus trace identical to the default's, so
+/// the compressed-instruction decoder never runs, and Ictus could have
+/// ignored the override entirely and still passed. Assembled for rv32ic,
+/// about half the instructions are 16-bit and 32-bit ones land on 2-byte
+/// boundaries; 35 of these 37 programs fail on a core *without*
+/// `COMPRESSED_ISA`.
+#[test]
+fn compressed_configuration_matches_icarus_verilog() {
+    run_configuration(
+        "compressed",
+        RV32IC,
+        &[("COMPRESSED_ISA", 1), ("LATCHED_MEM_RDATA", 1)],
+    );
+}
+
+/// The image sets `bench/isa/build.sh` produces.
+const RV32I: &str = "picorv32_isa";
+const RV32IC: &str = "picorv32_isa_c";
+
+/// Runs all 37 programs against picorv32 with `overrides` applied -- to
+/// Ictus through `lower_file_with_parameters`, and to Icarus through a
+/// generated module of `defparam`s, built from the same list so the two
+/// can't describe different configurations.
+fn run_configuration(label: &str, image_set: &str, overrides: &[(&str, u64)]) {
     if Command::new("iverilog").arg("-V").output().is_err() {
         eprintln!("iverilog not found on PATH; skipping differential test");
         return;
@@ -76,7 +165,7 @@ fn picorv32_isa_tests_match_icarus_verilog() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let design = root.join("bench/designs/picorv32/picorv32.v");
     let testbench = root.join("crates/ictus-cli/tests/fixtures/picorv32_isa_tb.v");
-    let images_dir = root.join("crates/ictus-cli/tests/fixtures/picorv32_isa");
+    let images_dir = root.join("crates/ictus-cli/tests/fixtures").join(image_set);
 
     let mut images: Vec<PathBuf> = std::fs::read_dir(&images_dir)
         .expect("the ISA test images should be committed; see bench/isa/build.sh")
@@ -90,9 +179,9 @@ fn picorv32_isa_tests_match_icarus_verilog() {
         "expected all 37 base-ISA test images; rebuild them with bench/isa/build.sh"
     );
 
-    let compiled = compile_testbench(&design, &testbench);
-    let module = ictus_frontend_verilog::lower_file(&design)
-        .expect("the vendored picorv32.v should lower cleanly");
+    let compiled = compile_testbench(&design, &testbench, label, overrides);
+    let module = ictus_frontend_verilog::lower_file_with_parameters(&design, overrides)
+        .unwrap_or_else(|e| panic!("picorv32 should lower in the {label} configuration: {e}"));
 
     let mut compared = 0usize;
     let mut failures = Vec::new();
@@ -121,7 +210,8 @@ fn picorv32_isa_tests_match_icarus_verilog() {
 
     assert!(
         failures.is_empty(),
-        "{} of {} picorv32 ISA tests disagree between Ictus and Icarus Verilog:\n  {}",
+        "{} of {} picorv32 ISA tests disagree between Ictus and Icarus Verilog in the {label} \
+         configuration:\n  {}",
         failures.len(),
         images.len(),
         failures.join("\n  ")
@@ -192,15 +282,45 @@ fn drive(sim: &mut Simulation, row: &TraceRow) {
     sim.set_all(&values);
 }
 
-fn compile_testbench(design: &Path, testbench: &Path) -> PathBuf {
-    let out_dir = std::env::temp_dir().join("ictus-differential-picorv32-isa");
+/// Compiles the testbench for one configuration.
+///
+/// Icarus's own override flag, `-P`, only reaches *root* modules, and
+/// picorv32 is instantiated inside the testbench. So the overrides are
+/// written out as hierarchical `defparam`s in a small generated module
+/// compiled alongside it. Writing them from the same list Ictus receives
+/// is the point: hardcoding picorv32's parameters into the testbench
+/// instead would duplicate its defaults, and a drift between the copies
+/// would make the "default" run quietly not be one.
+///
+/// Each configuration builds in its own directory, since cargo runs these
+/// tests in parallel.
+fn compile_testbench(
+    design: &Path,
+    testbench: &Path,
+    label: &str,
+    overrides: &[(&str, u64)],
+) -> PathBuf {
+    let out_dir = std::env::temp_dir()
+        .join("ictus-differential-picorv32-isa")
+        .join(label);
     std::fs::create_dir_all(&out_dir).expect("failed to create temp output dir");
     let compiled = out_dir.join("picorv32_isa_tb.vvp");
+
+    let mut defparams = String::from("module ictus_overrides;\n");
+    for (name, value) in overrides {
+        defparams.push_str(&format!(
+            "    defparam picorv32_isa_tb.uut.{name} = {value};\n"
+        ));
+    }
+    defparams.push_str("endmodule\n");
+    let overrides_file = out_dir.join("overrides.v");
+    std::fs::write(&overrides_file, defparams).expect("failed to write the overrides module");
 
     let compile = Command::new("iverilog")
         .arg("-o")
         .arg(&compiled)
         .arg(testbench)
+        .arg(&overrides_file)
         .arg(design)
         .output()
         .expect("failed to invoke iverilog");

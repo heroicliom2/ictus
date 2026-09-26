@@ -143,9 +143,14 @@ cycles) match Icarus on every traced port, every cycle, and on the final
 register file. That is the first time running more of the real design
 turned up nothing wrong.
 
-Next are top-level parameter overrides, so the same tests can run against
-picorv32's other configurations; module instantiation and Cranelift JIT
-codegen are the larger pieces after that.
+Top-level parameters can be overridden too (the equivalent of Icarus's
+`-P`), so the same suite also runs against three other configurations of
+picorv32 — tuned for speed, tuned for area, and with compressed
+instructions — 148 runs in all, every one matching Icarus.
+
+Module instantiation is the next large piece, and the first that changes
+what a design is to Ictus (so far, always one flat module); Cranelift JIT
+codegen comes after it.
 
 ## Workspace layout
 

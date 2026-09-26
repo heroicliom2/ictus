@@ -27,9 +27,10 @@ it against, on real designs instead of synthetic ones.
 - `isa/` — builds picorv32's own per-instruction tests (the riscv-tests
   rv32ui suite vendored in `designs/picorv32/tests/`) into flat memory
   images for Ictus's differential test,
-  `crates/ictus-cli/tests/differential_picorv32_isa.rs`. Run
+  `crates/ictus-cli/tests/differential_picorv32_isa.rs` — one set for
+  plain rv32i and one for rv32ic (with compressed instructions). Run
   `isa/build.sh` (needs `riscv64-unknown-elf-gcc`) only to regenerate
-  them; the images are committed. See docs/decisions.md D28.
+  them; the images are committed. See docs/decisions.md D28 and D29.
 
 ## Running it
 

@@ -166,7 +166,45 @@ impl<'a> std::ops::Deref for Ctx<'a> {
     }
 }
 
+/// Lowers the first ANSI-style module in `path`, with every parameter at
+/// its declared default. See `lower_file_with_parameters` to override
+/// some.
 pub fn lower_file(path: &Path) -> Result<Module, String> {
+    lower_file_with_parameters(path, &[])
+}
+
+/// Lowers the first ANSI-style module in `path`, overriding some of its
+/// top-level parameters -- what Icarus's `-P` and Verilator's `-G` do.
+///
+/// An override replaces the parameter's default *before* anything later
+/// in the module is resolved, so everything derived from it follows: a
+/// later parameter or `localparam` whose default reads it, a packed range
+/// sized by it, and -- the reason this exists -- which branch of every
+/// `generate if` is selected. picorv32's `BARREL_SHIFTER`, `TWO_CYCLE_ALU`
+/// and friends are exactly this kind of parameter, and without overrides
+/// only one side of each of their branches could ever be run.
+///
+/// Rejected rather than guessed at, each with an error naming it:
+///
+/// * a name that isn't a parameter of this module -- a typo would
+///   otherwise run the default configuration and look like success;
+/// * a `localparam`, which Verilog does not allow to be overridden;
+/// * a value that doesn't fit the parameter's declared width. Icarus
+///   silently truncates here (`-P...BARREL_SHIFTER=2` on a `[0:0]`
+///   parameter gives 0), which is exactly the kind of surprise a
+///   configuration flag shouldn't have;
+/// * the same name given twice.
+pub fn lower_file_with_parameters(
+    path: &Path,
+    overrides: &[(&str, u64)],
+) -> Result<Module, String> {
+    let mut override_map: HashMap<String, u64> = HashMap::new();
+    for &(name, value) in overrides {
+        if override_map.insert(name.to_string(), value).is_some() {
+            return Err(format!("parameter '{name}' is overridden more than once"));
+        }
+    }
+
     let defines = std::collections::HashMap::new();
     let includes: Vec<std::path::PathBuf> = vec![];
     let (tree, _) = parse_sv(path, &defines, &includes, false, false)
@@ -196,8 +234,9 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     // Resolved before anything else, matching source order (`module foo
     // #(parameters) (ports)`) and so that a parameter's default value can
     // reference an *earlier* parameter, per real Verilog elaboration
-    // order -- see lower_parameters.
-    let parameters = lower_parameters(module_node, &tree)?;
+    // order -- see lower_parameters. Overrides are applied as each
+    // parameter is reached, so later defaults see the overridden value.
+    let parameters = lower_parameters(module_node, &tree, &override_map)?;
 
     // Decides which branch of every `generate if` exists, now that the
     // parameters its conditions read are known. Every walk below consults
@@ -586,8 +625,10 @@ fn elaborate_generates(
 fn lower_parameters(
     module_node: &sv_parser::ModuleDeclarationAnsi,
     tree: &SyntaxTree,
+    overrides: &HashMap<String, u64>,
 ) -> Result<HashMap<String, (u64, u32)>, String> {
     let mut parameters = HashMap::new();
+    let mut applied = HashSet::new();
 
     for node in module_node.into_iter() {
         match node {
@@ -597,6 +638,10 @@ fn lower_parameters(
                     &param_decl.nodes.2,
                     tree,
                     &mut parameters,
+                    ParamKind::Overridable {
+                        overrides,
+                        applied: &mut applied,
+                    },
                 )?;
             }
             RefNode::LocalParameterDeclarationParam(local_decl) => {
@@ -605,13 +650,41 @@ fn lower_parameters(
                     &local_decl.nodes.2,
                     tree,
                     &mut parameters,
+                    ParamKind::Local { overrides },
                 )?;
             }
             _ => {}
         }
     }
 
+    // An override that matched nothing is a typo or a stale configuration,
+    // and running the default instead would look exactly like success.
+    let mut unknown: Vec<&str> = overrides
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !applied.contains(*name))
+        .collect();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "cannot override parameter(s) {unknown:?}: this module declares no parameter by \n             that name"
+        ));
+    }
+
     Ok(parameters)
+}
+
+/// Whether the declarations `resolve_param_assignments` is looking at can
+/// be overridden -- a `parameter` can, a `localparam` never can -- along
+/// with the overrides to apply and a record of which ones were used.
+enum ParamKind<'o> {
+    Overridable {
+        overrides: &'o HashMap<String, u64>,
+        applied: &'o mut HashSet<String>,
+    },
+    Local {
+        overrides: &'o HashMap<String, u64>,
+    },
 }
 
 /// Shared body for one `#(parameter ...)` or `localparam ...` declaration
@@ -626,6 +699,7 @@ fn resolve_param_assignments(
     assignments: &sv_parser::ListOfParamAssignments,
     tree: &SyntaxTree,
     parameters: &mut HashMap<String, (u64, u32)>,
+    mut kind: ParamKind,
 ) -> Result<(), String> {
     let width = match unwrap_node!(data_type, PackedDimensionRange) {
         Some(range_node) => lower_packed_range(range_node, tree, parameters)?,
@@ -642,14 +716,48 @@ fn resolve_param_assignments(
             .ok_or("parameter identifier unreadable")?
             .to_string();
 
-        let Some((_, default)) = &assignment.nodes.2 else {
-            return Err(format!(
-                "parameter '{name}' has no default value (overriding a parameter at \
-                 instantiation is not supported in v1)"
-            ));
+        let overridden = match &mut kind {
+            ParamKind::Local { overrides } => {
+                if overrides.contains_key(&name) {
+                    return Err(format!(
+                        "'{name}' is a localparam, which Verilog does not allow to be \
+                         overridden -- only a `parameter` can be"
+                    ));
+                }
+                None
+            }
+            ParamKind::Overridable { overrides, applied } => {
+                let value = overrides.get(&name).copied();
+                if value.is_some() {
+                    applied.insert(name.clone());
+                }
+                value
+            }
         };
-        let value = lower_constant_param_expression(default, tree, parameters)
-            .map_err(|e| format!("parameter '{name}' default: {e}"))?;
+
+        let value = match overridden {
+            Some(value) => {
+                if width < 64 && value >> width != 0 {
+                    return Err(format!(
+                        "override {name}={value} does not fit the parameter's {width}-bit \
+                         declared width"
+                    ));
+                }
+                // The default isn't evaluated at all when overridden, as in
+                // Verilog: it would be computed only to be thrown away.
+                value
+            }
+            None => {
+                let Some((_, default)) = &assignment.nodes.2 else {
+                    return Err(format!(
+                        "parameter '{name}' has no default value, and no override supplies \
+                         one"
+                    ));
+                };
+                lower_constant_param_expression(default, tree, parameters)
+                    .map_err(|e| format!("parameter '{name}' default: {e}"))?
+            }
+        };
 
         parameters.insert(name, (value, width));
     }

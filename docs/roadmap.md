@@ -1052,21 +1052,50 @@ offset, `jal`/`jalr`, `lui`/`auipc`.
 
 About 13 seconds in a debug build, with picorv32 lowered once and shared.
 
-**Next: top-level parameter overrides.** Every remaining step needs
-something new rather than more of the same, and this is the cheapest and
-most directly useful. picorv32's other single-module configurations --
-`BARREL_SHIFTER`, `TWO_CYCLE_ALU`, `TWO_CYCLE_COMPARE`,
-`ENABLE_REGS_DUALPORT=0` -- select the *other* branches of the
-`generate if`s that decisions.md D27 made real, and today nothing
-exercises those branches at all. With overrides, the same 37 programs run
-against each configuration, with Icarus given the matching `-P` flags.
-Simulators conventionally take top-level overrides from the command line
-(Icarus `-P`, Verilator `-G`), so this needs no instantiation.
+**Top-level parameter overrides are done, and the instruction tests now
+run against four configurations of picorv32.** Design in decisions.md
+D29.
 
-After that, the larger pieces: **module instantiation** (the biggest
-remaining language gap; it unlocks the multiply and divide tests, the
-prebuilt firmware, and running a testbench directly instead of replaying
-a trace), and **Cranelift codegen**, whose precondition from D12 -- a
+- `lower_file_with_parameters(path, &[(name, value)])` -- the equivalent
+  of Icarus `-P` / Verilator `-G`. An override replaces the default where
+  the parameter is resolved, so later parameters, `localparam`s, packed
+  ranges and `generate if` selections all follow it. Unknown names,
+  `localparam`s, values wider than the declared width (Icarus silently
+  truncates those) and duplicates are rejected.
+- Icarus's `-P` only reaches root modules and picorv32 sits inside the
+  testbench, so the test writes hierarchical `defparam`s from the same
+  list it gives Ictus -- one source of truth, and no copy of picorv32's
+  defaults in the testbench to drift.
+- Configurations: *default*, *fast* (`BARREL_SHIFTER`, `TWO_CYCLE_ALU`,
+  `TWO_CYCLE_COMPARE`), *small* (single register read port,
+  one-bit-per-cycle shifts, no counters, no misalignment trap) and
+  *compressed* (`COMPRESSED_ISA`, `LATCHED_MEM_RDATA`). All 148 runs pass,
+  about 200,000 cycles, in about 22 seconds with the four in parallel.
+  `fast` is the first run with the clocked branch of
+  `generate if (TWO_CYCLE_ALU)` live.
+- **What the test could actually see was measured, and one configuration
+  couldn't see anything.** Dropping every override on the Ictus side
+  failed `fast` (37 of 37) and `small` (7) but not `compressed`: on plain
+  rv32i programs `COMPRESSED_ISA` changes nothing observable, so the
+  compressed-instruction decoder never ran. `bench/isa/build.sh` now also
+  builds the tests for `rv32ic` -- about half the instructions 16-bit --
+  which fail 35 of 37 in Icarus without `COMPRESSED_ISA` and pass all 37
+  with it, in both simulators. With overrides dropped, `compressed` now
+  fails all 37 too.
+
+**Next: module instantiation.** It is the largest remaining gap by a
+distance, and the one thing between Ictus and the multiply/divide tests,
+picorv32's prebuilt firmware, and running a testbench directly instead of
+replaying a recorded one. It is also the first increment that changes
+what a *design* is to this codebase -- until now everything has been one
+flat module -- so it needs a real design pass before any code: whether
+instances are flattened into one `Module` at lowering time or kept as a
+hierarchy the kernel understands, how ports connect (by name, by
+position, to expressions rather than plain signals), how parameters pass
+down (the mechanism above is most of it), and how signal names stay
+unambiguous once two instances of one module both have a `count`.
+
+After that, **Cranelift codegen**, whose precondition from D12 -- a
 correctness baseline with a real design behind it -- is now met.
 
 The supported language subset is still intentionally narrow: single
@@ -1103,9 +1132,12 @@ assignment (`+=` and friends), no explicit sensitivity list, no `negedge`
 block, `generate if` but not `generate for`/`generate case`, no module
 instantiation, and at most one driving process or assignment per signal.
 The whole of picorv32.v lowers within
-this subset, and it runs picorv32's complete base-ISA test suite with
-every traced port and the final register file matching Icarus; Cranelift
-codegen is further out still.
+this subset, and it runs picorv32's complete base-ISA test suite -- in
+four configurations, including compressed instructions -- with every
+traced port and the final register file matching Icarus; Cranelift
+codegen is further out still. Top-level parameters can be overridden
+(`lower_file_with_parameters`); parameters of an instance can't, since
+there are no instances.
 
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
