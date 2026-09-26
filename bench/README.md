@@ -24,6 +24,12 @@ it against, on real designs instead of synthetic ones.
   `adapters/picorv32.sh` for a concrete example of why).
 - `run.sh` — the top-level harness. Discovers every adapter, runs each,
   times it, and prints a summary table.
+- `isa/` — builds picorv32's own per-instruction tests (the riscv-tests
+  rv32ui suite vendored in `designs/picorv32/tests/`) into flat memory
+  images for Ictus's differential test,
+  `crates/ictus-cli/tests/differential_picorv32_isa.rs`. Run
+  `isa/build.sh` (needs `riscv64-unknown-elf-gcc`) only to regenerate
+  them; the images are committed. See docs/decisions.md D28.
 
 ## Running it
 

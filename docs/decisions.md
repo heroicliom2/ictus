@@ -1479,3 +1479,74 @@ base ISA, no multiply, divide, interrupts or compressed instructions --
 and run through the existing trace harness. That is the longer, more
 demanding program the roadmap called for, and it no longer waits on
 parameter overrides or instantiation.
+
+## D28 — picorv32's own instruction tests, and a clean result
+
+**Decision**: run the riscv-tests rv32ui suite that ships with picorv32 --
+37 programs, one per base RV32I instruction, about 49,000 cycles in all --
+through the same trace-replay harness as D25, and commit the assembled
+images so the test suite needs no RISC-V toolchain.
+
+**The result is that nothing failed.** All 37 match Icarus on every
+traced port, every cycle, and on the final register file. That is worth
+recording plainly, because it is the first time running more of the real
+design found no defect: D25, D26 and D27 each came out of this same
+exercise. After them, Ictus runs picorv32 correctly across the complete
+base instruction set -- every ALU operation, both shift directions, every
+branch condition, byte/halfword/word loads and stores at every offset,
+`jal`/`jalr`, `lui`/`auipc`.
+
+**How the programs are built.** picorv32's firmware calls each test as a
+function; `bench/isa/start.S` is a two-instruction stub that jumps into
+one test and executes `ebreak` when it returns, so every run -- passing
+or failing -- ends with picorv32's `trap` output high, and the characters
+the test printed say which. `bench/isa/link.ld` lays code and data out
+contiguously from address 0, so the image loads with a plain
+`$readmemh`. `bench/isa/build.sh` builds all 37 for picorv32's *default*
+configuration (`-march=rv32i`), excluding the multiply, divide and
+remainder tests, which need `ENABLE_MUL`/`ENABLE_DIV`. The images are
+committed: regenerating them needs the toolchain, running them doesn't.
+
+**Three checks per program, in order.** First, that Icarus itself printed
+`<name>..OK` -- a reference run that fails its own test gives nothing
+trustworthy to compare against, and is reported as that rather than as an
+Ictus failure. Then every traced output, stopping at the first mismatch
+(after it, Ictus is being fed responses to requests it didn't make). Then
+the register file, which the ports can't vouch for (D25).
+
+**Two testbench details that would each have produced a wrong
+reference.** The memory honours byte strobes: the `sb` and `sh` tests
+fail against a whole-word memory *in Icarus*, and the earlier testbench
+didn't need strobes because its program only stored words. And the
+run-until-trap loop is written `trap !== 1'b1`, not `!trap`: before reset
+takes effect `trap` is `x`, `!x` is `x`, and a `while` on an `x`
+condition doesn't execute -- the first version ended every simulation at
+time zero after four cycles.
+
+**A clean pass has to be earned, so this was checked by breaking it.**
+The first attempt was a bad check, and the reason is instructive: making
+arithmetic right shift logical changed *nothing*, because a `$signed`
+operand arrives sign-extended across all 64 bits (D16), so a logical
+64-bit right shift of up to 32 places still pulls in copies of the sign
+bit, and the low 32 bits come out identical. The difference lives only in
+bits that are masked off. That is D20's reasoning working as designed --
+arithmetic shift is correct *because* of the sign extension -- but it
+meant the perturbation proved nothing. The second attempt made signed
+comparison unsigned, which does change mixed-sign results: exactly `bge`,
+`blt`, `slt` and `slti` failed, each at its first diverging cycle, while
+their unsigned counterparts (`bgeu`, `bltu`, `sltu`, `sltiu`) correctly
+still passed. The test is both sensitive and specific.
+
+**Cost**: about 13 seconds in a debug build, almost all of it Ictus
+ticking. picorv32 is lowered once and shared across all 37 runs, since
+lowering (about 3 seconds) would otherwise dominate.
+
+**Next.** Every remaining step needs something new rather than more of
+the same. The cheapest and most directly useful is **top-level parameter
+overrides**: picorv32's other single-module configurations --
+`BARREL_SHIFTER`, `TWO_CYCLE_ALU`, `TWO_CYCLE_COMPARE`,
+`ENABLE_REGS_DUALPORT=0` -- select the *other* branches of the
+`generate if`s D27 just made real, and the same 37 programs could then
+run against each configuration. Module instantiation is the larger step,
+unlocking the multiply and divide tests and the prebuilt firmware.
+Cranelift codegen now has the correctness baseline D12 required.

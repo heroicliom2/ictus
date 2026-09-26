@@ -1017,23 +1017,57 @@ Verified by breaking it: with elaboration disabled, the differential test
 because right after an edge a registered and a combinational `a + b`
 agree -- so a test sampling only after edges would have passed the bug.
 
-**Next: picorv32's own instruction tests.** A RISC-V cross-compiler is
-available here (`riscv64-unknown-elf-gcc`, targeting rv32 via
-`-march`/`-mabi`), so the per-instruction tests in
-`bench/designs/picorv32/tests/` can be assembled for picorv32's
-*default* configuration -- base ISA only, no multiply, divide, interrupts
-or compressed instructions -- and run through the existing trace harness
-by loading the image into the testbench memory with `$readmemh`. That is
-the longer, more demanding program the roadmap called for, and it no
-longer waits on anything else. The prebuilt `firmware.hex` does not fit
-yet: it was built for `COMPRESSED_ISA`, `ENABLE_MUL`, `ENABLE_DIV` and
-`ENABLE_IRQ`, and the multiply and divide units are separate modules, so
-it needs both top-level parameter overrides and module instantiation.
+**picorv32's own instruction tests all pass.** The riscv-tests rv32ui
+suite vendored with picorv32 -- 37 programs, one per base RV32I
+instruction, about 49,000 cycles -- runs through the trace-replay harness
+and matches Icarus on every traced port, every cycle, and on the final
+register file. Design in decisions.md D28.
+
+This is the first time running more of the real design found nothing
+wrong; D25-D27 all came out of the same exercise. The coverage is the
+whole base instruction set: every ALU operation, both shift directions,
+every branch condition, byte/halfword/word loads and stores at every
+offset, `jal`/`jalr`, `lui`/`auipc`.
+
+- `bench/isa/build.sh` assembles the tests for picorv32's *default*
+  configuration (`-march=rv32i`, so no multiply/divide/remainder) with a
+  two-instruction start stub that ends every run in `ebreak`, and writes
+  flat images that are committed -- running the test needs no RISC-V
+  toolchain.
+- Per program: Icarus must first print `<name>..OK` itself (a failing
+  reference is reported as that, not as an Ictus failure), then every
+  traced output is compared up to the first mismatch, then the register
+  file.
+- The testbench's memory honours byte strobes (the `sb`/`sh` tests fail
+  without them *in Icarus*), and its run-until-trap loop uses
+  `trap !== 1'b1` -- `!trap` is `x` before reset, which ended the first
+  version at time zero.
+- Checked by breaking it. Making signed comparison unsigned failed exactly
+  `bge`, `blt`, `slt` and `slti`, while `bgeu`/`bltu`/`sltu`/`sltiu`
+  still passed. A first attempt -- making arithmetic right shift logical
+  -- changed nothing at all, because a `$signed` operand is sign-extended
+  across 64 bits and the low 32 bits of a logical shift already carry
+  sign copies; that is the design working (D16/D20), but it meant the
+  perturbation proved nothing.
+
+About 13 seconds in a debug build, with picorv32 lowered once and shared.
+
+**Next: top-level parameter overrides.** Every remaining step needs
+something new rather than more of the same, and this is the cheapest and
+most directly useful. picorv32's other single-module configurations --
+`BARREL_SHIFTER`, `TWO_CYCLE_ALU`, `TWO_CYCLE_COMPARE`,
+`ENABLE_REGS_DUALPORT=0` -- select the *other* branches of the
+`generate if`s that decisions.md D27 made real, and today nothing
+exercises those branches at all. With overrides, the same 37 programs run
+against each configuration, with Icarus given the matching `-P` flags.
+Simulators conventionally take top-level overrides from the command line
+(Icarus `-P`, Verilator `-G`), so this needs no instantiation.
 
 After that, the larger pieces: **module instantiation** (the biggest
-remaining language gap, and what would let Ictus run a testbench
-directly), and **Cranelift codegen**, now that D12's precondition -- a
-correctness baseline with a real design behind it -- is met.
+remaining language gap; it unlocks the multiply and divide tests, the
+prebuilt firmware, and running a testbench directly instead of replaying
+a trace), and **Cranelift codegen**, whose precondition from D12 -- a
+correctness baseline with a real design behind it -- is now met.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes, combinational
@@ -1069,8 +1103,9 @@ assignment (`+=` and friends), no explicit sensitivity list, no `negedge`
 block, `generate if` but not `generate for`/`generate case`, no module
 instantiation, and at most one driving process or assignment per signal.
 The whole of picorv32.v lowers within
-this subset and both its bus behaviour and its register file match Icarus
-while it executes a program; Cranelift codegen is further out still.
+this subset, and it runs picorv32's complete base-ISA test suite with
+every traced port and the final register file matching Icarus; Cranelift
+codegen is further out still.
 
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential

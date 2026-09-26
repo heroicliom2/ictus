@@ -137,8 +137,15 @@ elaborated against the parameters, module instantiation is rejected
 rather than silently dropped, and a signal driven from more than one
 place is refused outright.
 
-Next is running picorv32's own per-instruction tests; module
-instantiation and Cranelift JIT codegen are the next large pieces.
+With that fixed, picorv32's own instruction-test suite runs too: all 37
+of its base-ISA programs (the riscv-tests rv32ui suite, about 49,000
+cycles) match Icarus on every traced port, every cycle, and on the final
+register file. That is the first time running more of the real design
+turned up nothing wrong.
+
+Next are top-level parameter overrides, so the same tests can run against
+picorv32's other configurations; module instantiation and Cranelift JIT
+codegen are the larger pieces after that.
 
 ## Workspace layout
 
