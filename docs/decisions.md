@@ -1765,3 +1765,106 @@ means implementing Verilog's context-determined expression widths
 properly, which needs its own design pass: it interacts with `$signed`
 sign extension, concatenation's self-determined operands, the ternary
 operator and assignment width.
+
+## D31 — Expression widths and signedness, made exact
+
+**Decision**: a frontend pass (`ictus-frontend-verilog`'s `width` module)
+implements IEEE 1800's context-determined expression widths (§11.6) and
+expression signedness (§11.8.1), rewriting each lowered expression so the
+kernel's plain 64-bit evaluation produces Verilog's value. Neither the
+kernel nor the IR changed.
+
+**How far the defect reached.** D30 found `(a - b) >> 1` wrong. Before
+designing anything, a wider probe against Icarus found seven forms wrong,
+all silently: a right shift, a comparison, `==`, `&&`, `!` or a shift
+amount applied to arithmetic that wrapped; `~a` into a wider target (the
+complement has to be taken *after* extending, so the high bits come out as
+ones); and a `$signed` operand mixed with an unsigned one, which Verilog
+evaluates as unsigned and Ictus sign-extended. Two more turned up while
+designing: `casez` items narrower than the selector were padded with
+don't-cares instead of zeros, and `8'b1??` -- three digits, eight bits --
+treated the five unwritten bits as don't-cares too. Ternaries,
+concatenation parts and all-signed arithmetic were already right.
+
+**The invariant.** Every expression evaluates to its value in *canonical
+form*: unsigned width W means nothing above bit W-1; signed width W means
+the full 64-bit sign extension of its W-bit pattern. The kernel's `Signed`
+already masks then sign-extends, and a select already masks, so both forms
+can be produced with existing IR. Given canonical operands, almost every
+operator yields a canonical result on its own; only add, subtract,
+multiply and left shift can carry bits past the width (plus `~` of a
+signed value, since the kernel masks `BitwiseNot`). Those are the only
+nodes the pass ever wraps.
+
+**Where the width comes from**, top-down per §11.6: an assignment
+evaluates its right-hand side at the wider of the target and itself; a
+context-determined operand (either side of `+ - * & | ^`, the left of a
+shift, the operand of `~`, both arms of `?:`) takes its parent's width;
+a comparison sizes its two sides to each other, whatever surrounds it;
+and a self-determined operand -- a shift amount, the operands of `&&`,
+`||`, `!` and reductions, a condition, an index, a concatenation part --
+takes its own. The cut happens at the width a node is *evaluated* at, not
+its own: `(a - b) >> 1` into a 16-bit target subtracts at 16 bits and
+gives 32767 for `3 - 5`, exactly as Icarus does.
+
+**Only where high bits are read.** A cut is needed only where something
+*reads* high bits: the operand of a right shift, a comparison, a truth
+test, an index or shift amount, a `case` selector. Add, subtract,
+multiply, left shift, the bitwise operators, `~` and the arms of `?:` all
+compute their low W bits from their operands' low W bits, so when only
+low bits are demanded, nothing below needs cutting -- and an assignment
+only demands low bits, because the kernel masks every write. So the
+ordinary `x <= a + b` gets no wrapper at all.
+
+This came from a performance concern that turned out to be wrong: the ISA
+suite looked 30% slower after the first version, which wrapped every
+arithmetic node. An interleaved A/B against the previous commit on the
+same machine showed no measurable difference in either lowering time or
+tick rate; the earlier numbers had been taken under lighter system load.
+The demand-driven version was kept anyway, because it is exact and
+produces less IR, not because it fixed a regression.
+
+**Two cases the design had to get right on purpose.** `{cout, sum} <= a +
+b` is split into one slice per target part; sizing each slice separately
+would add at 8 bits and lose the carry, so the value is sized against the
+whole target *before* splitting. And a `case` compares its selector and
+items at the width of the widest of them (§12.5): the selector is
+computed at that width -- keeping a carry when an item is wider -- and a
+wildcard item narrower than it has its care mask extended, so the bits
+above it must be zero.
+
+**Mixed signedness is rejected, not guessed.** Verilog makes an
+expression mixing signed and unsigned operands unsigned -- but an unsized
+decimal literal like `1` counts as *signed*, and the lowered IR doesn't
+record which literals were unsized. So `$signed(a) + 1` (signed in
+Verilog) and `$signed(a) + b` (unsigned) look identical here, and either
+guess is silently wrong for the other. Both are now errors that say so;
+`$signed(a) + $signed(b)` and `a + b` are the explicit spellings. This
+corrects D16, which argued that passing a `$signed` operand through `+`,
+`==` and friends was always safe -- it isn't when the other operand is
+unsigned -- and generalizes D21's rejection of mixed ordering comparisons.
+picorv32 never mixes. Tracking literal signedness would lift this, and is
+the natural next step for signedness.
+
+**Signedness is now the whole expression's.** `apply_binary_op` used to
+decide whether a comparison or `>>>` was signed by looking only at whether
+the operand was literally a `$signed(...)`, so `($signed(a) + $signed(b))
+>>> n` became a logical shift. It now uses §11.8.1's rule through
+`width::is_signed`. And `expr_width` is now the pass's self-determined
+width, so the frontend has one set of width rules rather than two -- which
+also closed D24's remaining gap: a shift is its left operand's width, so a
+shift result can now be a concatenation part.
+
+**Verified** by `differential_width_context.rs`: eighteen outputs, ten
+vectors each, covering every broken form plus the carry, `case` and
+`casez` cases, against Icarus -- until this landed it was D30's preserved
+reproduction, marked `#[ignore]`. A structural test pins where cuts do and
+don't appear. Checked by breaking it twice: disabling truncation, and
+letting a right shift's operand go uncut, each fail the first check with
+the original defect (255 where Icarus has 127). picorv32 in all five
+configurations is unchanged, as it should be: its arithmetic goes straight
+into registers.
+
+**Not covered**: constant-expression folding (parameter values,
+`localparam`s) still evaluates on 64 bits without these rules; nothing
+found so far depends on it, but it is the same class of question.

@@ -120,16 +120,26 @@
 //! reason both exist: until then every branch was lowered, and picorv32
 //! was right only by coincidence.
 //!
+//! Every expression is sized and typed by the `width` module before it
+//! reaches the IR -- IEEE 1800's context-determined widths (§11.6) and
+//! expression signedness (§11.8.1) -- so that the kernel's plain 64-bit
+//! evaluation gives Verilog's value; see that module's comment and
+//! decisions.md D31. It is applied where each assignment, condition and
+//! `case` is built, not afterwards: `{cout, sum} <= a + b` is split into
+//! slices, and has to be sized against the whole target first to keep its
+//! carry.
+//!
 //! Widen this as later phases need more of the language. The whole of
-//! phase 0's picorv32 benchmark design lowers through here cleanly (225
-//! signals) and then *executes* correctly: replayed against a recorded
-//! Icarus trace, every traced port matches cycle for cycle and the
-//! register file matches at the end. Getting there turned up four defects
-//! that each let the design lower, run, and produce plausible output
-//! while being wrong -- see decisions.md D25 and D26. Remaining gaps, in
-//! rough order of value: module instantiation, compound assignment
-//! (`+=`), and shift results still having no width (see `expr_width` and
-//! decisions.md D24).
+//! phase 0's picorv32 benchmark design lowers through here cleanly and
+//! *executes* correctly -- its base, compressed and divide instructions in
+//! five configurations, matching Icarus on every traced port, every cycle,
+//! and on the register file. Getting there turned up defects that each let
+//! the design lower, run, and produce plausible output while being wrong;
+//! see decisions.md D25 through D31. Remaining gaps, in rough order of
+//! value: `for` loops and indexed part-selects (picorv32's multiplier),
+//! `$unsigned`, and compound assignment (`+=`).
+
+mod width;
 
 use ictus_ir::{
     Assign, CaseArm, CaseValue, ClockedProcess, CombProcess, Direction, Expr, Module, Signal,
@@ -570,8 +580,17 @@ fn lower_instances<'a>(
                                  which v1 doesn't support -- write `.{port}({port})`"
                             ));
                         };
+                        // A connection behaves as an assignment to the
+                        // port, so it is sized like one (see `width`). A
+                        // plain signal -- what an output must be -- comes
+                        // back unchanged, so aliasing still sees it.
+                        let port_width = child.signals[port_id].width;
                         let expr = match &paren.nodes.1 {
-                            Some(expr) => Some(lower_expr(expr, tree, ctx)?),
+                            Some(expr) => Some(width::for_assignment(
+                                lower_expr(expr, tree, ctx)?,
+                                port_width,
+                                ctx,
+                            )?),
                             None => None,
                         };
                         if connections.insert(port_id, expr).is_some() {
@@ -2017,7 +2036,12 @@ fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Ctx) -> Result<Ve
 /// (`nodes.5`) from the last clause backward, then wrapping the first
 /// `if` around the result.
 fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Ctx) -> Result<Stmt, String> {
-    let cond = lower_cond_predicate(&cond_stmt.nodes.2.nodes.1, tree, module)?;
+    // A condition is self-determined: tested at its own width, so
+    // `if (a + b)` is false when the sum wraps to zero. See `width`.
+    let cond = width::self_determined(
+        lower_cond_predicate(&cond_stmt.nodes.2.nodes.1, tree, module)?,
+        module,
+    )?;
     let then_branch = lower_statement_or_null(&cond_stmt.nodes.3, tree, module)?;
 
     let mut else_branch = match &cond_stmt.nodes.5 {
@@ -2025,7 +2049,8 @@ fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Ctx) -
         None => Vec::new(),
     };
     for (_else_kw, _if_kw, paren, stmt) in cond_stmt.nodes.4.iter().rev() {
-        let elseif_cond = lower_cond_predicate(&paren.nodes.1, tree, module)?;
+        let elseif_cond =
+            width::self_determined(lower_cond_predicate(&paren.nodes.1, tree, module)?, module)?;
         let elseif_then = lower_statement_or_null(stmt, tree, module)?;
         else_branch = vec![Stmt::If {
             cond: elseif_cond,
@@ -2089,10 +2114,12 @@ fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Ctx) 
                     .0
                     .contents()
                     .into_iter()
-                    .map(|item_expr| lower_case_value(&item_expr.nodes.0, tree, module, wildcard_mode))
+                    .map(|item_expr| {
+                        lower_case_value(&item_expr.nodes.0, tree, module, wildcard_mode)
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let body = lower_statement_or_null(&nd.nodes.2, tree, module)?;
-                arms.push(CaseArm { values, body });
+                arms.push((values, body));
             }
             sv_parser::CaseItem::Default(d) => {
                 default = lower_statement_or_null(&d.nodes.2, tree, module)?;
@@ -2100,11 +2127,68 @@ fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Ctx) 
         }
     }
 
+    // IEEE 1800 §12.5: the selector and every item are compared at the
+    // width of the widest of them all. That matters two ways. A selector
+    // like `a + b` has to be computed at that width -- keeping a carry
+    // when an item is wider, dropping it when none is (see `width`). And
+    // a wildcard item narrower than the rest is *zero-extended*, so the
+    // bits above it must be zero in the selector: `8'b1??` against a
+    // 16-bit selector only matches when bits 3 through 15 are clear. Its
+    // care mask used to stop at the digits written, which ignored those
+    // bits instead.
+    let mut exprs = vec![selector];
+    let mut wildcard_width = 0;
+    for (values, _) in &arms {
+        for (value, item_width) in values {
+            match value {
+                CaseValue::Exact(expr) => exprs.push(expr.clone()),
+                CaseValue::Wildcard { .. } => {
+                    wildcard_width = wildcard_width.max(item_width.unwrap_or(0));
+                }
+            }
+        }
+    }
+    let (mut prepared, joint_width) = width::jointly(exprs, wildcard_width, module)?;
+    let mut prepared = prepared.drain(..);
+    let selector = prepared.next().expect("the selector was the first expression");
+
+    let joint_mask = mask_to(u64::MAX, joint_width);
+    let arms = arms
+        .into_iter()
+        .map(|(values, body)| {
+            let values = values
+                .into_iter()
+                .map(|(value, item_width)| match value {
+                    CaseValue::Exact(_) => {
+                        CaseValue::Exact(prepared.next().expect("one prepared expression per item"))
+                    }
+                    CaseValue::Wildcard { value, care_mask } => {
+                        let own = mask_to(u64::MAX, item_width.unwrap_or(joint_width));
+                        CaseValue::Wildcard {
+                            value,
+                            care_mask: care_mask | (joint_mask & !own),
+                        }
+                    }
+                })
+                .collect();
+            CaseArm { values, body }
+        })
+        .collect();
+
     Ok(Stmt::Case {
         selector,
         arms,
         default,
     })
+}
+
+/// The low `width` bits of `value`.
+fn mask_to(value: u64, width: u32) -> u64 {
+    if width >= 64 {
+        value
+    } else {
+        value & ((1u64 << width) - 1)
+    }
 }
 
 /// Lowers one `casez`/`casex` (or plain `case`) item value. When
@@ -2119,14 +2203,15 @@ fn lower_case_value(
     tree: &SyntaxTree,
     module: &Ctx,
     wildcard_mode: bool,
-) -> Result<CaseValue, String> {
+) -> Result<(CaseValue, Option<u32>), String> {
     if wildcard_mode {
         if let Some(binary) = as_binary_number(expr) {
-            let (value, care_mask) = lower_wildcard_binary(binary, tree)?;
-            return Ok(CaseValue::Wildcard { value, care_mask });
+            let width = lower_size(&binary.nodes.0, tree)?;
+            let (value, care_mask) = lower_wildcard_binary(binary, tree, width)?;
+            return Ok((CaseValue::Wildcard { value, care_mask }, Some(width)));
         }
     }
-    Ok(CaseValue::Exact(lower_expr(expr, tree, module)?))
+    Ok((CaseValue::Exact(lower_expr(expr, tree, module)?), None))
 }
 
 fn as_binary_number(expr: &sv_parser::Expression) -> Option<&sv_parser::BinaryNumber> {
@@ -2153,7 +2238,11 @@ fn as_binary_number(expr: &sv_parser::Expression) -> Option<&sv_parser::BinaryNu
 /// plain binary literals elsewhere in this frontend, rejects `?`/`x`/`z`
 /// characters outright, so wildcard literals need their own parser rather
 /// than reusing `lower_number`.
-fn lower_wildcard_binary(binary: &sv_parser::BinaryNumber, tree: &SyntaxTree) -> Result<(u64, u64), String> {
+fn lower_wildcard_binary(
+    binary: &sv_parser::BinaryNumber,
+    tree: &SyntaxTree,
+    width: u32,
+) -> Result<(u64, u64), String> {
     let text = locate_text(&binary.nodes.2.nodes.0, tree)?;
     let digits = strip_underscores(text);
 
@@ -2177,6 +2266,14 @@ fn lower_wildcard_binary(binary: &sv_parser::BinaryNumber, tree: &SyntaxTree) ->
                 ))
             }
         }
+    }
+    // A literal with fewer digits than its width (`8'b1??`) is zero-extended
+    // to it, so the bits the digits don't reach are zeros that must match --
+    // not don't-cares. Wildcards only ever come from `?`, `x` or `z` digits
+    // actually written.
+    let written = u32::try_from(digits.len()).unwrap_or(u32::MAX);
+    if written < width {
+        care_mask |= mask_to(u64::MAX, width) & !mask_to(u64::MAX, written);
     }
     Ok((value, care_mask))
 }
@@ -2264,8 +2361,9 @@ fn lower_procedural_assign(
         else {
             unreachable!("lower_array_index always returns an ArrayRead");
         };
-        let index = *index;
-        let value = lower_expr(value_expr, tree, module)?;
+        let index = width::self_determined(*index, module)?;
+        let element_width = module.signals[target].width;
+        let value = width::for_assignment(lower_expr(value_expr, tree, module)?, element_width, module)?;
         return Ok(vec![if blocking {
             Stmt::BlockingArrayAssign { array, index, value }
         } else {
@@ -2276,7 +2374,14 @@ fn lower_procedural_assign(
     let target_range = lower_select_target_range(lvalue, target_name, tree, module)?;
     check_target_range(target_range, target, target_name, module)?;
 
-    let value = lower_expr(value_expr, tree, module)?;
+    // Sized against what is actually written: the selected bits, or the
+    // whole signal. See `width`.
+    let written_width = match target_range {
+        Some((msb, lsb)) => msb - lsb + 1,
+        None => module.signals[target].width,
+    };
+    let value =
+        width::for_assignment(lower_expr(value_expr, tree, module)?, written_width, module)?;
 
     Ok(vec![if blocking {
         Stmt::BlockingAssign {
@@ -2356,6 +2461,13 @@ fn lower_concat_target_assign(
     }
 
     let mut shift: u32 = resolved.iter().map(|(_, _, width)| width).sum();
+
+    // The value is sized against the *whole* target, before it is split:
+    // `{cout, sum} <= a + b` with 8-bit `a` and `b` adds at 9 bits, and the
+    // carry lands in `cout`. Sizing each slice on its own would compute the
+    // sum at 8 bits and lose it. See `width`.
+    let value = width::for_assignment(value, shift, module)?;
+
     let mut stmts = Vec::with_capacity(resolved.len());
     for (target, target_range, width) in resolved {
         let msb = shift - 1;
@@ -2477,7 +2589,11 @@ fn lower_net_decl_assigns(
         }
         assigns.push(Assign {
             target,
-            value: lower_expr(value_expr, tree, module)?,
+            value: width::for_assignment(
+                lower_expr(value_expr, tree, module)?,
+                module.signals[target].width,
+                module,
+            )?,
         });
     }
     Ok(assigns)
@@ -2532,7 +2648,11 @@ fn lower_continuous_assign(
         ));
     }
 
-    let value = lower_expr(&assignment.nodes.2, tree, module)?;
+    let value = width::for_assignment(
+        lower_expr(&assignment.nodes.2, tree, module)?,
+        module.signals[target].width,
+        module,
+    )?;
 
     Ok(Assign { target, value })
 }
@@ -2561,10 +2681,17 @@ fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> 
                 // exactly, including how the kernel wraps it on a `u64`.
                 "-" => {
                     let width = expr_width(&operand, module)?;
-                    Ok(Expr::Sub(
-                        Box::new(Expr::Literal { value: 0, width }),
-                        Box::new(operand),
-                    ))
+                    // The zero takes the operand's signedness too, or
+                    // `-$signed(x)` would be a signed operand subtracted
+                    // from an unsigned zero -- which `width` rejects as
+                    // mixed -- when it is simply a signed negation.
+                    let zero = Expr::Literal { value: 0, width };
+                    let zero = if width::is_signed(&operand) {
+                        Expr::Signed(Box::new(zero), width)
+                    } else {
+                        zero
+                    };
+                    Ok(Expr::Sub(Box::new(zero), Box::new(operand)))
                 }
                 // Unary plus changes nothing.
                 "+" => Ok(operand),
@@ -2858,8 +2985,8 @@ fn lower_string_literal(
 fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> {
     let is_ordering_comparison = matches!(op_text, "<" | "<=" | ">" | ">=");
     if is_ordering_comparison {
-        let lhs_signed = matches!(lhs, Expr::Signed(..));
-        let rhs_signed = matches!(rhs, Expr::Signed(..));
+        let lhs_signed = width::is_signed(&lhs);
+        let rhs_signed = width::is_signed(&rhs);
         match (lhs_signed, rhs_signed) {
             // Both signed: a real signed comparison, built from the one
             // `SignedLt` variant plus operand-swapping and negation.
@@ -2899,7 +3026,7 @@ fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> 
     // bits down into the result instead of zeros. Rejected rather than
     // silently producing that, the same way an ordering comparison of a
     // `Signed` operand is above; no real design has needed it yet.
-    if op_text == ">>" && matches!(lhs, Expr::Signed(..)) {
+    if op_text == ">>" && width::is_signed(&lhs) {
         return Err(
             "a logical right shift of a $signed(...) value (`$signed(x) >> n`) is not \
              supported in v1 -- use `>>>` for an arithmetic (sign-replicating) shift, which \
@@ -2920,14 +3047,14 @@ fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> 
         // `>>>` differs from `>>` *only* for a signed left operand; on an
         // unsigned one Verilog defines it as an ordinary logical shift, so
         // that's what it lowers to -- not an approximation, the LRM's own
-        // rule. The `Signed` check is deliberately shallow (the operand
-        // itself, not a search through it), matching the ordering-comparison
-        // guard above: picorv32 always writes the direct
-        // `$signed(...) >>> n` form, so a `Signed` value buried deeper
-        // (`($signed(a) + 1) >>> n`) isn't detected -- and would lower to a
-        // logical shift. Worth revisiting if a real design ever writes that.
+        // rule. Signedness is the whole expression's, per IEEE 1800
+        // §11.8.1 (`width::is_signed`), not just whether the operand is
+        // literally a `$signed(...)`: `($signed(a) + $signed(b)) >>> n` is
+        // a signed shift too. (This check, and the comparison one above,
+        // used to look only at the operand itself and missed that case;
+        // see decisions.md D31.)
         ">>>" => {
-            if matches!(lhs, Expr::Signed(..)) {
+            if width::is_signed(&lhs) {
                 Ok(Expr::AShr(Box::new(lhs), Box::new(rhs)))
             } else {
                 Ok(Expr::Shr(Box::new(lhs), Box::new(rhs)))
@@ -3266,87 +3393,19 @@ fn lower_multiple_concatenation(
     Ok(Expr::Concat(replicated))
 }
 
-/// Computes a statically-known bit width for an already-lowered
-/// expression. Two callers need it: packing concatenation operands into
-/// their correct bit positions (see `Expr::Concat`'s doc comment in
-/// `ictus_ir`), and telling a unary operator how many bits it covers
-/// (`~x` preserves its operand's width; a reduction folds exactly its
-/// operand's bits).
+/// The self-determined width of an already-lowered expression -- what
+/// IEEE 1800 §11.6 gives it on its own. Two callers need it while an
+/// expression is being built: packing concatenation operands into their
+/// bit positions, and telling a unary operator how many bits it covers.
 ///
-/// Only expression forms with an exactly-known width are accepted; the
-/// rest are rejected rather than guessed at, since a wrong width here is
-/// a silently wrong *value* at either call site.
+/// This is `width::self_type`'s width, so there is one set of width rules
+/// in the frontend rather than two that can drift. That also closed the
+/// gap this function used to have (decisions.md D24): a shift is its left
+/// operand's width, which is now known, so a shift result can be a
+/// concatenation part. An expression mixing `$signed(...)` with unsigned
+/// operands is rejected here too; see `width`'s module comment.
 pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
-    match expr {
-        Expr::Literal { width, .. } => Ok(*width),
-        Expr::Ref(id) => Ok(module.signals[*id].width),
-        Expr::Select { msb, lsb, .. } => Ok(msb - lsb + 1),
-        Expr::DynamicBitSelect { .. } => Ok(1),
-        // One element of an array is as wide as the array's element width.
-        Expr::ArrayRead { array, .. } => Ok(module.signals[*array].width),
-        Expr::Concat(parts) => Ok(parts.iter().map(|(_, w)| w).sum()),
-        Expr::Ternary { then_val, else_val, .. } => {
-            Ok(expr_width(then_val, module)?.max(expr_width(else_val, module)?))
-        }
-        // `$signed(...)`'s own natural width, for concatenation-packing
-        // purposes, is exactly the width already recorded on it --
-        // concatenation uses each operand's *self-determined* width
-        // regardless of signedness; only an assignment-like context
-        // (outside this function's concern) triggers sign extension.
-        Expr::Signed(_, width) => Ok(*width),
-        // `BitwiseNot`'s stored width *is* its own result's width (`~x`
-        // preserves `x`'s width). A reduction operator's stored width is
-        // its *operand's* width (needed for evaluation, see
-        // `ictus_kernel::eval_expr`) -- the reduction's own result is
-        // always exactly 1 bit, regardless of what it reduced.
-        Expr::BitwiseNot(_, width) => Ok(*width),
-        // Every comparison, logical, and reduction operator is *defined*
-        // by Verilog to produce exactly 1 bit (0 or 1), whatever the
-        // width of what it compared or reduced.
-        Expr::Not(_)
-        | Expr::Eq(..)
-        | Expr::Ne(..)
-        | Expr::Lt(..)
-        | Expr::Le(..)
-        | Expr::Gt(..)
-        | Expr::Ge(..)
-        | Expr::SignedLt(..)
-        | Expr::LogicalAnd(..)
-        | Expr::LogicalOr(..)
-        | Expr::ReduceAnd(..)
-        | Expr::ReduceOr(..)
-        | Expr::ReduceXor(..) => Ok(1),
-        // Verilog gives every binary bitwise and arithmetic operator the
-        // same *self-determined* width: the wider of its two operands.
-        // Both operands are extended to that width before the operation,
-        // and the result is truncated back down to it.
-        //
-        // For the bitwise three that is exact in the strongest sense --
-        // neither operand can contribute a set bit above its own width,
-        // so nothing is lost either way. For the arithmetic three it is
-        // Verilog's rule but also a real trap worth naming: `{a + b, c}`
-        // with 8-bit `a` and `b` packs 8 bits and *discards the carry*,
-        // so an adder's 9th bit has to be asked for by widening an
-        // operand (`{1'b0, a} + {1'b0, b}`) rather than appearing on its
-        // own. This matches Verilog rather than second-guessing it, and
-        // the truncation genuinely happens: every consumer of this width
-        // masks the evaluated value back down to it -- concatenation
-        // packing, `BitwiseNot`, and the reduction operators all do (see
-        // `ictus_kernel::eval_expr`).
-        Expr::And(lhs, rhs)
-        | Expr::Or(lhs, rhs)
-        | Expr::Xor(lhs, rhs)
-        | Expr::Add(lhs, rhs)
-        | Expr::Sub(lhs, rhs)
-        | Expr::Mul(lhs, rhs) => Ok(expr_width(lhs, module)?.max(expr_width(rhs, module)?)),
-        other => Err(format!(
-            "this expression's width can't be determined in v1, which is needed here either \
-             to pack it into a concatenation or to know how many bits a unary operator \
-             covers (the shift operators are the notable gap: Verilog gives `a << b` its \
-             *left* operand's width, a different rule from the binary operators above, and \
-             that isn't implemented): {other:?}"
-        )),
-    }
+    width::self_type(expr, module).map(|ty| ty.width)
 }
 
 /// Extracts a `(msb, lsb)` write range from an assignment target that uses

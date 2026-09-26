@@ -1119,36 +1119,58 @@ A correction: the previous entry said instantiation would let Ictus run a
 testbench directly. It doesn't -- a testbench needs `initial` blocks,
 delays, event waits and `$display` -- so the trace-replay harness stays.
 
-**Next: a silent-wrong-answer defect in expression widths, found while
-adding unary minus.** The kernel evaluates every expression on a 64-bit
-word and relies on masking at the final write. That is correct for
-operators whose low bits depend only on low bits -- add, subtract,
-multiply, left shift, bitwise -- and wrong for operators that read *high*
-bits -- right shifts, comparisons, equality -- applied to an arithmetic
-result that wrapped. With 8-bit `a = 3`, `b = 5`, Verilog gives
-`(a - b) >> 1` as 127 and Ictus gives 255; `(a - b) < 8'hFF` is 1 in
-Verilog and 0 in Ictus. It predates this work -- addition, subtraction and
-multiplication have always behaved this way -- and nothing in the suite
-caught it, picorv32 included, because picorv32's arithmetic goes straight
-into registers. It is preserved as a runnable reproduction,
-`ictus-cli/tests/differential_width_context.rs`, marked `#[ignore]`.
+**Expression widths and signedness are now exact -- fixing a family of
+silent wrong answers found while adding unary minus.** Design in
+decisions.md D31.
 
-The fix is Verilog's context-determined expression widths (IEEE 1800
-§11.6): an operator's operands are evaluated at a width decided by the
-whole expression and its destination, not just the operator. That needs a
-design pass before code -- it interacts with `$signed` sign extension,
-concatenation's self-determined operands, the ternary operator and
-assignment width -- and it takes priority over new language coverage,
-because a simulator that gives quietly wrong answers is worse than one
-that refuses to run.
+The kernel evaluates on 64-bit words and masks a value only when it is
+written. That was right for operators whose low bits depend only on their
+operands' low bits, and wrong wherever something *read high bits* of
+arithmetic that wrapped. A probe against Icarus before designing found
+seven forms wrong -- a right shift, a comparison, `==`, `&&`, `!` or a
+shift amount applied to wrapped arithmetic, `~a` into a wider target, and
+`$signed` mixed with unsigned -- plus two `casez` sizing gaps found while
+designing.
 
-After it, the multiplier: `picorv32_pcpi_mul` uses nested `for` loops over
+- A frontend pass, `ictus-frontend-verilog`'s `width` module, implements
+  IEEE 1800 §11.6 (context-determined widths) and §11.8.1 (signedness).
+  It sizes every expression top-down by its context and cuts only the
+  operators that can carry past a width -- add, subtract, multiply, left
+  shift -- back to the width they are *evaluated* at. The kernel and IR
+  are unchanged: the cuts are ordinary selects and `$signed` extensions.
+- Cuts appear only where high bits are read (a right shift's operand, a
+  comparison, a truth test, an index, a `case` selector). An assignment
+  only reads low bits -- the kernel masks every write -- so ordinary
+  `x <= a + b` has no wrapper at all.
+- `{cout, sum} <= a + b` keeps its carry (the value is sized against the
+  whole target before it is split into slices); a `case` compares at the
+  width of its widest item; narrower `casez` items are zero-extended.
+- **Mixed signed/unsigned operands are rejected.** Verilog makes them
+  unsigned, but an unsized literal like `1` counts as signed and the IR
+  can't tell which literals were unsized, so `$signed(a) + 1` and
+  `$signed(a) + b` can't be told apart; guessing either way is silently
+  wrong for the other. picorv32 never mixes.
+- Signedness is now the whole expression's, so
+  `($signed(a) + $signed(b)) >>> n` is an arithmetic shift, and
+  `expr_width` shares the pass's rules -- which also means a shift result
+  can now be a concatenation part.
+
+Verified by `ictus-cli/tests/differential_width_context.rs` -- eighteen
+outputs by ten vectors against Icarus, including every broken form; until
+this landed it was D30's preserved reproduction, marked `#[ignore]`.
+Breaking the pass in two different ways brings the original defect back
+immediately. picorv32 in all five configurations is unaffected, and an
+A/B measurement against the previous commit found no performance cost.
+
+**Next: the multiplier.** `picorv32_pcpi_mul` uses nested `for` loops over
 `integer` variables, indexed part-selects (`next_rd[j +: CARRY_CHAIN]`) on
 both sides of an assignment, and `$unsigned`. The loops have constant
 bounds, so they can be unrolled at lowering time, which turns the indexed
 part-selects into ordinary constant ones. That completes picorv32's M
-extension; `picorv32_pcpi_fast_mul` additionally needs `$unsigned`. Then
-**Cranelift codegen**, whose precondition from D12 is met.
+extension -- the four multiply tests are already built and waiting in the
+rv32im image set -- and `picorv32_pcpi_fast_mul` additionally needs
+`$unsigned`. Then **Cranelift codegen**, whose precondition from D12 is
+met.
 
 The supported language subset is still intentionally narrow:
 ANSI-style modules -- the first in the file is the top, and the rest can
@@ -1165,7 +1187,7 @@ concatenation (plain and replication) and ternary on reads only -- with
 comparison/logical/reduction results and binary bitwise/arithmetic
 results, not just literals/refs/selects, valid as concatenation operands
 (each at Verilog's self-determined width, so an arithmetic carry is
-truncated away), but *not* a shift result -- a constant
+truncated away), shift results included -- a constant
 bit-select/part-select --
 or a concatenation of such -- as a procedural assignment target but not a
 continuous (`assign`) one and not with a variable index (though the
@@ -1186,9 +1208,9 @@ assignment (`+=` and friends), no explicit sensitivity list, no `negedge`
 block, `generate if` but not `generate for`/`generate case`, named
 module instantiation but no positional ports or parameters and no
 instance arrays, a single clock domain, and at most one driving process
-or assignment per signal. One known defect sits inside this subset (see
-above): an arithmetic result that wraps is not reduced to its Verilog
-width before a right shift or comparison reads it. The whole of
+or assignment per signal. Expression widths and signedness follow IEEE
+1800 §11.6 and §11.8.1 exactly, except that an operator mixing a
+`$signed(...)` operand with an unsigned one is rejected. The whole of
 picorv32.v lowers within this subset, and it runs picorv32's complete
 base-ISA test suite -- in four configurations, including compressed
 instructions -- plus the divide and remainder tests through its

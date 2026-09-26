@@ -155,12 +155,19 @@ itself still sees one flat module. With that and unary minus,
 picorv32's hardware divider — a separate module it instantiates — runs
 the divide and remainder tests, matching Icarus.
 
-Adding unary minus also exposed a defect that predates it, and fixing it
-comes before any new language support: an arithmetic result that wraps
-around its bit width isn't reduced to that width before a right shift or
-comparison reads it. With 8-bit values, Verilog gives `(3 - 5) >> 1` as
-127; Ictus gives 255. It's kept as a runnable reproduction in the test
-suite until it's fixed. Cranelift JIT codegen comes after that.
+Adding unary minus also exposed a family of silent wrong answers that
+predated it: an arithmetic result that wrapped around its bit width wasn't
+reduced to that width before a right shift, comparison or truth test read
+it. With 8-bit values, Verilog gives `(3 - 5) >> 1` as 127, and Ictus gave
+255. Expression widths and signedness now follow the Verilog standard's
+rules exactly (IEEE 1800 §11.6 and §11.8.1), checked against Icarus
+across every form that was wrong. The one exception is an operator mixing
+a `$signed(...)` value with an unsigned one: it's rejected rather than
+guessed at, because whether `$signed(a) + 1` is signed depends on how the
+`1` was written, which Ictus doesn't yet track.
+
+Next is picorv32's multiplier, which needs `for` loops; Cranelift JIT
+codegen comes after that.
 
 ## Workspace layout
 
