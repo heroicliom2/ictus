@@ -1388,3 +1388,94 @@ at 8 characters, since longer genuinely does not fit this kernel's `u64`
 values -- rejected with that reason rather than truncated, a silently
 truncated string being both wrong and hard to notice. picorv32's longest
 is exactly 8, into a `reg [63:0]`.
+
+## D27 — Elaborating `generate if`, and one driver per signal
+
+**Decision**: `generate if` conditions are evaluated at lowering time
+against the resolved parameters, and only the selected branch is lowered.
+Module instantiation, `generate for` and `generate case` are rejected
+where they occur in code that exists, rather than skipped. And a signal
+may now be driven from only one place.
+
+**The bug, and how it was found.** The frontend walks a module with
+sv-parser's deep iterator, which descends into a `generate if` and yields
+the contents of *both* branches. So the frontend lowered both. picorv32's
+`generate if (TWO_CYCLE_ALU)` became a clocked ALU and a combinational
+ALU driving the same signals, and the design was correct only because
+settling runs the combinational one last. Its `generate if (ENABLE_MUL)`
+branches hold module instantiations, which were silently dropped, leaving
+only the `else` branch's tie-off assignments -- which happen to be right
+for the default parameters.
+
+No test found this, and none could have with default parameters on
+straight-line code. It was found by starting on the obvious next step --
+running picorv32's own test firmware -- and noticing that the firmware
+was built for non-default parameters, which raised the question of how
+parameters select code at all. The answer was "they don't". This is the
+fourth instance of the pattern in D25/D26: a design that lowers, runs,
+and produces right answers *by coincidence*.
+
+**Why a filter over every walk, not a transformed tree.** Every walk in
+the frontend iterates the module independently (parameters, tasks,
+declarations, always blocks, assignments). Elaboration records the source
+spans of the unselected branches, and each walk skips any item whose
+first source position lies inside one. Producing a pruned copy of
+sv-parser's tree would have been cleaner in principle and much larger in
+practice; the filter is one check per walk, and the spans use the same
+byte offsets every node in the tree already carries.
+
+**Order matters inside elaboration itself.** Constructs are visited
+outer-before-inner, and one inside an already-excluded branch is skipped
+rather than evaluated. `else if` needs nothing special as a result -- the
+nested `if` sits inside the outer `else` and is either excluded with it or
+evaluated in its own right. Skipping also means an unselected branch may
+contain anything at all, including things this frontend would reject;
+rejecting code that doesn't exist in the elaborated design would be as
+wrong as lowering it.
+
+**What is rejected, and why each isn't approximated:**
+
+- **Module instantiation.** Previously dropped silently, which is the
+  worst available behaviour: picorv32 with `ENABLE_MUL=1` would have
+  lowered without error and had no multiplier. Instantiation is a real,
+  planned feature, not something to approximate by omission.
+- **`generate for` / `generate case`.** Legitimate, not needed yet; a
+  `for` also needs genvar scoping.
+- **A parameter declared inside any `generate if`**, selected or not.
+  Parameters are resolved before branches are chosen, so the common idiom
+  of declaring the same name in both branches would silently take
+  whichever came last. The fixture for this is exactly that idiom, and
+  without the check it would lower to the wrong shift amount.
+
+**One driver per signal.** After lowering, a signal driven by more than
+one clocked process, combinational process or continuous assignment in
+total is rejected. This is the invariant the generate bug broke, and
+checking it would have refused the old lowering outright instead of
+depending on a test that happened to sample between clock edges. The
+correctly elaborated picorv32 has no multiply-driven signal. It is
+deliberately stricter than Verilog: two continuous drivers on a net are
+legal and resolved by net type (a conflict reads `x`), which a 2-state
+kernel cannot represent; two `always` blocks writing one variable are
+legal but race, and synthesis refuses them. The legal *and* well-defined
+case it turns away -- two blocks writing disjoint bit ranges or different
+array elements of one signal -- would need per-bit driver tracking to
+accept safely.
+
+**Verified by breaking it.** The differential test's fixture has two
+`generate if`s selecting *opposite* branches, so a registered `sum` and a
+combinational `diff` coexist, and it samples between edges as well as
+after them. With elaboration temporarily disabled, only the between-edge
+samples of `sum` disagree with Icarus -- every post-edge sample still
+matches, because right after an edge a registered and a combinational
+`a + b` agree. A post-edge-only test would have passed the bug. The
+`else if` chain in the same fixture came out *right* even with every
+branch lowered, because the last of three competing assignments wins each
+settling pass -- the same luck, one more time.
+
+**Next.** A RISC-V cross-compiler is available (`riscv64-unknown-elf-gcc`,
+which targets rv32 with the right `-march`/`-mabi`), so picorv32's own
+per-instruction tests can be assembled for its *default* configuration --
+base ISA, no multiply, divide, interrupts or compressed instructions --
+and run through the existing trace harness. That is the longer, more
+demanding program the roadmap called for, and it no longer waits on
+parameter overrides or instantiation.

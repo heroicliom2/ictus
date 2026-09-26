@@ -977,23 +977,63 @@ own unit tests for the two things no reference simulator can answer
 rather than hanging), and end-to-end by the picorv32 test, which now
 compares the register file.
 
-**Next**: no single confirmed blocker -- picorv32 lowers *and* executes
-correctly, which closes the loop that has driven every increment since
-D13. Candidates, roughly in order of what would prove the most:
+**`generate if` is now elaborated -- and picorv32 had been passing partly
+by coincidence until it was.** Design in decisions.md D27.
 
-- **A longer, more demanding program.** The current one is eight
-  instructions. Running picorv32's own firmware or its
-  instruction-set tests would exercise far more of the core, and the
-  harness already supports it -- what it needs is a testbench memory big
-  enough and a way to load a program image rather than four hand-written
-  words. This is the cheapest way to find the next real gap, and it is
-  the same diagnostic loop that has worked every time so far.
-- **Module instantiation.** The largest remaining language gap, and the
-  one that would let Ictus run a testbench directly rather than replaying
-  a recorded trace.
-- **Cranelift codegen** (phase 1's actual goal), now that there is a
-  correctness baseline with a real design behind it to check against --
-  which was D12's condition for starting.
+The frontend walked each module with sv-parser's deep iterator, which
+yields the contents of *both* branches of a `generate if`, so both were
+lowered. picorv32's `generate if (TWO_CYCLE_ALU)` produced a clocked ALU
+and a combinational ALU driving the same signals, correct only because
+settling ran the combinational one last; its `ENABLE_MUL`/`ENABLE_DIV`
+branches hold module instantiations, which were silently dropped, leaving
+the `else` tie-offs that happen to suit the default parameters. Nothing
+caught it -- it surfaced when starting on the firmware below raised the
+question of how parameters select code at all.
+
+- `generate if` conditions are folded to constants against the resolved
+  parameters, and the source spans of unselected branches are recorded.
+  Every walk in the frontend skips items inside one -- a filter rather
+  than a pruned tree, because each walk iterates independently and the
+  spans reuse offsets the tree already carries. `else if` needs nothing
+  extra; a construct inside an excluded branch is skipped, never
+  evaluated, so an unselected branch can contain anything.
+- Rejected where they occur in code that exists, rather than skipped:
+  **module instantiation** (previously dropped silently -- picorv32 with
+  `ENABLE_MUL=1` would have lowered with no multiplier and no error),
+  **`generate for`/`generate case`**, and **a parameter declared inside
+  any `generate if`** (parameters resolve before branches are chosen, so
+  the both-branches idiom would silently take the last value).
+- **One driver per signal**: a signal written by more than one process or
+  continuous assignment is rejected. That is the invariant the bug broke,
+  and it would have refused the old lowering outright. Stricter than
+  Verilog on purpose -- two net drivers need a resolution rule a 2-state
+  kernel lacks, and two blocks writing one variable race -- though it does
+  turn away disjoint-bit-range writes from separate blocks, which are
+  legal and well-defined.
+
+Verified by breaking it: with elaboration disabled, the differential test
+(`ictus-cli/tests/differential_generate.rs`) fails only on its
+*between-edge* samples. Every post-edge sample still matches Icarus,
+because right after an edge a registered and a combinational `a + b`
+agree -- so a test sampling only after edges would have passed the bug.
+
+**Next: picorv32's own instruction tests.** A RISC-V cross-compiler is
+available here (`riscv64-unknown-elf-gcc`, targeting rv32 via
+`-march`/`-mabi`), so the per-instruction tests in
+`bench/designs/picorv32/tests/` can be assembled for picorv32's
+*default* configuration -- base ISA only, no multiply, divide, interrupts
+or compressed instructions -- and run through the existing trace harness
+by loading the image into the testbench memory with `$readmemh`. That is
+the longer, more demanding program the roadmap called for, and it no
+longer waits on anything else. The prebuilt `firmware.hex` does not fit
+yet: it was built for `COMPRESSED_ISA`, `ENABLE_MUL`, `ENABLE_DIV` and
+`ENABLE_IRQ`, and the multiply and divide units are separate modules, so
+it needs both top-level parameter overrides and module instantiation.
+
+After that, the larger pieces: **module instantiation** (the biggest
+remaining language gap, and what would let Ictus run a testbench
+directly), and **Cranelift codegen**, now that D12's precondition -- a
+correctness baseline with a real design behind it -- is met.
 
 The supported language subset is still intentionally narrow: single
 ANSI-style module, any number of clocked processes, combinational
@@ -1026,7 +1066,9 @@ mem [0:31]`) with one unpacked dimension, internal-only, one element at a
 time -- but no array port, no bit-select of an element, and no `assign`
 to one -- and both `<=` and `=` inside a clocked block, but no compound
 assignment (`+=` and friends), no explicit sensitivity list, no `negedge`
-block, no module instantiation. The whole of picorv32.v lowers within
+block, `generate if` but not `generate for`/`generate case`, no module
+instantiation, and at most one driving process or assignment per signal.
+The whole of picorv32.v lowers within
 this subset and both its bus behaviour and its register file match Icarus
 while it executes a program; Cranelift codegen is further out still.
 

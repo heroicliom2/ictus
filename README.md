@@ -129,7 +129,16 @@ reproducing every bus cycle while writing no registers at all — a
 reminder that agreement on a design's ports is not evidence that the
 design ran.
 
-Module instantiation and Cranelift JIT codegen are the next large pieces.
+A fifth turned up afterwards, and it had been hiding behind correct
+results: both branches of every `generate if` were being lowered.
+picorv32 got right answers only because its conflicting branches happened
+to resolve the right way for its default parameters. `generate if` is now
+elaborated against the parameters, module instantiation is rejected
+rather than silently dropped, and a signal driven from more than one
+place is refused outright.
+
+Next is running picorv32's own per-instruction tests; module
+instantiation and Cranelift JIT codegen are the next large pieces.
 
 ## Workspace layout
 

@@ -6,7 +6,9 @@
 //!
 //! v1 scope (deliberately narrow -- see docs/decisions.md for the
 //! interpreter-first sequencing this supports): a single flat module, no
-//! instances/hierarchy and no generate blocks; array/memory signals
+//! instances/hierarchy (a `generate if` is resolved by the frontend, so
+//! only its selected branch ever reaches this IR, and nothing here needs
+//! to know it existed); array/memory signals
 //! (`reg [31:0] mem [0:31]`) *are* supported, with one unpacked
 //! dimension, read and written one element at a time at a runtime index
 //! (see `Signal::depth`, `Expr::ArrayRead`, `Stmt::ArrayAssign`), any

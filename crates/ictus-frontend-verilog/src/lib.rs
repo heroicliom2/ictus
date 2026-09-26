@@ -109,6 +109,14 @@
 //! initializer (`reg x = 0;`) looks identical, means something else
 //! entirely, and is rejected -- see `reject_variable_initializer`.
 //!
+//! `generate if` is elaborated before any of that: its condition is folded
+//! against the resolved parameters and only the selected branch is
+//! lowered (see `elaborate_generates`), module instantiation is rejected
+//! rather than skipped, and a signal driven from more than one place is
+//! refused (see `reject_multiple_drivers`) -- decisions.md D27, and the
+//! reason both exist: until then every branch was lowered, and picorv32
+//! was right only by coincidence.
+//!
 //! Widen this as later phases need more of the language. The whole of
 //! phase 0's picorv32 benchmark design lowers through here cleanly (225
 //! signals) and then *executes* correctly: replayed against a recorded
@@ -191,11 +199,18 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     // order -- see lower_parameters.
     let parameters = lower_parameters(module_node, &tree)?;
 
+    // Decides which branch of every `generate if` exists, now that the
+    // parameters its conditions read are known. Every walk below consults
+    // it and skips anything inside a branch that wasn't selected -- see
+    // `elaborate_generates` for why that has to be a filter on every walk
+    // rather than something done once.
+    let elab = elaborate_generates(module_node, &tree, &parameters)?;
+
     // Scanned up front, same reasoning as parameters: a task-call
     // statement (see lower_task_call_statement) needs to know whether the
     // task it names has a provably-empty body before it can decide
     // whether to accept the call as a no-op.
-    let empty_tasks = lower_task_declarations(module_node, &tree)?;
+    let empty_tasks = lower_task_declarations(module_node, &tree, &elab)?;
 
     // A port that omits its own `input`/`output` keyword (`input clk,
     // resetn,` -- resetn has no keyword of its own) inherits the
@@ -211,12 +226,14 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
 
     for decl_node in module_node.into_iter() {
         match decl_node {
-            RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net)) => {
+            RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net))
+                if !elab.excludes(&**net) =>
+            {
                 for signal in lower_internal_signal(&**net, &tree, &parameters)? {
                     module.push_signal(signal);
                 }
             }
-            RefNode::DataDeclaration(DataDeclaration::Variable(var)) => {
+            RefNode::DataDeclaration(DataDeclaration::Variable(var)) if !elab.excludes(&**var) => {
                 reject_variable_initializer(var, &tree)?;
                 for signal in lower_internal_signal(&**var, &tree, &parameters)? {
                     module.push_signal(signal);
@@ -243,6 +260,9 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     let mut comb_processes = Vec::new();
     for always_node in module_node.into_iter() {
         if let RefNode::AlwaysConstruct(always) = always_node {
+            if elab.excludes(always) {
+                continue;
+            }
             match lower_always(always, &tree, &ctx)? {
                 LoweredAlways::Clocked(process) => clocked_processes.push(process),
                 LoweredAlways::Combinational(process) => comb_processes.push(process),
@@ -255,16 +275,12 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     // initializer, `wire mem_done = ...;`, which IEEE 1800 defines as
     // exactly equivalent to `wire mem_done; assign mem_done = ...;`.
     //
-    // Both are collected in **one pass**, so the resulting `assigns` keep
-    // their original source order however the two are interleaved. That
-    // matters: `Simulation::settle_combinational` evaluates them once
-    // each in this order, so an assignment that reads a net driven by a
-    // later one would see a stale value for a cycle. Source order is not
-    // a guarantee of a correct topological order -- nothing stops a
-    // design from writing them in any order at all, and settling to a
-    // real fixpoint is the actual fix (see docs/roadmap.md) -- but
-    // preserving it keeps the common, readable case right instead of
-    // reordering every design's logic for no reason.
+    // Both are collected in one pass, so `assigns` keeps their source
+    // order however the two are interleaved. The kernel settles to a
+    // fixpoint, so this order no longer affects any result -- it only
+    // keeps the lowered module readable against the source, and saves a
+    // settling pass in the common case where the source is already
+    // written in dependency order.
     //
     // This runs after the signal walk rather than inside it, because a
     // right-hand side may reference any signal in the module, including
@@ -272,10 +288,14 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     let mut assigns = Vec::new();
     for node in module_node.into_iter() {
         match node {
-            RefNode::ContinuousAssign(sv_parser::ContinuousAssign::Net(net)) => {
+            RefNode::ContinuousAssign(sv_parser::ContinuousAssign::Net(net))
+                if !elab.excludes(&**net) =>
+            {
                 assigns.push(lower_continuous_assign(net, &tree, &ctx)?);
             }
-            RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net)) => {
+            RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net))
+                if !elab.excludes(&**net) =>
+            {
                 assigns.extend(lower_net_decl_assigns(net, &tree, &ctx)?);
             }
             _ => {}
@@ -286,7 +306,260 @@ pub fn lower_file(path: &Path) -> Result<Module, String> {
     module.comb_processes = comb_processes;
     module.assigns = assigns;
 
+    reject_multiple_drivers(&module)?;
+
     Ok(module)
+}
+
+/// Rejects a signal driven from more than one place -- more than one
+/// clocked process, combinational process or continuous assignment in
+/// total. Several statements inside the *same* process writing it are
+/// fine; that is ordinary sequential code.
+///
+/// This is a structural invariant that catches frontend bugs as well as
+/// design bugs, and it exists because of one. Before `generate if` was
+/// elaborated, picorv32 lowered with its ALU signals driven by both a
+/// clocked and a combinational process, and simulated correctly only
+/// because the combinational one happened to run last. No test caught it
+/// until one sampled between clock edges; this check would have refused
+/// the design outright. picorv32 as correctly elaborated has no signal
+/// with more than one driver.
+///
+/// As a statement about Verilog it is deliberately stricter than the
+/// language. Two continuous assignments to one net are legal and resolved
+/// by the net type (a conflict reads `x`), which a 2-state kernel cannot
+/// represent. Two `always` blocks writing one variable are legal but race,
+/// and synthesis refuses them. The case this does turn away that is both
+/// legal *and* well-defined is two blocks writing disjoint bit ranges or
+/// different elements of one signal -- a real, if uncommon, style that
+/// would need per-bit driver tracking to accept safely.
+fn reject_multiple_drivers(module: &Module) -> Result<(), String> {
+    fn collect_targets(stmts: &[Stmt], out: &mut HashSet<SignalId>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::NonBlockingAssign { target, .. } | Stmt::BlockingAssign { target, .. } => {
+                    out.insert(*target);
+                }
+                Stmt::ArrayAssign { array, .. } | Stmt::BlockingArrayAssign { array, .. } => {
+                    out.insert(*array);
+                }
+                Stmt::If { then_branch, else_branch, .. } => {
+                    collect_targets(then_branch, out);
+                    collect_targets(else_branch, out);
+                }
+                Stmt::Case { arms, default, .. } => {
+                    for arm in arms {
+                        collect_targets(&arm.body, out);
+                    }
+                    collect_targets(default, out);
+                }
+            }
+        }
+    }
+
+    let mut drivers: HashMap<SignalId, Vec<String>> = HashMap::new();
+    let mut note = |id: SignalId, driver: String| drivers.entry(id).or_default().push(driver);
+
+    for (i, process) in module.clocked_processes.iter().enumerate() {
+        let mut targets = HashSet::new();
+        collect_targets(&process.body, &mut targets);
+        for id in targets {
+            note(id, format!("clocked always block #{}", i + 1));
+        }
+    }
+    for (i, process) in module.comb_processes.iter().enumerate() {
+        let mut targets = HashSet::new();
+        collect_targets(&process.body, &mut targets);
+        for id in targets {
+            note(id, format!("combinational always block #{}", i + 1));
+        }
+    }
+    for assign in &module.assigns {
+        note(assign.target, "a continuous assignment".to_string());
+    }
+
+    // Reported in signal order, so the error is the same on every run.
+    let mut multiply_driven: Vec<_> = drivers.into_iter().filter(|(_, d)| d.len() > 1).collect();
+    multiply_driven.sort_by_key(|(id, _)| *id);
+    if let Some((id, sources)) = multiply_driven.first() {
+        return Err(format!(
+            "signal '{}' is driven from more than one place ({}), which v1 does not support: \
+             two continuous drivers need a resolution rule a 2-state kernel doesn't have, and \
+             two processes writing one signal race",
+            module.signals[*id].name,
+            sources.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// The result of elaborating a module's `generate` constructs: the source
+/// spans of every branch that was **not** selected.
+///
+/// It is a filter rather than a transformed tree because every walk in
+/// this file iterates the module with sv-parser's deep iterator, which
+/// descends into a `generate if` and yields the contents of *both*
+/// branches. That is exactly the bug this exists to fix: before it,
+/// picorv32's `generate if (TWO_CYCLE_ALU)` produced both the clocked
+/// ALU and the combinational one, driving the same signals, and the
+/// design worked only because the combinational one happened to run
+/// last. Each walk asks `excludes` about the items it cares about and
+/// skips the ones inside an unselected branch.
+///
+/// Spans are byte offsets into the *preprocessed* source, the same
+/// coordinate system every `Locate` in the tree uses.
+struct Elaboration {
+    excluded: Vec<(usize, usize)>,
+}
+
+impl Elaboration {
+    /// Whether `node` lies inside a branch elaboration did not select.
+    /// Decided by the node's first source position, which is enough: a
+    /// node either lies wholly inside a branch or wholly outside it.
+    fn excludes<'a, T>(&self, node: &'a T) -> bool
+    where
+        &'a T: IntoIterator<Item = RefNode<'a>>,
+    {
+        first_offset(node).is_some_and(|offset| self.contains(offset))
+    }
+
+    fn contains(&self, offset: usize) -> bool {
+        self.excluded
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&offset))
+    }
+}
+
+/// The first source position anywhere in `node`, or `None` for a node
+/// with no text at all.
+fn first_offset<'a, T>(node: &'a T) -> Option<usize>
+where
+    &'a T: IntoIterator<Item = RefNode<'a>>,
+{
+    node.into_iter().find_map(|n| match n {
+        RefNode::Locate(l) => Some(l.offset),
+        _ => None,
+    })
+}
+
+/// The source span `[start, end)` covering all of `node`'s text.
+fn span_of<'a, T>(node: &'a T) -> Option<(usize, usize)>
+where
+    &'a T: IntoIterator<Item = RefNode<'a>>,
+{
+    let (mut start, mut end) = (usize::MAX, 0);
+    for n in node {
+        if let RefNode::Locate(l) = n {
+            start = start.min(l.offset);
+            end = end.max(l.offset + l.len);
+        }
+    }
+    (start < end).then_some((start, end))
+}
+
+/// Elaborates the module's `generate` constructs against its resolved
+/// parameters: each `generate if` condition is folded to a compile-time
+/// constant and the branch it doesn't select is recorded as excluded.
+/// `else if` chains need no special handling -- the nested `if` sits
+/// inside the outer one's `else` branch, so it is either excluded along
+/// with it or evaluated in its own right.
+///
+/// The walk is in source order, outer constructs before inner ones, so a
+/// construct inside an already-excluded branch is skipped rather than
+/// evaluated. That matters beyond efficiency: an unselected branch may
+/// contain things this frontend would reject, and rejecting code that
+/// doesn't exist in the elaborated design would be as wrong as lowering
+/// it.
+///
+/// Rejected, when they lie in code that *does* exist:
+///
+/// * **Module instantiation.** Previously these were silently dropped,
+///   which is the same failure docs/decisions.md D25 is about: picorv32
+///   with `ENABLE_MUL=1` would have lowered cleanly and simply had no
+///   multiplier. Instantiation is a real, planned feature, not something
+///   to approximate by omission.
+/// * **`generate for` and `generate case`.** Both are legitimate and
+///   neither is needed yet; a `for` would also need genvar scoping.
+/// * **A parameter declared inside any `generate if`**, selected or not.
+///   `lower_parameters` has already run by this point, over the whole
+///   module, so a `localparam` inside a branch is already in the table --
+///   and the common idiom of declaring the same name in both branches
+///   would silently resolve to whichever came last.
+fn elaborate_generates(
+    module_node: &sv_parser::ModuleDeclarationAnsi,
+    tree: &SyntaxTree,
+    parameters: &HashMap<String, (u64, u32)>,
+) -> Result<Elaboration, String> {
+    let mut elab = Elaboration {
+        excluded: Vec::new(),
+    };
+    let mut generate_ifs: Vec<(usize, usize)> = Vec::new();
+
+    for node in module_node.into_iter() {
+        match node {
+            RefNode::IfGenerateConstruct(generate) => {
+                if elab.excludes(generate) {
+                    continue;
+                }
+                generate_ifs.extend(span_of(generate));
+
+                let cond_node = &generate.nodes.1.nodes.1;
+                let cond = lower_constant_expr(cond_node, tree, parameters)?;
+                let selected = try_const_fold(&cond).ok_or_else(|| {
+                    format!(
+                        "a `generate if` condition must be a compile-time constant, but this one \
+                         could not be evaluated: {cond:?}"
+                    )
+                })? != 0;
+
+                let unselected = if selected {
+                    generate.nodes.3.as_ref().and_then(|(_else, block)| span_of(block))
+                } else {
+                    span_of(&generate.nodes.2)
+                };
+                elab.excluded.extend(unselected);
+            }
+            RefNode::LoopGenerateConstruct(generate) if !elab.excludes(generate) => {
+                return Err("`generate for` is not supported in v1".to_string());
+            }
+            RefNode::CaseGenerateConstruct(generate) if !elab.excludes(generate) => {
+                return Err("`generate case` is not supported in v1".to_string());
+            }
+            RefNode::ModuleInstantiation(instance) if !elab.excludes(instance) => {
+                let module_name = unwrap_node!(instance, ModuleIdentifier)
+                    .and_then(|n| unwrap_node!(n, SimpleIdentifier))
+                    .and_then(|n| ident_str(n, tree))
+                    .unwrap_or("<unreadable>");
+                return Err(format!(
+                    "module instantiation (of '{module_name}') is not supported in v1 -- \
+                     rejected rather than skipped, since skipping it would lower a design that \
+                     is silently missing whatever that instance does"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Checked after the walk, once every `generate if` span is known.
+    let in_generate_if =
+        |offset: usize| generate_ifs.iter().any(|&(s, e)| (s..e).contains(&offset));
+    for node in module_node.into_iter() {
+        let offset = match node {
+            RefNode::ParameterDeclaration(p) => first_offset(p),
+            RefNode::LocalParameterDeclaration(p) => first_offset(p),
+            _ => continue,
+        };
+        if offset.is_some_and(in_generate_if) {
+            return Err(
+                "a parameter or localparam declared inside a `generate if` is not supported in \
+                 v1 -- parameters are resolved before generate branches are selected, so one \
+                 declared in both branches would silently take whichever value came last"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(elab)
 }
 
 /// Parses every `#(parameter ...)` *and* `localparam ...` declaration in
@@ -739,6 +1012,7 @@ fn constant_expr_width(expr: &Expr) -> Result<u32, String> {
 fn lower_task_declarations(
     module_node: &sv_parser::ModuleDeclarationAnsi,
     tree: &SyntaxTree,
+    elab: &Elaboration,
 ) -> Result<HashSet<String>, String> {
     let mut empty_tasks = HashSet::new();
 
@@ -746,6 +1020,9 @@ fn lower_task_declarations(
         let RefNode::TaskDeclaration(task) = node else {
             continue;
         };
+        if elab.excludes(task) {
+            continue;
+        }
 
         let (name_node, is_empty) = match &task.nodes.2 {
             sv_parser::TaskBodyDeclaration::WithoutPort(body) => {
