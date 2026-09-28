@@ -131,13 +131,15 @@
 //!
 //! Widen this as later phases need more of the language. The whole of
 //! phase 0's picorv32 benchmark design lowers through here cleanly and
-//! *executes* correctly -- its base, compressed and divide instructions in
-//! five configurations, matching Icarus on every traced port, every cycle,
-//! and on the register file. Getting there turned up defects that each let
-//! the design lower, run, and produce plausible output while being wrong;
-//! see decisions.md D25 through D31. Remaining gaps, in rough order of
-//! value: `for` loops and indexed part-selects (picorv32's multiplier),
-//! `$unsigned`, and compound assignment (`+=`).
+//! *executes* correctly -- its base, compressed, multiply and divide
+//! instructions in six configurations, matching Icarus on every traced
+//! port, every cycle, and on the register file. Getting there turned up
+//! defects that each let the design lower, run, and produce plausible
+//! output while being wrong; see decisions.md D25 through D33. `for` loops
+//! are unrolled here, while lowering (see `lower_for`), so no loop reaches
+//! the IR. Remaining gaps, in rough order of value: `reg signed`
+//! declarations (the keyword is currently ignored), declared ranges that
+//! don't end at bit 0, and compound assignment (`+=`).
 
 mod width;
 
@@ -166,10 +168,19 @@ use sv_parser::{
 /// `lower_parameters`), and a call to an empty task lowers to no
 /// statements at all (see `lower_task_declarations`), so the IR and the
 /// kernel never need to know either existed.
+///
+/// The same goes for `integer` variables: v1 supports them only as `for`
+/// loop variables, and a loop is unrolled at lowering time, so inside each
+/// copy of the body the variable is a constant -- bound in `parameters`,
+/// exactly like a parameter -- and outside a loop it can't be used at all
+/// (see `lower_for`). `integers` holds their names, so that a use outside
+/// a loop gets an error saying so rather than "unknown signal".
+#[derive(Clone, Copy)]
 struct Ctx<'a> {
     module: &'a Module,
     parameters: &'a HashMap<String, (u64, u32)>,
     empty_tasks: &'a HashSet<String>,
+    integers: &'a HashSet<String>,
 }
 
 impl<'a> std::ops::Deref for Ctx<'a> {
@@ -313,6 +324,8 @@ fn lower_module<'a>(
         }
     }
 
+    // `integer` variables don't become signals: see `Ctx`.
+    let mut integers = HashSet::new();
     for decl_node in module_node.into_iter() {
         match decl_node {
             RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net))
@@ -324,8 +337,21 @@ fn lower_module<'a>(
             }
             RefNode::DataDeclaration(DataDeclaration::Variable(var)) if !elab.excludes(&**var) => {
                 reject_variable_initializer(var, tree)?;
-                for signal in lower_internal_signal(&**var, tree, &parameters)? {
-                    module.push_signal(signal);
+                let signals = lower_internal_signal(&**var, tree, &parameters)?;
+                if is_integer_declaration(var)? {
+                    for signal in signals {
+                        if signal.depth.is_some() {
+                            return Err(format!(
+                                "an array of integers ('{}') is not supported in v1",
+                                signal.name
+                            ));
+                        }
+                        integers.insert(signal.name);
+                    }
+                } else {
+                    for signal in signals {
+                        module.push_signal(signal);
+                    }
                 }
             }
             _ => {}
@@ -343,6 +369,7 @@ fn lower_module<'a>(
         module: &module,
         parameters: &parameters,
         empty_tasks: &empty_tasks,
+        integers: &integers,
     };
 
     let mut clocked_processes = Vec::new();
@@ -449,7 +476,9 @@ fn lower_instances<'a>(
 ) -> Result<Vec<PendingInstance>, String> {
     let ident_of = |node: RefNode| -> Result<String, String> {
         let simple = unwrap_node!(node, SimpleIdentifier).ok_or("identifier unreadable")?;
-        Ok(ident_str(simple, tree).ok_or("identifier unreadable")?.to_string())
+        Ok(ident_str(simple, tree)
+            .ok_or("identifier unreadable")?
+            .to_string())
     };
 
     let mut pending = Vec::new();
@@ -499,16 +528,14 @@ fn lower_instances<'a>(
                         let Some(value_node) = &parameter.nodes.2.nodes.1 else {
                             continue;
                         };
-                        let sv_parser::ParamExpression::MintypmaxExpression(mintypmax) =
-                            value_node
+                        let sv_parser::ParamExpression::MintypmaxExpression(mintypmax) = value_node
                         else {
                             return Err(format!(
                                 "parameter '{name}' of '{child_name}' is given a type or `$`, \
                                  which v1 doesn't support"
                             ));
                         };
-                        let sv_parser::MintypmaxExpression::Expression(expr) = &**mintypmax
-                        else {
+                        let sv_parser::MintypmaxExpression::Expression(expr) = &**mintypmax else {
                             return Err(format!(
                                 "parameter '{name}' of '{child_name}' is given a min:typ:max \
                                  value, which v1 doesn't support"
@@ -571,9 +598,7 @@ fn lower_instances<'a>(
                         let port_id = child
                             .signal_id(&port)
                             .filter(|&id| child.signals[id].direction.is_some())
-                            .ok_or_else(|| {
-                                format!("'{child_name}' has no port named '{port}'")
-                            })?;
+                            .ok_or_else(|| format!("'{child_name}' has no port named '{port}'"))?;
                         let Some(paren) = &connection.nodes.3 else {
                             return Err(format!(
                                 "instance '{instance_name}' connects `.{port}` implicitly, \
@@ -796,7 +821,11 @@ fn reject_multiple_drivers(module: &Module) -> Result<(), String> {
                 Stmt::ArrayAssign { array, .. } | Stmt::BlockingArrayAssign { array, .. } => {
                     out.insert(*array);
                 }
-                Stmt::If { then_branch, else_branch, .. } => {
+                Stmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
                     collect_targets(then_branch, out);
                     collect_targets(else_branch, out);
                 }
@@ -987,7 +1016,11 @@ fn elaborate_generates(
                 })? != 0;
 
                 let unselected = if selected {
-                    generate.nodes.3.as_ref().and_then(|(_else, block)| span_of(block))
+                    generate
+                        .nodes
+                        .3
+                        .as_ref()
+                        .and_then(|(_else, block)| span_of(block))
                 } else {
                     span_of(&generate.nodes.2)
                 };
@@ -1211,13 +1244,16 @@ fn lower_constant_param_expression(
         return Err("parameter/localparam default must be a constant expression in v1".to_string());
     };
     let expr = match &**mtm {
-        sv_parser::ConstantMintypmaxExpression::Unary(ce) => lower_constant_expr(ce, tree, parameters)?,
+        sv_parser::ConstantMintypmaxExpression::Unary(ce) => {
+            lower_constant_expr(ce, tree, parameters)?
+        }
         sv_parser::ConstantMintypmaxExpression::Ternary(_) => {
-            return Err("min:typ:max parameter/localparam values are not supported in v1".to_string())
+            return Err(
+                "min:typ:max parameter/localparam values are not supported in v1".to_string(),
+            )
         }
     };
-    try_const_fold(&expr)
-        .ok_or_else(|| "does not reduce to a compile-time constant".to_string())
+    try_const_fold(&expr).ok_or_else(|| "does not reduce to a compile-time constant".to_string())
 }
 
 /// Lowers Verilog's *constant*-expression grammar (`ConstantExpression`)
@@ -1239,8 +1275,7 @@ fn lower_constant_expr(
     match expr {
         CE::ConstantPrimary(primary) => lower_constant_primary(primary, tree, parameters),
         CE::Binary(binary) => {
-            let op_text =
-                symbol_text(&binary.nodes.1, tree).ok_or("binary operator unreadable")?;
+            let op_text = symbol_text(&binary.nodes.1, tree).ok_or("binary operator unreadable")?;
             let lhs = lower_constant_expr(&binary.nodes.0, tree, parameters)?;
             let rhs = lower_constant_expr(&binary.nodes.3, tree, parameters)?;
             apply_binary_op(op_text, lhs, rhs)
@@ -1255,7 +1290,9 @@ fn lower_constant_expr(
                 else_val: Box::new(else_val),
             })
         }
-        other => Err(format!("constant expression form not supported in v1: {other:?}")),
+        other => Err(format!(
+            "constant expression form not supported in v1: {other:?}"
+        )),
     }
 }
 
@@ -1270,9 +1307,9 @@ fn lookup_constant_parameter(
     name: &str,
     parameters: &HashMap<String, (u64, u32)>,
 ) -> Result<Expr, String> {
-    let &(value, width) = parameters
-        .get(name)
-        .ok_or_else(|| format!("reference to unknown parameter '{name}' in a constant expression"))?;
+    let &(value, width) = parameters.get(name).ok_or_else(|| {
+        format!("reference to unknown parameter '{name}' in a constant expression")
+    })?;
     Ok(Expr::Literal { value, width })
 }
 
@@ -1303,8 +1340,7 @@ fn lower_constant_primary(
             }
             let ident = unwrap_node!(&p.nodes.0, SimpleIdentifier)
                 .ok_or("parameter reference identifier unreadable")?;
-            let name =
-                ident_str(ident, tree).ok_or("parameter reference identifier unreadable")?;
+            let name = ident_str(ident, tree).ok_or("parameter reference identifier unreadable")?;
             lookup_constant_parameter(name, parameters)
         }
         // sv-parser's constant-expression grammar can parse a *bare*
@@ -1336,8 +1372,7 @@ fn lower_constant_primary(
             }
             let ident = unwrap_node!(&tf_call.nodes.0, SimpleIdentifier)
                 .ok_or("parameter reference identifier unreadable")?;
-            let name =
-                ident_str(ident, tree).ok_or("parameter reference identifier unreadable")?;
+            let name = ident_str(ident, tree).ok_or("parameter reference identifier unreadable")?;
             lookup_constant_parameter(name, parameters)
         }
         CP::MintypmaxExpression(paren) => match &paren.nodes.0.nodes.1 {
@@ -1443,7 +1478,9 @@ fn try_const_fold(expr: &Expr) -> Option<u64> {
         }
         Expr::AShr(lhs, rhs) => {
             let value = try_const_fold(lhs)? as i64;
-            let shift = u32::try_from(try_const_fold(rhs)?).unwrap_or(u32::MAX).min(63);
+            let shift = u32::try_from(try_const_fold(rhs)?)
+                .unwrap_or(u32::MAX)
+                .min(63);
             Some((value >> shift) as u64)
         }
         Expr::And(lhs, rhs) => Some(try_const_fold(lhs)? & try_const_fold(rhs)?),
@@ -1458,12 +1495,12 @@ fn try_const_fold(expr: &Expr) -> Option<u64> {
         Expr::SignedLt(lhs, rhs) => Some(bool_val(
             (try_const_fold(lhs)? as i64) < (try_const_fold(rhs)? as i64),
         )),
-        Expr::LogicalAnd(lhs, rhs) => {
-            Some(bool_val(try_const_fold(lhs)? != 0 && try_const_fold(rhs)? != 0))
-        }
-        Expr::LogicalOr(lhs, rhs) => {
-            Some(bool_val(try_const_fold(lhs)? != 0 || try_const_fold(rhs)? != 0))
-        }
+        Expr::LogicalAnd(lhs, rhs) => Some(bool_val(
+            try_const_fold(lhs)? != 0 && try_const_fold(rhs)? != 0,
+        )),
+        Expr::LogicalOr(lhs, rhs) => Some(bool_val(
+            try_const_fold(lhs)? != 0 || try_const_fold(rhs)? != 0,
+        )),
         Expr::Select { base, msb, lsb } => Some(mask(try_const_fold(base)? >> lsb, msb - lsb + 1)),
         Expr::Concat(parts) => {
             let mut result = 0u64;
@@ -1472,7 +1509,11 @@ fn try_const_fold(expr: &Expr) -> Option<u64> {
             }
             Some(result)
         }
-        Expr::Ternary { cond, then_val, else_val } => {
+        Expr::Ternary {
+            cond,
+            then_val,
+            else_val,
+        } => {
             if try_const_fold(cond)? != 0 {
                 try_const_fold(then_val)
             } else {
@@ -1506,9 +1547,9 @@ fn constant_expr_width(expr: &Expr) -> Result<u32, String> {
     match expr {
         Expr::Literal { width, .. } => Ok(*width),
         Expr::Concat(parts) => Ok(parts.iter().map(|(_, w)| w).sum()),
-        Expr::Ternary { then_val, else_val, .. } => {
-            Ok(constant_expr_width(then_val)?.max(constant_expr_width(else_val)?))
-        }
+        Expr::Ternary {
+            then_val, else_val, ..
+        } => Ok(constant_expr_width(then_val)?.max(constant_expr_width(else_val)?)),
         // Same self-determined-width rule as `expr_width`'s equivalent
         // arm, kept in step with it deliberately: a `localparam` whose
         // value concatenates `A + B` should not fail where the identical
@@ -1564,7 +1605,8 @@ fn lower_task_declarations(
                 (&body.nodes.1, body.nodes.5.iter().all(statement_is_noop))
             }
         };
-        let ident = unwrap_node!(name_node, SimpleIdentifier).ok_or("task identifier unreadable")?;
+        let ident =
+            unwrap_node!(name_node, SimpleIdentifier).ok_or("task identifier unreadable")?;
         let name = ident_str(ident, tree).ok_or("task identifier unreadable")?;
 
         if is_empty {
@@ -1630,7 +1672,9 @@ fn lower_port(
         // No direction keyword of its own -- inherit from the previous
         // port in the list (see the comment at this function's call site).
         None => last_direction.ok_or_else(|| {
-            format!("port '{name}' has no direction, and there's no previous port to inherit one from")
+            format!(
+                "port '{name}' has no direction, and there's no previous port to inherit one from"
+            )
         })?,
     };
     *last_direction = Some(direction);
@@ -1777,10 +1821,12 @@ fn lower_packed_range(
     let constant_range = &range.nodes.0.nodes.1;
     let msb = lower_constant_expr(&constant_range.nodes.0, tree, parameters)?;
     let lsb = lower_constant_expr(&constant_range.nodes.2, tree, parameters)?;
-    let msb = try_const_fold(&msb)
-        .ok_or_else(|| "packed range bound does not reduce to a compile-time constant".to_string())?;
-    let lsb = try_const_fold(&lsb)
-        .ok_or_else(|| "packed range bound does not reduce to a compile-time constant".to_string())?;
+    let msb = try_const_fold(&msb).ok_or_else(|| {
+        "packed range bound does not reduce to a compile-time constant".to_string()
+    })?;
+    let lsb = try_const_fold(&lsb).ok_or_else(|| {
+        "packed range bound does not reduce to a compile-time constant".to_string()
+    })?;
     Ok((msb as u32).abs_diff(lsb as u32) + 1)
 }
 
@@ -1842,7 +1888,10 @@ fn lower_always(
             )?));
         }
     };
-    let is_posedge = matches!(edge_node, RefNode::EdgeIdentifier(EdgeIdentifier::Posedge(_)));
+    let is_posedge = matches!(
+        edge_node,
+        RefNode::EdgeIdentifier(EdgeIdentifier::Posedge(_))
+    );
     if !is_posedge {
         return Err(
             "a `negedge`-triggered `always` block is not supported in v1 (only \
@@ -1912,7 +1961,11 @@ fn reject_nonblocking_in_comb(stmts: &[Stmt]) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            Stmt::If { then_branch, else_branch, .. } => {
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 reject_nonblocking_in_comb(then_branch)?;
                 reject_nonblocking_in_comb(else_branch)?;
             }
@@ -1958,10 +2011,21 @@ fn lower_statement_item(
             let (assign, _semicolon) = &**b;
             lower_blocking_assign(assign, tree, module)
         }
-        StatementItem::SubroutineCallStatement(call) => lower_task_call_statement(call, tree, module),
+        StatementItem::SubroutineCallStatement(call) => {
+            lower_task_call_statement(call, tree, module)
+        }
+        StatementItem::LoopStatement(loop_stmt) => match &**loop_stmt {
+            sv_parser::LoopStatement::For(for_loop) => lower_for(for_loop, tree, module),
+            _ => Err(
+                "only `for` loops are supported in v1 -- no `while`, `repeat`, `forever`, \
+                 `do ... while` or `foreach`"
+                    .to_string(),
+            ),
+        },
         _ => Err(
             "statement form not supported in v1 (only begin/end blocks, if/else, case, \
-             blocking and non-blocking assignment, and a call to a provably-empty \n             task)"
+             blocking and non-blocking assignment, a `for` loop, and a call to a \
+             provably-empty task)"
                 .to_string(),
         ),
     }
@@ -2021,6 +2085,246 @@ fn lower_task_call_statement(
     }
 }
 
+/// The most iterations one `for` loop may unroll to. Real loops over bits
+/// and words are far below it; the point is to fail cleanly on a loop that
+/// never ends rather than lower forever.
+const MAX_LOOP_ITERATIONS: u32 = 1 << 16;
+
+/// Lowers a `for` loop by *unrolling* it: the loop is run here, while
+/// lowering, and the body is emitted once per iteration with the loop
+/// variable replaced by that iteration's value. No loop reaches the IR or
+/// the kernel. This is what a synthesis tool does with the same loop, and
+/// it's only possible because the loop's control -- its start value,
+/// condition and step -- must be compile-time constants: built from
+/// literals, parameters and the loop variable itself, never a signal.
+///
+/// Inside each copy of the body the variable is bound in `parameters`, so
+/// it resolves wherever a parameter does -- general expressions and the
+/// constant grammar of select bounds alike -- and `next_rd[j +: 4]` with
+/// `j` bound to 8 is simply the constant part-select `next_rd[11:8]`.
+///
+/// Restrictions, each rejected with its reason rather than approximated:
+///
+/// * The variable must be declared `integer` and assigned by the loop's
+///   own `i = ...` start and step (not `i++`/`i += 1`, not a loop-local
+///   `int i`). The body can't assign it, and it can't be read outside a
+///   loop -- so its value after the loop, which v1 doesn't track, is never
+///   observable. A nested loop can't reuse an enclosing loop's variable.
+/// * Its value must stay in `0 .. 2^31` at every step. Verilog's `integer`
+///   is signed and v1's constants are unsigned; in that range the two read
+///   the same.
+/// * For the same reason, a subtraction of two constants that goes
+///   negative anywhere in the loop -- `i - 1` on the iteration where `i`
+///   is 0 -- is rejected: Verilog would compare, shift or extend it as the
+///   negative `integer` it is, and v1 as a large unsigned number.
+fn lower_for(
+    for_loop: &sv_parser::LoopStatementFor,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Vec<Stmt>, String> {
+    let (_keyword, header, body) = &for_loop.nodes;
+    let (init, _, cond, _, step) = &header.nodes.1;
+
+    let Some(sv_parser::ForInitialization::ListOfVariableAssignments(init)) = init else {
+        return Err(
+            "a `for` loop must start by assigning an `integer` variable in v1 (`for (i = 0; \
+             ...)`) -- a loop-local declaration (`for (int i = 0; ...)`) or an empty start is \
+             not supported"
+                .to_string(),
+        );
+    };
+    let &[init] = init.nodes.0.contents().as_slice() else {
+        return Err(
+            "a `for` loop with more than one start assignment is not supported in v1".to_string(),
+        );
+    };
+    let var = loop_variable(&init.nodes.0, tree, module)?;
+
+    let cond = cond
+        .as_ref()
+        .ok_or("a `for` loop without a condition never ends, so it can't be unrolled")?;
+    let step = step
+        .as_ref()
+        .ok_or("a `for` loop without a step is not supported in v1")?;
+    let &[step] = step.nodes.0.contents().as_slice() else {
+        return Err(
+            "a `for` loop with more than one step assignment is not supported in v1".to_string(),
+        );
+    };
+    let sv_parser::ForStepAssignment::OperatorAssignment(step) = step else {
+        return Err(format!(
+            "a `for` loop step must be written `{var} = ...` in v1 (not `{var}++`/`{var}--`)"
+        ));
+    };
+    let operator = symbol_text(&step.nodes.1, tree).ok_or("loop step operator unreadable")?;
+    if operator != "=" {
+        return Err(format!(
+            "a `for` loop step must be written `{var} = ...` in v1 (not `{operator}`)"
+        ));
+    }
+    if loop_variable(&step.nodes.0, tree, module)? != var {
+        return Err(format!(
+            "a `for` loop's step must assign its own variable, '{var}'"
+        ));
+    }
+
+    let mut value = loop_control(&init.nodes.2, "start value", tree, module)?;
+    let mut unrolled = Vec::new();
+    let mut iterations = 0;
+    loop {
+        let mut bound = module.parameters.clone();
+        bound.insert(var.to_string(), (value, 32));
+        let inner = Ctx {
+            parameters: &bound,
+            ..*module
+        };
+
+        if loop_control(cond, "condition", tree, &inner)? == 0 {
+            break;
+        }
+        iterations += 1;
+        if iterations > MAX_LOOP_ITERATIONS {
+            return Err(format!(
+                "a `for` loop over '{var}' runs more than {MAX_LOOP_ITERATIONS} times; v1 \
+                 unrolls loops, and stops here rather than lowering one that may never end"
+            ));
+        }
+
+        let stmts = lower_statement_or_null(body, tree, &inner)?;
+        for stmt in &stmts {
+            let mut underflow = None;
+            stmt.visit_exprs(&mut |e| {
+                if underflow.is_none() {
+                    underflow = constant_underflow(e);
+                }
+            });
+            if let Some((lhs, rhs)) = underflow {
+                return Err(negative_in_loop(
+                    lhs,
+                    rhs,
+                    &format!("its body (where {var} = {value})"),
+                ));
+            }
+        }
+        unrolled.extend(stmts);
+
+        value = loop_control(&step.nodes.2, "step", tree, &inner)?;
+    }
+    Ok(unrolled)
+}
+
+/// The `integer` variable a `for` loop's start or step assigns.
+fn loop_variable<'a>(
+    lvalue: &'a sv_parser::VariableLvalue,
+    tree: &'a SyntaxTree,
+    module: &Ctx,
+) -> Result<&'a str, String> {
+    let plain = matches!(lvalue, sv_parser::VariableLvalue::Identifier(_))
+        && match unwrap_node!(lvalue, Select) {
+            Some(RefNode::Select(select)) => {
+                select.nodes.0.is_none()
+                    && select.nodes.1.nodes.0.is_empty()
+                    && select.nodes.2.is_none()
+            }
+            _ => true,
+        };
+    if !plain {
+        return Err("a `for` loop must assign a plain `integer` variable in v1".to_string());
+    }
+    let ident =
+        unwrap_node!(lvalue, SimpleIdentifier).ok_or("loop variable identifier unreadable")?;
+    let name = ident_str(ident, tree).ok_or("loop variable identifier unreadable")?;
+    if module.parameters.contains_key(name) {
+        return Err(format!(
+            "'{name}' is already the variable of an enclosing `for` loop -- an inner loop \
+             reusing it would change how many times the outer one runs, which v1 doesn't \
+             support"
+        ));
+    }
+    if !module.integers.contains(name) {
+        return Err(format!(
+            "'{name}' is used as a `for` loop variable but isn't declared `integer` -- v1 \
+             supports only `integer` loop variables"
+        ));
+    }
+    Ok(name)
+}
+
+/// Evaluates a `for` loop's start value, condition or step to the constant
+/// it must be. See `lower_for` for the range it has to stay in, and why.
+fn loop_control(
+    expr: &sv_parser::Expression,
+    what: &str,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<u64, String> {
+    let lowered = lower_expr(expr, tree, module)?;
+    let mut underflow = None;
+    lowered.visit(&mut |e| {
+        if underflow.is_none() {
+            underflow = constant_underflow(e);
+        }
+    });
+    if let Some((lhs, rhs)) = underflow {
+        return Err(negative_in_loop(lhs, rhs, &format!("its {what}")));
+    }
+    let value = try_const_fold(&lowered).ok_or_else(|| {
+        format!(
+            "a `for` loop's {what} must be a compile-time constant in v1, since the loop is \
+             unrolled while lowering -- this one reads a signal"
+        )
+    })?;
+    if value >= 1 << 31 {
+        return Err(format!(
+            "a `for` loop's {what} evaluates to {value}, outside 0..2^31 -- v1 keeps loop \
+             variables where reading an `integer` as signed or as unsigned gives the same number"
+        ));
+    }
+    Ok(value)
+}
+
+/// A subtraction of two compile-time constants that goes below zero, as
+/// its two operands.
+fn constant_underflow(expr: &Expr) -> Option<(u64, u64)> {
+    let Expr::Sub(lhs, rhs) = expr else {
+        return None;
+    };
+    let (lhs, rhs) = (try_const_fold(lhs)?, try_const_fold(rhs)?);
+    (lhs < rhs).then_some((lhs, rhs))
+}
+
+fn negative_in_loop(lhs: u64, rhs: u64, place: &str) -> String {
+    format!(
+        "a `for` loop computes {lhs} - {rhs} in {place}, which is negative -- Verilog does \
+         `integer` arithmetic signed, and v1 evaluates constants unsigned, so the two would \
+         disagree wherever the result is compared, shifted right or widened. Rejected rather \
+         than guessed"
+    )
+}
+
+fn integer_outside_loop(name: &str) -> String {
+    format!(
+        "'{name}' is an `integer`, which v1 supports only as a `for` loop variable, used \
+         inside the loop it controls"
+    )
+}
+
+/// The signal a procedural assignment writes, by name.
+fn procedural_target(name: &str, module: &Ctx) -> Result<SignalId, String> {
+    module.signal_id(name).ok_or_else(|| {
+        if module.integers.contains(name) && module.parameters.contains_key(name) {
+            format!(
+                "a `for` loop's body assigns its own variable '{name}', which v1 doesn't \
+                 support -- the loop is unrolled with '{name}' fixed on each iteration"
+            )
+        } else if module.integers.contains(name) {
+            integer_outside_loop(name)
+        } else {
+            format!("assignment target '{name}' is not a known signal")
+        }
+    })
+}
+
 fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Ctx) -> Result<Vec<Stmt>, String> {
     let mut out = Vec::new();
     for stmt in &seq.nodes.3 {
@@ -2035,7 +2339,11 @@ fn lower_seq_block(seq: &SeqBlock, tree: &SyntaxTree, module: &Ctx) -> Result<Ve
 /// folding `cond_stmt.nodes.4`'s `else if` clauses onto the final `else`
 /// (`nodes.5`) from the last clause backward, then wrapping the first
 /// `if` around the result.
-fn lower_if(cond_stmt: &ConditionalStatement, tree: &SyntaxTree, module: &Ctx) -> Result<Stmt, String> {
+fn lower_if(
+    cond_stmt: &ConditionalStatement,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Stmt, String> {
     // A condition is self-determined: tested at its own width, so
     // `if (a + b)` is false when the sum wraps to zero. See `width`.
     let cond = width::self_determined(
@@ -2094,7 +2402,11 @@ fn lower_cond_predicate(
 /// (including every item under plain `case`) is exact-match, unchanged
 /// from before. `inside`/pattern-matching case forms
 /// (`CaseStatement::Matches`/`Inside`) aren't supported.
-fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Ctx) -> Result<Stmt, String> {
+fn lower_case(
+    case: &sv_parser::CaseStatement,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Stmt, String> {
     let sv_parser::CaseStatement::Normal(normal) = case else {
         return Err("`inside`/pattern-matching case forms are not supported in v1".to_string());
     };
@@ -2150,7 +2462,9 @@ fn lower_case(case: &sv_parser::CaseStatement, tree: &SyntaxTree, module: &Ctx) 
     }
     let (mut prepared, joint_width) = width::jointly(exprs, wildcard_width, module)?;
     let mut prepared = prepared.drain(..);
-    let selector = prepared.next().expect("the selector was the first expression");
+    let selector = prepared
+        .next()
+        .expect("the selector was the first expression");
 
     let joint_mask = mask_to(u64::MAX, joint_width);
     let arms = arms
@@ -2303,8 +2617,7 @@ fn lower_blocking_assign(
                 .to_string(),
         );
     };
-    let operator =
-        symbol_text(&op_assign.nodes.1, tree).ok_or("assignment operator unreadable")?;
+    let operator = symbol_text(&op_assign.nodes.1, tree).ok_or("assignment operator unreadable")?;
     if operator != "=" {
         return Err(format!(
             "compound assignment '{operator}' is not supported in v1 -- write it out as \
@@ -2343,9 +2656,7 @@ fn lower_procedural_assign(
     let lhs_ident = unwrap_node!(lvalue, SimpleIdentifier)
         .ok_or("assignment target is not a simple identifier")?;
     let target_name = ident_str(lhs_ident, tree).ok_or("assignment target unreadable")?;
-    let target = module
-        .signal_id(target_name)
-        .ok_or_else(|| format!("assignment target '{target_name}' is not a known signal"))?;
+    let target = procedural_target(target_name, module)?;
 
     // Writing an array element (`mem[i] <= v;`) addresses a chosen
     // element rather than a bit range of a fixed signal, so it's its own
@@ -2363,11 +2674,20 @@ fn lower_procedural_assign(
         };
         let index = width::self_determined(*index, module)?;
         let element_width = module.signals[target].width;
-        let value = width::for_assignment(lower_expr(value_expr, tree, module)?, element_width, module)?;
+        let value =
+            width::for_assignment(lower_expr(value_expr, tree, module)?, element_width, module)?;
         return Ok(vec![if blocking {
-            Stmt::BlockingArrayAssign { array, index, value }
+            Stmt::BlockingArrayAssign {
+                array,
+                index,
+                value,
+            }
         } else {
-            Stmt::ArrayAssign { array, index, value }
+            Stmt::ArrayAssign {
+                array,
+                index,
+                value,
+            }
         }]);
     }
 
@@ -2452,9 +2772,7 @@ fn lower_concat_target_assign(
             .ok_or("concatenation assignment target part is not a simple identifier")?;
         let name =
             ident_str(ident, tree).ok_or("concatenation assignment target part unreadable")?;
-        let target = module
-            .signal_id(name)
-            .ok_or_else(|| format!("assignment target '{name}' is not a known signal"))?;
+        let target = procedural_target(name, module)?;
         // Without this, `mem[0]` would be taken as bit 0 of the array
         // signal rather than as an element of it.
         if module.signals[target].depth.is_some() {
@@ -2555,6 +2873,35 @@ fn lower_concat_target_assign(
 /// silently wrong for anything else, and "silently wrong for some inputs"
 /// is the failure this whole area of the frontend just got bitten by
 /// (docs/decisions.md D25).
+/// Whether a variable declaration declares `integer`s -- which v1 supports
+/// only as `for` loop variables (see `Ctx`) -- rather than ordinary `reg`/
+/// `logic`/`bit` signals. Every other data type is rejected. Until this
+/// check existed, a declaration's type was never looked at: its width came
+/// from a packed range if it had one and was 1 bit otherwise, so `integer
+/// i;` and `int n;` were silently 1-bit unsigned signals.
+fn is_integer_declaration(var: &sv_parser::DataDeclarationVariable) -> Result<bool, String> {
+    use sv_parser::{DataType, DataTypeOrImplicit, IntegerAtomType};
+    match &var.nodes.3 {
+        DataTypeOrImplicit::ImplicitDataType(_) => Ok(false),
+        DataTypeOrImplicit::DataType(data_type) => match &**data_type {
+            DataType::Vector(_) => Ok(false),
+            DataType::Atom(atom) => match &atom.nodes.0 {
+                IntegerAtomType::Integer(_) => Ok(true),
+                _ => Err(
+                    "`int`, `byte`, `shortint`, `longint` and `time` variables are not \
+                     supported in v1 (only `integer`, as a `for` loop variable)"
+                        .to_string(),
+                ),
+            },
+            _ => Err(
+                "this variable data type is not supported in v1 (only `reg`/`logic`/`bit` \
+                 vectors, and `integer` as a `for` loop variable)"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
 fn reject_variable_initializer(
     var: &sv_parser::DataDeclarationVariable,
     tree: &SyntaxTree,
@@ -2698,7 +3045,11 @@ fn lower_continuous_assign(
 /// walker-produced nodes do -- matching on the concrete enum's own
 /// variants directly sidesteps that ambiguity entirely instead of trying
 /// to pattern-match an inconsistently-shaped `RefNode`.
-fn lower_expr(expr: &sv_parser::Expression, tree: &SyntaxTree, module: &Ctx) -> Result<Expr, String> {
+fn lower_expr(
+    expr: &sv_parser::Expression,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Expr, String> {
     use sv_parser::Expression as E;
     match expr {
         E::Primary(primary) => lower_primary(primary, tree, module),
@@ -2968,7 +3319,11 @@ fn lower_string_literal(
     // zero-width literal would be meaningless to every consumer of
     // `expr_width`, so it takes the width of the one null character that
     // reading is closest to.
-    let width = if body.is_empty() { 8 } else { body.len() as u32 * 8 };
+    let width = if body.is_empty() {
+        8
+    } else {
+        body.len() as u32 * 8
+    };
     Ok(Expr::Literal { value, width })
 }
 
@@ -3117,7 +3472,11 @@ fn apply_binary_op(op_text: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> 
 /// expression) and would wrongly lower the *entire* primary as just a
 /// reference to `a`, silently discarding the `== b` part. Matching the
 /// immediate variant avoids reaching past the primary's own top level.
-fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) -> Result<Expr, String> {
+fn lower_primary(
+    primary: &sv_parser::Primary,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<Expr, String> {
     use sv_parser::Primary as P;
     match primary {
         P::PrimaryLiteral(lit) => match &**lit {
@@ -3133,10 +3492,14 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) 
             // resolved to a plain Literal right here rather than an
             // Expr::Ref, since it has no SignalId and the kernel never
             // needs to know it existed (see lower_parameters).
+            // A `for` loop variable is bound in `parameters` too, inside
+            // the loop body -- see `lower_for`.
             let base = if let Some(id) = module.signal_id(name) {
                 Expr::Ref(id)
             } else if let Some(&(value, width)) = module.parameters.get(name) {
                 Expr::Literal { value, width }
+            } else if module.integers.contains(name) {
+                return Err(integer_outside_loop(name));
             } else {
                 return Err(format!("reference to unknown signal or parameter '{name}'"));
             };
@@ -3151,7 +3514,8 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) 
         P::Concatenation(concat) => {
             if concat.nodes.1.is_some() {
                 return Err(
-                    "indexing into a concatenation (`{a,b}[3:0]`) is not supported in v1".to_string(),
+                    "indexing into a concatenation (`{a,b}[3:0]`) is not supported in v1"
+                        .to_string(),
                 );
             }
             lower_concatenation(&concat.nodes.0, tree, module)
@@ -3166,7 +3530,9 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) 
             lower_multiple_concatenation(&mc.nodes.0, tree, module)
         }
         P::FunctionSubroutineCall(call) => lower_system_function_call(call, tree, module),
-        other => Err(format!("primary expression form not supported in v1: {other:?}")),
+        other => Err(format!(
+            "primary expression form not supported in v1: {other:?}"
+        )),
     }
 }
 
@@ -3174,7 +3540,8 @@ fn lower_primary(primary: &sv_parser::Primary, tree: &SyntaxTree, module: &Ctx) 
 /// (see `ictus_ir::Expr::Signed`'s doc comment for its semantics and why
 /// v1 needs it: picorv32 uses it throughout for RISC-V immediate
 /// sign-extension, e.g. `decoded_imm <= $signed(mem_rdata_q[31:20]);`).
-/// Every other system function (`$unsigned`, `$display`, ...) and every
+/// `$unsigned(expr)` is supported too, as a select of all its bits. Every
+/// other system function (`$display`, `$clog2`, ...) and every
 /// other `SubroutineCall` form (a plain task/function call, a method
 /// call, `randomize()`) is rejected, not guessed at.
 fn lower_system_function_call(
@@ -3200,31 +3567,43 @@ fn lower_system_function_call(
     let name = tree
         .get_str(&args.nodes.0.nodes.0)
         .ok_or("system function name unreadable")?;
-    if name != "$signed" {
+    if name != "$signed" && name != "$unsigned" {
         return Err(format!(
-            "system function '{name}' is not supported in v1 (only $signed is)"
+            "system function '{name}' is not supported in v1 (only $signed and $unsigned are)"
         ));
     }
 
-    let arguments = args.nodes.1.nodes.1.0.contents();
+    let arguments = args.nodes.1.nodes.1 .0.contents();
     if arguments.len() != 1 {
-        return Err("$signed(...) must take exactly one argument in v1".to_string());
+        return Err(format!("{name}(...) must take exactly one argument in v1"));
     }
     let argument = arguments[0]
         .as_ref()
-        .ok_or("$signed(...) argument is missing")?;
+        .ok_or_else(|| format!("{name}(...) argument is missing"))?;
 
     let inner = lower_expr(argument, tree, module)?;
     let width = expr_width(&inner, module)?;
+    if name == "$unsigned" {
+        // The same bits, read as unsigned, at the argument's own
+        // (self-determined) width -- which is exactly a select of all of
+        // them: a select is unsigned, and `width` sizes its base on its
+        // own, so `$unsigned(a + b)` still drops the carry, and
+        // `$unsigned($signed(x))` drops the sign extension.
+        return Ok(Expr::Select {
+            base: Box::new(inner),
+            msb: width - 1,
+            lsb: 0,
+        });
+    }
     Ok(Expr::Signed(Box::new(inner), width))
 }
 
 /// Applies a `Select` (`x[3]`, `x[i]`, `x[7:0]`, or neither for a plain
 /// reference) to an already-lowered `base` expression. Part-select bounds
-/// (`x[7:0]`) must still be constants known at lowering time --
-/// `PartSelectRange::ConstantRange` only, not `IndexedRange`
-/// (`x[base +: width]`, a variable base with fixed width), which isn't
-/// supported yet. A single bit-select's index (`x[3]` or `x[i]`) can be
+/// (`x[7:0]`) must still be constants known at lowering time, and so must
+/// an indexed part-select's base (`x[j +: 4]`, see `lower_indexed_range`);
+/// every constant select is checked against its base's width (see
+/// `check_read_range`). A single bit-select's index (`x[3]` or `x[i]`) can be
 /// anything: an expression that folds to a constant at lowering time
 /// (via `try_const_fold` -- not just a bare literal like `3`, but
 /// anything built from literals and already-resolved parameter
@@ -3248,26 +3627,29 @@ fn lower_select(
         }
     }
 
-    // Part-select: `x[msb:lsb]`.
+    // Part-select: `x[msb:lsb]`, or indexed, `x[base +: width]`.
     if let Some(bracket) = &select.nodes.2 {
-        return match &bracket.nodes.1 {
+        let (msb, lsb) = match &bracket.nodes.1 {
             sv_parser::PartSelectRange::ConstantRange(range) => {
                 let msb = lower_constant_index(&range.nodes.0, tree, module.parameters)?;
                 let lsb = lower_constant_index(&range.nodes.2, tree, module.parameters)?;
                 if lsb > msb {
-                    return Err(format!("part-select `[{msb}:{lsb}]` has lsb greater than msb"));
+                    return Err(format!(
+                        "part-select `[{msb}:{lsb}]` has lsb greater than msb"
+                    ));
                 }
-                Ok(Expr::Select {
-                    base: Box::new(base),
-                    msb,
-                    lsb,
-                })
+                (msb, lsb)
             }
-            sv_parser::PartSelectRange::IndexedRange(_) => Err(
-                "indexed part-select (`x[base +: width]`/`x[base -: width]`) is not supported in v1"
-                    .to_string(),
-            ),
+            sv_parser::PartSelectRange::IndexedRange(range) => {
+                lower_indexed_range(range, tree, module)?
+            }
         };
+        check_read_range(&base, msb, module)?;
+        return Ok(Expr::Select {
+            base: Box::new(base),
+            msb,
+            lsb,
+        });
     }
 
     // Bit-select: `x[3]` (or no select at all, if the bracket list is empty).
@@ -3277,7 +3659,8 @@ fn lower_select(
             let index = lower_expr(&only.nodes.1, tree, module)?;
             match try_const_fold(&index) {
                 Some(value) => {
-                    let bit = value as u32;
+                    let bit = constant_bit(value)?;
+                    check_read_range(&base, bit, module)?;
                     Ok(Expr::Select {
                         base: Box::new(base),
                         msb: bit,
@@ -3336,6 +3719,59 @@ fn lower_array_index(
              multi-dimensional array) is not supported in v1"
         )),
     }
+}
+
+/// Resolves an indexed part-select -- `x[base +: width]`, bits `base`
+/// upward, or `x[base -: width]`, bits `base` downward -- to the `(msb,
+/// lsb)` it selects, for reads and assignment targets alike. Verilog
+/// requires the width to be constant but lets the base vary at run time;
+/// v1 needs the base constant too, which is what a `for` loop variable is
+/// once the loop is unrolled (picorv32's multiplier: `next_rd[j +:
+/// CARRY_CHAIN]`).
+fn lower_indexed_range(
+    range: &sv_parser::IndexedRange,
+    tree: &SyntaxTree,
+    module: &Ctx,
+) -> Result<(u32, u32), String> {
+    let base = lower_expr(&range.nodes.0, tree, module)?;
+    let base = try_const_fold(&base).ok_or(
+        "an indexed part-select (`x[base +: width]`) whose base isn't a compile-time constant \
+         is not supported in v1 -- a constant base, such as a `for` loop variable, is",
+    )?;
+    let base = constant_bit(base)?;
+    let width = lower_constant_index(&range.nodes.2, tree, module.parameters)?;
+    if width == 0 {
+        return Err("an indexed part-select's width must be at least 1".to_string());
+    }
+    let op = symbol_text(&range.nodes.1, tree).ok_or("indexed part-select operator unreadable")?;
+    let range = match op {
+        "+:" => base.checked_add(width - 1).map(|msb| (msb, base)),
+        "-:" => base.checked_sub(width - 1).map(|lsb| (base, lsb)),
+        other => return Err(format!("unknown indexed part-select operator '{other}'")),
+    };
+    range.ok_or_else(|| format!("indexed part-select `[{base} {op} {width}]` reaches below bit 0"))
+}
+
+/// A constant bit position, which must fit a `u32` -- a plain `as u32`
+/// would wrap a huge value (a negative index computed on 64 bits, say)
+/// into a small, valid-looking one.
+fn constant_bit(value: u64) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("bit position {value} is out of range"))
+}
+
+/// Rejects a constant select that reaches past the value it selects from.
+/// Verilog reads such bits as `x`; the kernel would read zeros, or for a
+/// position of 64 or more, fail. Not reachable from ordinary source until
+/// `for` loops made positions computed (`x[i + 1]` on the last iteration).
+fn check_read_range(base: &Expr, msb: u32, module: &Ctx) -> Result<(), String> {
+    let width = expr_width(base, module)?;
+    if msb >= width {
+        return Err(format!(
+            "a select of bit {msb} is out of range for a {width}-bit value -- Verilog reads \
+             out-of-range bits as `x`, and v1 rejects a constant select that reaches them"
+        ));
+    }
+    Ok(())
 }
 
 /// A bit-select/part-select bound (`x[7:0]`) is the same constant-
@@ -3452,10 +3888,11 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
 /// (`x[i] <= v;`, `i` a genuine signal -- checked via `try_const_fold`,
 /// the same helper `lower_select`'s read-side bit-select uses, so
 /// `x[regindex_bits-1] <= v;` is accepted the same way a read would be)
-/// or an indexed part-select (`x[base +: width] <= v;`) would need the
+/// or an indexed part-select with a variable base would need the
 /// kernel to compute the write range at simulation time rather than
 /// lowering time, which the kernel doesn't implement -- both are
-/// rejected here with a specific error rather than silently doing the
+/// rejected here (an indexed part-select with a *constant* base, such as
+/// an unrolled `for` loop variable, is fine: see `lower_indexed_range`) with a specific error rather than silently doing the
 /// wrong thing. Multi-dimensional indexing (array signals) is likewise
 /// rejected, matching `lower_select`'s read-side restriction.
 fn lower_select_target_range<'a, T>(
@@ -3484,9 +3921,9 @@ where
                 }
                 Ok(Some((msb, lsb)))
             }
-            sv_parser::PartSelectRange::IndexedRange(_) => Err(format!(
-                "assignment target '{target_name}' uses an indexed part-select (`x[base +: width]`), which v1 doesn't support as a write target"
-            )),
+            sv_parser::PartSelectRange::IndexedRange(range) => {
+                Ok(Some(lower_indexed_range(range, tree, module)?))
+            }
         };
     }
 
@@ -3497,7 +3934,7 @@ where
             let index = lower_expr(&only.nodes.1, tree, module)?;
             match try_const_fold(&index) {
                 Some(value) => {
-                    let bit = value as u32;
+                    let bit = constant_bit(value)?;
                     Ok(Some((bit, bit)))
                 }
                 None => Err(format!(
@@ -3667,7 +4104,8 @@ fn lower_size(size: &Option<sv_parser::Size>, tree: &SyntaxTree) -> Result<u32, 
 }
 
 fn locate_text<'a>(locate: &'a Locate, tree: &'a SyntaxTree) -> Result<&'a str, String> {
-    tree.get_str(locate).ok_or_else(|| "could not read literal text".to_string())
+    tree.get_str(locate)
+        .ok_or_else(|| "could not read literal text".to_string())
 }
 
 fn strip_underscores(s: &str) -> String {

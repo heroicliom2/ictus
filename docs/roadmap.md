@@ -1174,15 +1174,52 @@ signal written by any part but the last -- so the multiplier's form still
 lowers. An array element as a concatenation-target part is rejected too;
 it was being taken as a bit of the array signal.
 
-**Next: the multiplier.** `picorv32_pcpi_mul` uses nested `for` loops over
-`integer` variables, indexed part-selects (`next_rd[j +: CARRY_CHAIN]`) on
-both sides of an assignment, and `$unsigned`. The loops have constant
-bounds, so they can be unrolled at lowering time, which turns the indexed
-part-selects into ordinary constant ones. That completes picorv32's M
-extension -- the four multiply tests are already built and waiting in the
-rv32im image set -- and `picorv32_pcpi_fast_mul` additionally needs
-`$unsigned`. Then **Cranelift codegen**, whose precondition from D12 is
-met.
+**`for` loops are done, and with them picorv32's whole M extension**
+(decisions.md D33). A loop is *unrolled* while lowering -- run by the
+frontend, with the body emitted once per iteration and the loop variable
+replaced by that iteration's value -- so no loop reaches the IR or the
+kernel, and `next_rd[j +: 4]` with `j` bound to 8 is simply the constant
+part-select `next_rd[11:8]`. That is what a synthesis tool does with the
+same loop, and it works because a loop's start, condition and step must
+be compile-time constants.
+
+- `integer` variables are supported only as loop variables. They used to
+  lower, silently, as **1-bit** signals (a declaration's type was never
+  looked at); now they are not signals at all, a use outside a loop is an
+  error, and `int`/`byte`/`real` and the other types are rejected.
+- Verilog's `integer` is signed and v1's constants are unsigned, so a loop
+  variable must stay in `0 .. 2^31`, and a constant subtraction that goes
+  negative inside a loop is rejected. That rules out the descending loop
+  that runs to -1 (`for (i = 7; i >= 0; i = i - 1)`); `for (i = 8; i > 0;
+  i = i - 1)` with `i - 1` in the body is the accepted spelling.
+- Indexed part-selects (`x[j +: 4]`, `x[k -: 4]`) are supported on both
+  sides of an assignment, with a constant base -- an unrolled loop
+  variable, or anything else that folds.
+- `$unsigned(x)` is supported: `x`'s bits read as unsigned, at `x`'s own
+  width.
+- A constant select reaching past its value's width (`a[i + 1]` on the
+  last iteration) is now rejected on reads too, as it already was on
+  writes; Verilog reads those bits as `x`.
+
+Verified by `differential_for_loop.rs` (twelve outputs: indices, computed
+`+:`/`-:` bases, a descending loop, nested loops, a loop-carried
+dependency, the loop variable as a value, a clocked loop, and
+`$unsigned`; against Icarus *and* an independent Python model) and by
+`differential_picorv32_isa.rs`'s new `m_extension` and `fast_multiplier`
+configurations, which run all eight rv32im programs through picorv32's
+divider and either multiplier. Dropping one iteration of each loop makes
+exactly `mulh`, `mulhsu` and `mulhu` fail (they read the product's high
+half; `mul` doesn't), and leaves the loop-free fast multiplier passing.
+
+**Next: three declaration forms still silently misread** -- all
+confirmed against Icarus while writing this up, none used by picorv32.
+`reg signed` is lowered unsigned (the keyword is never looked at, so
+`s >>> 1` of a negative `s` gives 5 where Icarus gives 253), and a
+declared range is kept only as a width, so `reg [8:1] r; r[1]` reads the
+wrong bit, as does `reg [0:7] r; r[0]`. Each should become either
+correct or a rejection. Then **Cranelift codegen**, whose precondition
+from D12 is met.
+
 
 The supported language subset is still intentionally narrow:
 ANSI-style modules -- the first in the file is the top, and the rest can
@@ -1194,7 +1231,8 @@ standalone `assign` and a net declaration carrying an initializer),
 resolution pass (value expressions may reference an earlier parameter/
 localparam, and use `+ - * << >> >>> & | ^ == != < <= > >= && ||`, the
 ternary operator, and concatenation; a `parameter` can be overridden at
-the top or at a named instantiation), constant/variable bit-select and constant part-select,
+the top or at a named instantiation), constant/variable bit-select, constant part-select, and
+indexed part-select (`+:`/`-:`) with a constant base, on reads and targets,
 concatenation (plain and replication) and ternary on reads only -- with
 comparison/logical/reduction results and binary bitwise/arithmetic
 results, not just literals/refs/selects, valid as concatenation operands
@@ -1210,14 +1248,16 @@ wider assignment target and to mark operands for the signed-aware
 operators -- a real arithmetic right shift (`$signed(x) >>> n`) and a
 real signed ordering comparison (`$signed(a) < $signed(b)`) -- but *not*
 a logical right shift of a `$signed(...)` value, nor a *mixed*
-signed/unsigned comparison (and no other system function), a call to a
+signed/unsigned comparison, `$unsigned(...)` (and no other system function), a call to a
 provably-empty task but no other task/function calls, logical `!`,
 bitwise `~`, unary `-` and `+`, and the reduction operators, a 4-state `x`/`z` literal
 outside a case item (resolves to `0`), array/memory signals (`reg [31:0]
 mem [0:31]`) with one unpacked dimension, internal-only, one element at a
 time -- but no array port, no bit-select of an element, and no `assign`
 to one -- and both `<=` and `=` inside a clocked block, but no compound
-assignment (`+=` and friends), no explicit sensitivity list, no `negedge`
+assignment (`+=` and friends), `for` loops with constant control over an
+`integer` variable (unrolled while lowering; the variable is usable only
+inside its loop) but no other loop kind, no explicit sensitivity list, no `negedge`
 block, `generate if` but not `generate for`/`generate case`, named
 module instantiation but no positional ports or parameters and no
 instance arrays, a single clock domain, and at most one driving process
@@ -1226,8 +1266,8 @@ or assignment per signal. Expression widths and signedness follow IEEE
 `$signed(...)` operand with an unsigned one is rejected. The whole of
 picorv32.v lowers within this subset, and it runs picorv32's complete
 base-ISA test suite -- in four configurations, including compressed
-instructions -- plus the divide and remainder tests through its
-instantiated hardware divider, with every traced port and the final
+instructions -- plus the whole M extension through its instantiated
+divider and either of its multipliers, with every traced port and the final
 register file matching Icarus; Cranelift codegen is further out still.
 
 

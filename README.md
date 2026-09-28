@@ -166,8 +166,22 @@ a `$signed(...)` value with an unsigned one: it's rejected rather than
 guessed at, because whether `$signed(a) + 1` is signed depends on how the
 `1` was written, which Ictus doesn't yet track.
 
-Next is picorv32's multiplier, which needs `for` loops; Cranelift JIT
-codegen comes after that.
+`for` loops work now, so picorv32's multiplier runs too, and with it the
+whole M extension: all eight multiply and divide tests match Icarus, with
+either of picorv32's two multipliers. Ictus *unrolls* a loop while it
+reads the design, the way a synthesis tool does: the body is copied once
+per iteration with the loop counter replaced by that iteration's value,
+so the simulator itself never sees a loop. That needs the loop's bounds
+to be constants, which in RTL they almost always are.
+
+Preparing for it turned up another silent wrong answer, in blocking
+assignment to a concatenation: `{x, y} = {y, x};` set both to `y`.
+Where that would happen it's now rejected.
+
+Next: three declaration forms that are still silently misread, all
+confirmed against Icarus — `reg signed` (the keyword is ignored), and
+ranges that don't end at bit 0 (`[8:1]`, `[0:7]`) — then Cranelift JIT
+codegen.
 
 ## Workspace layout
 

@@ -171,6 +171,16 @@ the next processing stage needs — e.g., turning a frontend's AST into this
 project's shared IR (docs/architecture.md, Pipeline). "Lower" just means
 "more explicit/mechanical, less abstract," not "worse."
 
+**Loop unrolling** — replacing a loop with that many copies of its body,
+one per iteration, each with the loop counter replaced by that iteration's
+actual number. `for (i = 0; i < 3; i = i + 1) y[i] = a[2 - i];` unrolls to
+`y[0] = a[2]; y[1] = a[1]; y[2] = a[0];`. It needs the number of
+iterations to be known in advance — a constant, not something a signal
+decides. Synthesis tools do the same thing to RTL `for` loops (a loop
+becomes replicated hardware, not a circuit that loops), and Ictus does it
+while lowering, so the simulator itself never sees a loop (decisions.md
+D33).
+
 **Codegen (code generation)** — the step where a compiler produces the
 final output form — actual CPU machine instructions, in this project's
 case — from whatever representation it's been working with internally.

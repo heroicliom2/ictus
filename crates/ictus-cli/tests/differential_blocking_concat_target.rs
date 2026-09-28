@@ -40,12 +40,12 @@ fn blocking_concat_target_test_matches_icarus_verilog() {
         ictus_trace,
         vec![
             // ({hi,lo} = {a,b}+1, {cout,sum} = a+b, {q_hi,q_lo} = {a^b,a}-3)
-            (3, 10, 0, 12, 10, 0),  // a=3,  b=9
-            (0, 0, 1, 14, 0, 12),   // a=15, b=15: {a,b}+1 wraps to 0
-            (0, 1, 0, 0, 15, 13),   // a=0,  b=0: {0,0}-3 wraps to 0xFD
-            (8, 8, 0, 15, 15, 5),   // a=8,  b=7
-            (0, 3, 0, 2, 1, 13),    // a=0,  b=2
-            (12, 6, 1, 1, 9, 9),    // a=12, b=5: carry out of the sum
+            (3, 10, 0, 12, 10, 0), // a=3,  b=9
+            (0, 0, 1, 14, 0, 12),  // a=15, b=15: {a,b}+1 wraps to 0
+            (0, 1, 0, 0, 15, 13),  // a=0,  b=0: {0,0}-3 wraps to 0xFD
+            (8, 8, 0, 15, 15, 5),  // a=8,  b=7
+            (0, 3, 0, 2, 1, 13),   // a=0,  b=2
+            (12, 6, 1, 1, 9, 9),   // a=12, b=5: carry out of the sum
         ],
         "expected each value split across its target with the carry kept"
     );

@@ -31,7 +31,7 @@
 //!      can't make (see `differential_picorv32.rs` on a core that
 //!      reproduced every bus cycle while executing nothing).
 //!
-//! **Configurations.** The programs run against five configurations of
+//! **Configurations.** The programs run against six configurations of
 //! picorv32, each applied to Ictus with `lower_file_with_parameters` and
 //! to Icarus with generated `defparam`s. Two questions about them are easy
 //! to conflate, and were measured separately:
@@ -51,13 +51,13 @@
 //!     instead. That the override mechanism itself works is established
 //!     directly, by ictus-frontend-verilog's own tests.
 //!
-//! **What isn't covered**: the four multiply tests, which need
-//! `ENABLE_MUL`. The multiplier is a separate module picorv32 instantiates
-//! -- instantiation works (the `divider` configuration runs the divide and
-//! remainder tests through one) -- but its body uses `for` loops Ictus
-//! can't lower yet. The images are built by `bench/isa/build.sh` and
-//! committed, so this test needs no RISC-V toolchain. See
-//! docs/decisions.md D28, D29 and D30.
+//! **The M extension** runs through the hardware picorv32 instantiates for
+//! it -- a divider plus one of two multipliers -- so the `m_extension` and
+//! `fast_multiplier` configurations are also the test of module
+//! instantiation (D30) and of `for` loops (D33): the sequential
+//! multiplier's carry-save adder is a pair of nested loops. The images are
+//! built by `bench/isa/build.sh` and committed, so this test needs no
+//! RISC-V toolchain. See docs/decisions.md D28, D29, D30 and D33.
 
 use ictus_ir::Module;
 use ictus_kernel::Simulation;
@@ -151,19 +151,34 @@ fn compressed_configuration_matches_icarus_verilog() {
     );
 }
 
-/// picorv32's hardware divider, which is a separate module
-/// (`picorv32_pcpi_div`) that picorv32 instantiates when `ENABLE_DIV` is
-/// set -- so this is the first run of the design in which Ictus has
-/// flattened an instance, and the instance is doing real work: every
-/// `div`, `divu`, `rem` and `remu` in these programs is computed by it,
-/// over the co-processor interface, across many cycles. See
-/// docs/decisions.md D30.
-///
-/// Only the four divide/remainder programs run; the multiply ones need
-/// `ENABLE_MUL`, whose multiplier uses `for` loops Ictus can't lower yet.
+/// The whole M extension, in the hardware picorv32 instantiates for it:
+/// `picorv32_pcpi_div` for `div`/`divu`/`rem`/`remu`, and the sequential
+/// `picorv32_pcpi_mul` for `mul`/`mulh`/`mulhsu`/`mulhu` -- a shift-and-add
+/// multiplier whose carry-save adder is written as nested `for` loops with
+/// indexed part-selects, so this is where unrolling (D33) meets a real
+/// design. Each instruction is computed by an instance over the
+/// co-processor interface, across many cycles. See docs/decisions.md D30.
 #[test]
-fn divider_configuration_matches_icarus_verilog() {
-    run_configuration("divider", RV32IM, &[("ENABLE_DIV", 1)]);
+fn m_extension_configuration_matches_icarus_verilog() {
+    run_configuration(
+        "m_extension",
+        RV32IM,
+        &[("ENABLE_MUL", 1), ("ENABLE_DIV", 1)],
+    );
+}
+
+/// The same programs with `picorv32_pcpi_fast_mul` in place of the
+/// sequential multiplier: a single wide `*`, on operands sign- or
+/// zero-extended with `$signed`/`$unsigned` to 33 bits, finishing in a
+/// few cycles instead of dozens -- so the traces differ from the
+/// `m_extension` configuration's, and both have to match Icarus.
+#[test]
+fn fast_multiplier_configuration_matches_icarus_verilog() {
+    run_configuration(
+        "fast_multiplier",
+        RV32IM,
+        &[("ENABLE_FAST_MUL", 1), ("ENABLE_DIV", 1)],
+    );
 }
 
 /// The image sets `bench/isa/build.sh` produces.
@@ -171,8 +186,10 @@ const RV32I: &str = "picorv32_isa";
 const RV32IC: &str = "picorv32_isa_c";
 const RV32IM: &str = "picorv32_isa_m";
 
-/// The programs in the rv32im set that the divider alone can run.
-const DIVIDER_PROGRAMS: [&str; 4] = ["div", "divu", "rem", "remu"];
+/// The programs in the rv32im set: the multiply and divide instructions.
+const M_PROGRAMS: [&str; 8] = [
+    "div", "divu", "mul", "mulh", "mulhsu", "mulhu", "rem", "remu",
+];
 
 /// Runs a set of programs against picorv32 with `overrides` applied -- to
 /// Ictus through `lower_file_with_parameters`, and to Icarus through a
@@ -196,17 +213,14 @@ fn run_configuration(label: &str, image_set: &str, overrides: &[(&str, u64)]) {
         .collect();
     images.sort();
     match image_set {
-        // The divide/remainder programs are only half the M set; the
-        // multiply half needs a multiplier this configuration doesn't have.
         RV32IM => {
-            images.retain(|path| {
-                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                DIVIDER_PROGRAMS.contains(&name)
-            });
+            let names: Vec<&str> = images
+                .iter()
+                .filter_map(|path| path.file_stem().and_then(|s| s.to_str()))
+                .collect();
             assert_eq!(
-                images.len(),
-                DIVIDER_PROGRAMS.len(),
-                "expected the divide/remainder images; rebuild them with bench/isa/build.sh"
+                names, M_PROGRAMS,
+                "expected every multiply/divide image; rebuild them with bench/isa/build.sh"
             );
         }
         _ => assert_eq!(

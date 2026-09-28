@@ -1905,3 +1905,105 @@ Also rejected now: an array element as a concatenation-target part
 forms, in combinational and clocked blocks, including a carry that must
 survive the split) and by frontend tests that the swap and the array part
 are rejected; disabling the check makes the swap lower again.
+
+## D33 — `for` loops, unrolled while lowering
+
+**Decision**: a `for` loop is *unrolled* by the frontend. It runs the loop
+itself while lowering -- evaluating the start value, the condition and the
+step -- and emits the body once per iteration with the loop variable
+replaced by that iteration's value. No loop reaches the IR or the kernel.
+Its loop variable must be an `integer`, which is otherwise unusable.
+
+**Why unroll.** picorv32's multiplier -- the last piece of its M extension
+-- is a carry-save adder written as two nested loops, and its indexed
+part-selects (`next_rd[j +: CARRY_CHAIN]`) have a *variable* base as
+written. Supporting loops in the kernel would mean a loop statement in the
+IR, a runtime loop variable, and part-selects whose position is computed
+while simulating -- all of which the future Cranelift backend would then
+also have to compile. Unrolled, `j` is a constant in each copy of the body,
+`next_rd[j +: 4]` with `j` = 8 is just the constant part-select
+`next_rd[11:8]`, and nothing downstream changes. This is what a synthesis
+tool does with the same loop, and it covers RTL loops generally: in
+synthesizable code the bounds are constants almost by definition. A loop
+whose bounds depend on a signal is rejected, and so is `while`/`repeat`/
+`forever`/`do`/`foreach`.
+
+**How the loop variable reaches the body.** It is bound in the same table
+parameters live in, for the duration of each copy. So it resolves wherever
+a parameter does -- general expressions, and the separate constant grammar
+of select bounds -- with no new lookup path, and a select built from it
+folds exactly as one built from a parameter does.
+
+**`integer` as a loop variable only.** Until now a declaration's *type* was
+never looked at: the width came from a packed range if there was one, and
+was 1 otherwise, so `integer i;` (and `int`, `byte`, `real`) lowered
+silently as a 1-bit signal. `integer` now makes a name that is not a
+signal at all: it can be a loop's variable, and any other use -- a read or
+write outside a loop, or a write from the loop's own body -- is an error
+that says so. The alternative, a real 32-bit signed signal, would need
+signed signals (which don't exist yet; see the next section) and would
+have to carry the variable's value *after* the loop, which is observable
+in Verilog and which unrolling doesn't compute. Making it unusable outside
+a loop means that value can never be read, so not computing it is exact.
+The other integer types, and every data type that isn't a `reg`/`logic`/
+`bit` vector, are now rejected rather than made 1 bit.
+
+**Signed loop variables, unsigned constants.** Verilog's `integer` is
+signed; v1's constants are unsigned 64-bit values -- the gap D31 noted for
+parameter arithmetic. Loops make it much easier to reach, because a loop
+variable is usually 0 on some iteration: `if (i - 1 < 0)` is true there in
+Verilog and false if evaluated unsigned. Two rules close it:
+
+- A loop variable must stay in `0 .. 2^31` at every step. In that range an
+  `integer` reads the same signed or unsigned.
+- A subtraction of two constants that goes negative anywhere in a loop's
+  control or body is rejected. Negative values only arise by subtraction
+  (unary minus is `0 - x`), and every constant select position has
+  already been folded to a number by then, so what remains are exactly
+  the subtractions whose result is used as a value.
+
+The cost is the classic descending loop that stops at -1, `for (i = 7; i
+>= 0; i = i - 1)`, rejected at its last step; `for (i = 8; i > 0; i = i -
+1)` using `i - 1` is the accepted spelling. The second rule also rejects
+some constant subtractions that would have been fine (their result wrapped
+into an unsigned context); the error says why.
+
+**Also in this change**, each needed by the multiplier or made reachable by
+loops:
+
+- *Indexed part-selects* (`x[base +: width]`, `x[base -: width]`) on reads
+  and targets, with a constant base. A base that reads a signal is
+  rejected: it would need the kernel to position the select at run time.
+- *`$unsigned(x)`*, as a select of all of `x`'s bits: a select is
+  unsigned, and the width pass (D31) sizes its operand on its own, so
+  `$unsigned(a + b)` loses the carry and `$unsigned($signed(x))` loses the
+  sign extension, both as in Verilog. `picorv32_pcpi_mul` uses it, not
+  just the fast multiplier.
+- *Range checks on constant selects when reading*, as writes already had.
+  `a[i + 1]` on a loop's last iteration reads past `a`'s top bit, which
+  Verilog reads as `x`; the kernel would have read zeros, or for a
+  position of 64 or more, failed. A constant position is also checked to
+  fit 32 bits rather than being truncated into a small, valid-looking one.
+- A loop that runs more than 65,536 times is stopped with an error rather
+  than lowered forever.
+
+**Verified** by `differential_for_loop.rs` -- twelve outputs over eight
+vectors covering a loop variable as an index, in a computed `+:`/`-:`
+base, in a condition and as a value; a descending loop; nested loops; an
+iteration reading what the previous one wrote; a loop in a clocked block;
+and `$unsigned` -- compared against Icarus and against an independent
+Python model of the same logic. In picorv32, `differential_picorv32_isa.rs`
+now runs all eight rv32im programs through the divider plus either
+multiplier (`m_extension`, `fast_multiplier`), replacing the divide-only
+configuration. Dropping the sixteenth iteration of every loop -- the top
+4-bit chunk of the multiplier's 64-bit adder -- fails exactly `mulh`,
+`mulhsu` and `mulhu`, the three that read the product's high half, and
+leaves the loop-free fast multiplier passing. Frontend tests pin the
+unrolled shape and each rejection.
+
+**Not covered**: `i++`/`i += 1` steps and loop-local `for (int i = 0; ...)`
+declarations (both easy, deferred for scope); an indexed part-select with a
+run-time base; `generate for`. And three declaration forms found still
+silently misread while writing this up -- `reg signed`, and ranges that
+don't end at bit 0 (`[8:1]`, `[0:7]`) -- all confirmed against Icarus,
+none used by picorv32; they are next.
