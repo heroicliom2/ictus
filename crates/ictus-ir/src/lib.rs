@@ -541,6 +541,128 @@ impl Expr {
     }
 }
 
+// Visiting, read-only. Exhaustive for the same reason as the renumbering
+// above: a check built on these (which signals does this expression read?)
+// must not silently miss a new variant's operands.
+
+impl Expr {
+    /// Calls `f` on this expression and then on every expression inside
+    /// it, outermost first.
+    pub fn visit<F: FnMut(&Expr)>(&self, f: &mut F) {
+        f(self);
+        match self {
+            Expr::Literal { .. } | Expr::Ref(_) => {}
+            Expr::Not(inner)
+            | Expr::BitwiseNot(inner, _)
+            | Expr::ReduceAnd(inner, _)
+            | Expr::ReduceOr(inner, _)
+            | Expr::ReduceXor(inner, _)
+            | Expr::Signed(inner, _) => inner.visit(f),
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::Shl(lhs, rhs)
+            | Expr::Shr(lhs, rhs)
+            | Expr::AShr(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Xor(lhs, rhs)
+            | Expr::Eq(lhs, rhs)
+            | Expr::Ne(lhs, rhs)
+            | Expr::Lt(lhs, rhs)
+            | Expr::Le(lhs, rhs)
+            | Expr::Gt(lhs, rhs)
+            | Expr::Ge(lhs, rhs)
+            | Expr::SignedLt(lhs, rhs)
+            | Expr::LogicalAnd(lhs, rhs)
+            | Expr::LogicalOr(lhs, rhs) => {
+                lhs.visit(f);
+                rhs.visit(f);
+            }
+            Expr::Select { base, .. } => base.visit(f),
+            Expr::DynamicBitSelect { base, index } => {
+                base.visit(f);
+                index.visit(f);
+            }
+            Expr::ArrayRead { index, .. } => index.visit(f),
+            Expr::Concat(parts) => {
+                for (part, _width) in parts {
+                    part.visit(f);
+                }
+            }
+            Expr::Ternary {
+                cond,
+                then_val,
+                else_val,
+            } => {
+                cond.visit(f);
+                then_val.visit(f);
+                else_val.visit(f);
+            }
+        }
+    }
+
+    /// Whether evaluating this expression reads `signal` -- as a plain
+    /// reference or as an array being indexed.
+    pub fn reads(&self, signal: SignalId) -> bool {
+        let mut found = false;
+        self.visit(&mut |e| match e {
+            Expr::Ref(id) | Expr::ArrayRead { array: id, .. } if *id == signal => found = true,
+            _ => {}
+        });
+        found
+    }
+}
+
+impl Stmt {
+    /// Calls `f` (as `Expr::visit` does) on every expression this statement
+    /// evaluates -- values, indices, conditions, selectors and case items
+    /// -- including inside nested `if`/`case` bodies.
+    pub fn visit_exprs<F: FnMut(&Expr)>(&self, f: &mut F) {
+        match self {
+            Stmt::NonBlockingAssign { value, .. } | Stmt::BlockingAssign { value, .. } => {
+                value.visit(f)
+            }
+            Stmt::ArrayAssign { index, value, .. }
+            | Stmt::BlockingArrayAssign { index, value, .. } => {
+                index.visit(f);
+                value.visit(f);
+            }
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                cond.visit(f);
+                for stmt in then_branch.iter().chain(else_branch.iter()) {
+                    stmt.visit_exprs(f);
+                }
+            }
+            Stmt::Case {
+                selector,
+                arms,
+                default,
+            } => {
+                selector.visit(f);
+                for arm in arms {
+                    for value in &arm.values {
+                        match value {
+                            CaseValue::Exact(expr) => expr.visit(f),
+                            CaseValue::Wildcard { .. } => {}
+                        }
+                    }
+                    for stmt in &arm.body {
+                        stmt.visit_exprs(f);
+                    }
+                }
+                for stmt in default {
+                    stmt.visit_exprs(f);
+                }
+            }
+        }
+    }
+}
+
 impl Stmt {
     /// Rewrites every signal this statement reads or writes through `map`,
     /// including inside nested `if`/`case` bodies.

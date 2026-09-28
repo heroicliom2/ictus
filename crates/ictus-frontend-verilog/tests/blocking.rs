@@ -72,3 +72,53 @@ fn rejects_compound_assignment() {
         "expected the error to name the compound operator, got: {err}"
     );
 }
+
+/// `{x, y} = {y, x};` -- a blocking concatenation target whose right-hand
+/// side reads a signal an earlier part writes. v1 writes the parts one at
+/// a time, so the second part would see the first part's new value (Ictus
+/// gave `9 9` where Icarus gives `9 3`). Rejected, naming the signal.
+#[test]
+fn rejects_blocking_concat_target_reading_an_earlier_part() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/blocking_concat_swap_test.v");
+    let err = ictus_frontend_verilog::lower_file(&path)
+        .expect_err("a blocking swap through a concatenation target must be rejected");
+    assert!(
+        err.contains("reads 'x'") && err.contains("earlier part"),
+        "error should name the signal read after being written: {err}"
+    );
+}
+
+/// The same split with the right-hand side reading only the *last* part's
+/// target is accepted: nothing has been written when it is evaluated.
+/// (Its values are checked against Icarus in ictus-cli's
+/// `differential_blocking_concat_target.rs`.)
+#[test]
+fn accepts_blocking_concat_target_reading_only_the_last_part() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ictus-cli/tests/fixtures/blocking_concat_target_test.v");
+    let module = ictus_frontend_verilog::lower_file(&path)
+        .expect("reading the last part's target is safe and should lower");
+    let hi = module.signal_id("hi").expect("hi port");
+    let lo = module.signal_id("lo").expect("lo port");
+    let body = &module.comb_processes[0].body;
+    let targets: Vec<_> = body
+        .iter()
+        .map(|stmt| match stmt {
+            Stmt::BlockingAssign { target, .. } => *target,
+            other => panic!("expected only blocking assignments, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(targets, vec![lo, hi, lo], "`lo = b;` then one statement per part, in order");
+}
+
+/// An array element as a concatenation-target part is rejected rather than
+/// taken as a bit-select of the array signal.
+#[test]
+fn rejects_array_element_in_concat_target() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/concat_target_array_part_test.v");
+    let err = ictus_frontend_verilog::lower_file(&path)
+        .expect_err("an array element in a concatenation target must be rejected");
+    assert!(err.contains("mem"), "error should name the array: {err}");
+}

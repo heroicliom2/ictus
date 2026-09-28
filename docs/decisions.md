@@ -1868,3 +1868,40 @@ into registers.
 **Not covered**: constant-expression folding (parameter values,
 `localparam`s) still evaluates on 64 bits without these rules; nothing
 found so far depends on it, but it is the same class of question.
+
+## D32 — Blocking assignment to a concatenation: one evaluation, or a rejection
+
+**Decision**: a *blocking* assignment to a concatenation target (`{a, b} =
+value;`) is rejected when `value` reads a signal that any part other than
+the last one writes. Everything else about the form is unchanged.
+
+**The defect.** D15 lowered a concatenation target as one statement per
+part, each writing its slice of its own copy of the value. That was argued
+for non-blocking assignment, where every copy is evaluated before any write
+lands. D23 then made blocking assignment share the same target lowering --
+and for `=` each part is written *before* the next part's copy is
+evaluated. `{x, y} = {y, x};` therefore set both to `y`: Icarus prints
+`9 3`, Ictus printed `9 9`. Nothing had tested the blocking form. It was
+found by reading the lowering while preparing for picorv32's multiplier,
+whose carry-save adder is exactly this shape (`{next_rdt[...],
+next_rd[...]} = next_rd[...] + ...;`), then confirmed against Icarus before
+changing anything.
+
+**Why reject rather than fix.** Evaluating once needs somewhere to hold the
+value between the parts' writes -- a hidden temporary signal, which would
+be the frontend's first synthesized signal and would show up in
+multiple-driver checks, traces and signal counts. The rejection is exact
+instead of approximate: the order of the parts' writes is observable only
+through a *later* part's copy reading an *earlier* part's target, so the
+last part is exempt and nothing that is accepted can be wrong. The
+multiplier's form reads only the last part's target and is accepted.
+Blocking swaps through a concatenation are rare in RTL; the error suggests
+a temporary or `<=`.
+
+Also rejected now: an array element as a concatenation-target part
+(`{mem[0], x} <= v;`), which was being taken as bit 0 of the array signal.
+
+**Verified** by `differential_blocking_concat_target.rs` (the accepted
+forms, in combinational and clocked blocks, including a carry that must
+survive the split) and by frontend tests that the swap and the array part
+are rejected; disabling the check makes the swap lower again.

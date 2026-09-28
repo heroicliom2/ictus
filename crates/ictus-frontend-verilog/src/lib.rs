@@ -2412,7 +2412,10 @@ fn lower_procedural_assign(
 /// `Expr::Select` for that part's bit range -- correct because a
 /// non-blocking assignment's right-hand side has no side effects to
 /// worry about duplicating, just a value the kernel re-reads once per
-/// part at commit time. Each part must itself be a plain identifier, with
+/// part at commit time. The blocking form (`{a, b} = value;`) shares this,
+/// but its copies are evaluated *between* the parts' writes, so it is
+/// rejected when that would be visible (see the check below; found
+/// against Icarus with `{x, y} = {y, x};`). Each part must itself be a plain identifier, with
 /// an optional *constant* bit-select/part-select (reusing
 /// `lower_select_target_range`, the same restriction a non-concatenation
 /// select target has) -- a nested concatenation, streaming concatenation,
@@ -2452,12 +2455,43 @@ fn lower_concat_target_assign(
         let target = module
             .signal_id(name)
             .ok_or_else(|| format!("assignment target '{name}' is not a known signal"))?;
+        // Without this, `mem[0]` would be taken as bit 0 of the array
+        // signal rather than as an element of it.
+        if module.signals[target].depth.is_some() {
+            return Err(format!(
+                "array element '{name}[...]' as part of a concatenation assignment target is \
+                 not supported in v1 -- assign the element on its own"
+            ));
+        }
         let target_range = lower_select_target_range(part, name, tree, module)?;
         check_target_range(target_range, target, name, module)?;
         let width = target_range
             .map(|(msb, lsb)| msb - lsb + 1)
             .unwrap_or(module.signals[target].width);
         resolved.push((target, target_range, width));
+    }
+
+    // Each part below gets its own copy of `value`, evaluated when that
+    // part's statement runs. For a non-blocking assignment every copy is
+    // evaluated before any write lands, so they all agree. For a blocking
+    // one, each part is written before the next part's copy is evaluated
+    // -- so if the value reads a signal an earlier part writes, a later
+    // part sees the new value instead of the one Verilog evaluated once,
+    // up front: `{x, y} = {y, x};` would set both to `y`. Only the last
+    // part can't affect a later one, so it's exempt.
+    if blocking {
+        for (target, _, _) in &resolved[..resolved.len() - 1] {
+            if value.reads(*target) {
+                let name = &module.signals[*target].name;
+                return Err(format!(
+                    "a blocking assignment to a concatenation whose right-hand side reads \
+                     '{name}', which an earlier part of the target writes, is not supported in \
+                     v1 -- Verilog evaluates the right-hand side once, before any part is \
+                     written, and v1 writes the parts one at a time. Assign the value to a \
+                     temporary first, or use `<=`"
+                ));
+            }
+        }
     }
 
     let mut shift: u32 = resolved.iter().map(|(_, _, width)| width).sum();

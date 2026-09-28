@@ -1162,6 +1162,18 @@ Breaking the pass in two different ways brings the original defect back
 immediately. picorv32 in all five configurations is unaffected, and an
 A/B measurement against the previous commit found no performance cost.
 
+**A blocking assignment to a concatenation is now exact or rejected**
+(decisions.md D32). A concatenation target is lowered as one statement
+per part, each with its own copy of the value. That is right for `<=`,
+but for `=` each part is written before the next part's copy is
+evaluated, so `{x, y} = {y, x};` set both to `y` (Icarus: `9 3`; Ictus
+was `9 9`). Found while reading the lowering ahead of the multiplier,
+whose carry-save adder has this shape, and confirmed against Icarus
+first. Now rejected exactly when it would be visible -- the value reads a
+signal written by any part but the last -- so the multiplier's form still
+lowers. An array element as a concatenation-target part is rejected too;
+it was being taken as a bit of the array signal.
+
 **Next: the multiplier.** `picorv32_pcpi_mul` uses nested `for` loops over
 `integer` variables, indexed part-selects (`next_rd[j +: CARRY_CHAIN]`) on
 both sides of an assignment, and `$unsigned`. The loops have constant
@@ -1189,7 +1201,8 @@ results, not just literals/refs/selects, valid as concatenation operands
 (each at Verilog's self-determined width, so an arithmetic carry is
 truncated away), shift results included -- a constant
 bit-select/part-select --
-or a concatenation of such -- as a procedural assignment target but not a
+or a concatenation of such (with `=`, one whose value doesn't read what
+an earlier part writes) -- as a procedural assignment target but not a
 continuous (`assign`) one and not with a variable index (though the
 index/bound *may* reference a parameter/localparam, per the
 constant-folding work), `$signed(...)` to sign-extend a value into a
