@@ -256,7 +256,7 @@ fn rejects_a_constant_read_past_the_top_bit() {
     assert_rejected(
         "read_past_top",
         &in_comb_block("for (i = 0; i < 8; i = i + 1) y[i] = a[i + 1];"),
-        "bit 8 is out of range for a 8-bit value",
+        "index 8 is outside its declared range `[7:0]`",
     );
 }
 

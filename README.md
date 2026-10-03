@@ -178,10 +178,19 @@ Preparing for it turned up another silent wrong answer, in blocking
 assignment to a concatenation: `{x, y} = {y, x};` set both to `y`.
 Where that would happen it's now rejected.
 
-Next: three declaration forms that are still silently misread, all
-confirmed against Icarus — `reg signed` (the keyword is ignored), and
-ranges that don't end at bit 0 (`[8:1]`, `[0:7]`) — then Cranelift JIT
-codegen.
+Vectors and arrays are now indexed the way they were declared. Before,
+Ictus kept only a declaration's width, so in `reg [8:1] r` the index
+`r[1]` read the second bit rather than the first, in `reg [0:7] q` —
+where index 0 is the *most* significant bit — `q[0]` read the bottom bit,
+and in `reg [7:0] mem [1:4]` every write to `mem[4]` was dropped. All
+three now match Icarus. A declaration marked `signed` is rejected for now
+rather than silently treated as unsigned: handling it properly needs
+Ictus to know which numbers in the source are signed (in Verilog a plain
+`1` is), which it doesn't yet.
+
+Next: nothing left in the supported language blocks picorv32, so the
+recommended next step is Cranelift JIT codegen — the speed half of this
+phase — with signed values as the next language feature after it.
 
 ## Workspace layout
 

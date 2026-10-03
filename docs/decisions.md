@@ -2007,3 +2007,85 @@ run-time base; `generate for`. And three declaration forms found still
 silently misread while writing this up -- `reg signed`, and ranges that
 don't end at bit 0 (`[8:1]`, `[0:7]`) -- all confirmed against Icarus,
 none used by picorv32; they are next.
+
+## D34 — Declared ranges honoured; `signed` declarations rejected
+
+**Decision**: every index into a signal is translated through the range
+the signal was *declared* with, so `reg [8:1] r`, `reg [0:7] q` and
+`reg [7:0] mem [1:4]` read and write the bits and elements Verilog says
+they do. A declaration marked `signed` is rejected until Ictus can
+support it properly.
+
+**What was wrong.** D33 left three declaration forms recorded as silently
+misread, and the fix found a fourth. All four were confirmed against
+Icarus, none is used by picorv32, and all came from the same loss: the
+frontend reduced a declared range to its width and then treated every
+index as a bit position counted from 0.
+
+- `reg [8:1] r; r[1]` read position 1, the second bit, instead of the
+  first. Part-selects, indexed part-selects and runtime indices were all
+  off by the same one.
+- `reg [0:7] q; q[0]` read the least significant bit. An ascending range
+  numbers from the *most* significant end: `q[0]` is the top bit, and
+  `q[0:3]` the top nibble. (That part-select was rejected outright, as a
+  "reversed" range.)
+- `reg [7:0] mem [1:4]` stored `mem[1]` in slot 1, so `mem[4]` landed
+  past the end and was dropped as out of range. Checked by restoring the
+  old behaviour: reading `mem[4]` gave 0 where Icarus gives 68.
+- `reg signed` was accepted and the keyword never looked at, so a
+  negative value shifted right arithmetically filled with zeros (Icarus
+  253, Ictus 5).
+
+**How ranges work now.** A `DeclaredRange` keeps a declaration's bounds
+as written, `[left:right]`, and turns an index into a position -- 0 at
+the least significant end. On a descending range the position is
+`index - right`, and on an ascending one `right - index`. Everything that
+builds a select goes through it, on reads and write targets alike:
+constant bit-selects, part-selects, indexed part-selects (`+:`/`-:`) and
+runtime indices, where a runtime index becomes `index - right` or
+`right - index` computed at simulation time.
+The translation also owns the two checks that depend on the declaration:
+a part-select must run the same way as the range it selects from
+(`r[4:1]` and `q[0:3]` are fine; `r[1:4]` and `q[3:0]` are errors in
+Verilog and here), and a constant index must be one the declaration has.
+That replaced two separate width-based range checks, and changed one
+message a `for`-loop test was matching.
+
+Array elements are numbered the same way, but only the *offset* matters:
+elements aren't packed into a single number, so any consistent slot
+order works, and `mem[i]` becomes slot `i - low`. An index below the
+range comes out negative, which wraps to a slot that doesn't exist -- read
+as 0, write dropped, exactly D22's rule for any out-of-range index.
+
+The kernel and IR are unchanged: positions are what they already used.
+The declared ranges live in a table the frontend keeps for the module it
+is lowering, which is all that's needed -- an instance's selects are
+lowered inside its own module, before it is flattened into its parent.
+
+**Parameters** are a special case. A parameter becomes a plain literal
+wherever it is used, carrying no range, so a select into one is
+necessarily against `[width-1:0]`. Rather than add ranges to the
+parameter table for a form nothing uses, a parameter declared with any
+other range (`parameter [8:1] P`) is rejected. picorv32's
+`parameter [0:0] ENABLE_COUNTERS` is `[0:0]`, which is that shape.
+
+**Why `signed` is rejected rather than implemented.** Supporting it
+needs a piece Ictus doesn't have: knowing which literals are signed. In
+Verilog an unsized `1` is a signed 32-bit integer, so `s + 1` with a
+signed `s` is signed arithmetic -- but the IR doesn't record how a literal
+was written, which is exactly why D31 rejects an operator that mixes
+signed and unsigned operands. Implementing `reg signed` on its own would
+mostly turn silent wrong answers into that rejection, one use at a time.
+Rejecting the declaration says so at the point that matters, on a
+variable, a port and a parameter alike. Literal signedness and declared
+signedness are naturally one increment, which would also lift D31's
+mixed-signedness rejection.
+
+**Verified** structurally (`ictus-frontend-verilog/tests/ranges.rs`: the
+translated positions for every select form, the rejections) and
+differentially (`ictus-cli/tests/differential_range.rs`: twelve outputs
+covering reads, writes, an offset port and an offset array, against
+Icarus). Restoring the old index-as-position behaviour fails the first
+check (`r[1]` is 0 in Ictus, 1 in Icarus). picorv32 in every
+configuration is unaffected, as expected -- it declares nothing but
+`[n:0]` vectors and `[0:n]` arrays.

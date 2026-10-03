@@ -120,6 +120,13 @@
 //! reason both exist: until then every branch was lowered, and picorv32
 //! was right only by coincidence.
 //!
+//! Every index into a signal is translated through the range the signal
+//! was declared with -- `reg [8:1] r`, `reg [0:7] q`, `mem [1:4]` -- into
+//! the 0-based bit position (or array slot) the kernel uses; see
+//! `DeclaredRange` and decisions.md D34. A declaration marked `signed` is
+//! rejected until literal signedness is tracked
+//! (`reject_signed_declaration`).
+//!
 //! Every expression is sized and typed by the `width` module before it
 //! reaches the IR -- IEEE 1800's context-determined widths (§11.6) and
 //! expression signedness (§11.8.1) -- so that the kernel's plain 64-bit
@@ -181,6 +188,24 @@ struct Ctx<'a> {
     parameters: &'a HashMap<String, (u64, u32)>,
     empty_tasks: &'a HashSet<String>,
     integers: &'a HashSet<String>,
+    /// Each signal's declared ranges; see `DeclaredRange`.
+    ranges: &'a HashMap<SignalId, SignalRanges>,
+}
+
+impl Ctx<'_> {
+    /// The declared range a select into `base` is indexed against: a
+    /// signal's own declaration, or `[width-1:0]` for anything else -- a
+    /// parameter or loop variable, which are plain by construction.
+    fn packed_range(&self, base: &Expr) -> Result<DeclaredRange, String> {
+        match base {
+            Expr::Ref(id) => Ok(self
+                .ranges
+                .get(id)
+                .map(|r| r.packed)
+                .unwrap_or_else(|| DeclaredRange::plain(self.module.signals[*id].width))),
+            other => Ok(DeclaredRange::plain(expr_width(other, self.module)?)),
+        }
+    }
 }
 
 impl<'a> std::ops::Deref for Ctx<'a> {
@@ -318,9 +343,20 @@ fn lower_module<'a>(
     // real, common style (picorv32 uses it in its very first two ports),
     // not an edge case. last_direction tracks that across the loop.
     let mut last_direction: Option<Direction> = None;
+    // Each signal's ranges as declared, so an index into it can be turned
+    // into a bit position -- see `DeclaredRange`.
+    let mut ranges: HashMap<SignalId, SignalRanges> = HashMap::new();
     for port_node in module_node.into_iter() {
         if let RefNode::AnsiPortDeclaration(port) = port_node {
-            module.push_signal(lower_port(port, tree, &mut last_direction, &parameters)?);
+            let (signal, packed) = lower_port(port, tree, &mut last_direction, &parameters)?;
+            let id = module.push_signal(signal);
+            ranges.insert(
+                id,
+                SignalRanges {
+                    packed,
+                    unpacked: None,
+                },
+            );
         }
     }
 
@@ -331,15 +367,16 @@ fn lower_module<'a>(
             RefNode::NetDeclaration(sv_parser::NetDeclaration::NetType(net))
                 if !elab.excludes(&**net) =>
             {
-                for signal in lower_internal_signal(&**net, tree, &parameters)? {
-                    module.push_signal(signal);
+                for (signal, signal_ranges) in lower_internal_signal(&**net, tree, &parameters)? {
+                    let id = module.push_signal(signal);
+                    ranges.insert(id, signal_ranges);
                 }
             }
             RefNode::DataDeclaration(DataDeclaration::Variable(var)) if !elab.excludes(&**var) => {
                 reject_variable_initializer(var, tree)?;
                 let signals = lower_internal_signal(&**var, tree, &parameters)?;
                 if is_integer_declaration(var)? {
-                    for signal in signals {
+                    for (signal, _) in signals {
                         if signal.depth.is_some() {
                             return Err(format!(
                                 "an array of integers ('{}') is not supported in v1",
@@ -349,8 +386,9 @@ fn lower_module<'a>(
                         integers.insert(signal.name);
                     }
                 } else {
-                    for signal in signals {
-                        module.push_signal(signal);
+                    for (signal, signal_ranges) in signals {
+                        let id = module.push_signal(signal);
+                        ranges.insert(id, signal_ranges);
                     }
                 }
             }
@@ -370,6 +408,7 @@ fn lower_module<'a>(
         parameters: &parameters,
         empty_tasks: &empty_tasks,
         integers: &integers,
+        ranges: &ranges,
     };
 
     let mut clocked_processes = Vec::new();
@@ -1158,8 +1197,22 @@ fn resolve_param_assignments(
     parameters: &mut HashMap<String, (u64, u32)>,
     mut kind: ParamKind,
 ) -> Result<(), String> {
+    reject_signed_declaration(data_type, "a parameter")?;
     let width = match unwrap_node!(data_type, PackedDimensionRange) {
-        Some(range_node) => lower_packed_range(range_node, tree, parameters)?,
+        Some(range_node) => {
+            let range = lower_packed_range(range_node, tree, parameters)?;
+            // A parameter becomes a plain literal wherever it's used, which
+            // carries no declared range -- so a select into one (`P[1]`)
+            // would read it as `[width-1:0]`. Only that shape is accepted.
+            if !range.is_plain() {
+                return Err(format!(
+                    "a parameter declared with the range `[{}:{}]` is not supported in v1 -- \
+                     only a range ending at 0, `[n:0]`",
+                    range.left, range.right
+                ));
+            }
+            range.width()
+        }
         // No explicit range (`localparam integer regindex_bits = ...;`,
         // or a bare `parameter X = ...;`) -- 32 bits either way: Verilog's
         // default `integer`/untyped-parameter width.
@@ -1652,7 +1705,7 @@ fn lower_port(
     tree: &SyntaxTree,
     last_direction: &mut Option<Direction>,
     parameters: &HashMap<String, (u64, u32)>,
-) -> Result<Signal, String> {
+) -> Result<(Signal, DeclaredRange), String> {
     let ident_node =
         unwrap_node!(port, PortIdentifier).ok_or("port declaration has no identifier")?;
     let ident_simple =
@@ -1679,9 +1732,10 @@ fn lower_port(
     };
     *last_direction = Some(direction);
 
-    let width = match unwrap_node!(port, PackedDimensionRange) {
+    reject_signed_declaration(port, &format!("port '{name}'"))?;
+    let range = match unwrap_node!(port, PackedDimensionRange) {
         Some(range_node) => lower_packed_range(range_node, tree, parameters)?,
-        None => 1,
+        None => DeclaredRange::plain(1),
     };
 
     // An array *port* would need the array to be addressable from outside
@@ -1693,12 +1747,15 @@ fn lower_port(
         ));
     }
 
-    Ok(Signal {
-        name,
-        width,
-        direction: Some(direction),
-        depth: None,
-    })
+    Ok((
+        Signal {
+            name,
+            width: range.width(),
+            direction: Some(direction),
+            depth: None,
+        },
+        range,
+    ))
 }
 
 /// Lowers a `wire`/`reg` declaration in the module body (as opposed to a
@@ -1721,24 +1778,27 @@ fn lower_internal_signal<'a, T>(
     decl: &'a T,
     tree: &'a SyntaxTree,
     parameters: &HashMap<String, (u64, u32)>,
-) -> Result<Vec<Signal>, String>
+) -> Result<Vec<(Signal, SignalRanges)>, String>
 where
     &'a T: IntoIterator<Item = RefNode<'a>>,
 {
-    let width = match unwrap_node!(decl, PackedDimensionRange) {
+    reject_signed_declaration(decl, "a signal")?;
+    let packed = match unwrap_node!(decl, PackedDimensionRange) {
         Some(range_node) => lower_packed_range(range_node, tree, parameters)?,
-        None => 1,
+        None => DeclaredRange::plain(1),
     };
 
     // An *unpacked* dimension (`reg [31:0] mem [0:31];`) makes this an
     // array -- a distinct grammar node from the packed one above, so the
-    // width search can't confuse the two.
-    let depth = match unwrap_node!(decl, UnpackedDimensionRange) {
+    // width search can't confuse the two. Its range is kept like a packed
+    // one: `mem [1:4]` has elements 1 through 4, so `mem[1]` is the first
+    // (see `lower_array_index`).
+    let unpacked = match unwrap_node!(decl, UnpackedDimensionRange) {
         Some(RefNode::UnpackedDimensionRange(range)) => {
             let bounds = &range.nodes.0.nodes.1;
-            let high = lower_constant_index(&bounds.nodes.0, tree, parameters)?;
-            let low = lower_constant_index(&bounds.nodes.2, tree, parameters)?;
-            Some(high.abs_diff(low) + 1)
+            let left = lower_constant_index(&bounds.nodes.0, tree, parameters)?;
+            let right = lower_constant_index(&bounds.nodes.2, tree, parameters)?;
+            Some(DeclaredRange { left, right })
         }
         // `mem [4]` (a size rather than a range) and the other unpacked
         // forms aren't lowered; only `[high:low]` is.
@@ -1780,7 +1840,7 @@ where
     // case (every real array declaration found so far), but
     // `reg [7:0] a, mem [0:3];` would wrongly make `a` an array too.
     // Rejected rather than mis-lowered.
-    if depth.is_some() && names.len() > 1 {
+    if unpacked.is_some() && names.len() > 1 {
         return Err(format!(
             "an array declaration that also declares other names in the same statement \
              (`{}`) is not supported in v1 -- declare the array on its own",
@@ -1790,11 +1850,14 @@ where
 
     Ok(names
         .into_iter()
-        .map(|name| Signal {
-            name,
-            width,
-            direction: None,
-            depth,
+        .map(|name| {
+            let signal = Signal {
+                name,
+                width: packed.width(),
+                direction: None,
+                depth: unpacked.map(DeclaredRange::width),
+            };
+            (signal, SignalRanges { packed, unpacked })
         })
         .collect())
 }
@@ -1807,11 +1870,135 @@ where
 /// reference a parameter (picorv32's `reg [regindex_bits-1:0] decoded_rd,
 /// decoded_rs1;`, `regindex_bits` itself a `localparam`) and not just a
 /// plain literal.
+/// A range exactly as declared, `[left:right]` -- kept so an index written
+/// against it can be turned into a bit position.
+///
+/// Verilog numbers a vector's bits however its declaration says. In
+/// `reg [7:0] a` index 0 is the least significant bit, which is also its
+/// position; but in `reg [8:1] r` the least significant bit is `r[1]`, and
+/// in `reg [0:7] q` it is `q[7]` -- an *ascending* range, where the
+/// left-hand index is the most significant bit. The kernel only knows
+/// positions, counted from 0 at the least significant end, so every index
+/// is translated here. Before this the frontend kept only a range's width,
+/// and `r[1]` read the wrong bit without complaint (decisions.md D34).
+///
+/// Bounds are unsigned: a negative bound is rejected where the range is
+/// read, since nothing needs one and a `u64` that wrapped would otherwise
+/// look like a large, valid index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeclaredRange {
+    left: u32,
+    right: u32,
+}
+
+impl DeclaredRange {
+    /// `[width - 1 : 0]` -- what a width alone implies, and what a value
+    /// with no declaration of its own (an expression, a literal) has.
+    fn plain(width: u32) -> Self {
+        DeclaredRange {
+            left: width.saturating_sub(1),
+            right: 0,
+        }
+    }
+
+    fn width(self) -> u32 {
+        self.left.abs_diff(self.right) + 1
+    }
+
+    /// Indices already are positions, so nothing needs translating.
+    fn is_plain(self) -> bool {
+        self.right == 0
+    }
+
+    /// The left-hand index is the *least* significant -- `[0:7]`.
+    fn ascending(self) -> bool {
+        self.left < self.right
+    }
+
+    fn low(self) -> u32 {
+        self.left.min(self.right)
+    }
+
+    /// The position of index `index` (0 = least significant bit), or
+    /// `None` if the declaration doesn't have that index.
+    fn position(self, index: u32) -> Option<u32> {
+        if index < self.low() || index > self.left.max(self.right) {
+            return None;
+        }
+        Some(if self.ascending() {
+            self.right - index
+        } else {
+            index - self.right
+        })
+    }
+
+    /// Translates indices `first` and `second` -- as written, `x[first:
+    /// second]`, or the same index twice for a single bit -- into the
+    /// `(msb, lsb)` positions they select. `written_as_range` asks for
+    /// Verilog's rule that a part-select runs the same way as its
+    /// declaration (`r[4:1]` on `[8:1]`, `q[0:3]` on `[0:7]`); an indexed
+    /// part-select has no direction of its own and skips it.
+    fn positions(
+        self,
+        first: u32,
+        second: u32,
+        written_as_range: bool,
+        what: &str,
+    ) -> Result<(u32, u32), String> {
+        if written_as_range && first != second && (first < second) != self.ascending() {
+            return Err(format!(
+                "{what}: the part-select `[{first}:{second}]` runs the opposite way to its \
+                 declared range `[{}:{}]`, which Verilog doesn't allow",
+                self.left, self.right
+            ));
+        }
+        let position = |index| {
+            self.position(index).ok_or_else(|| {
+                format!(
+                    "{what}: index {index} is outside its declared range `[{}:{}]` -- \
+                     Verilog reads an out-of-range bit as `x`, and v1 rejects a constant \
+                     select that reaches one",
+                    self.left, self.right
+                )
+            })
+        };
+        let (a, b) = (position(first)?, position(second)?);
+        Ok((a.max(b), a.min(b)))
+    }
+
+    /// The position a *runtime* index selects, as an expression: the index
+    /// itself for a plain range, or its offset from the least significant
+    /// index. An index outside the range comes out negative, which wraps to
+    /// a huge position that the kernel reads as 0 -- Verilog's `x`, in two
+    /// states -- exactly as an out-of-range index into a plain range does.
+    fn position_expr(self, index: Expr) -> Expr {
+        let lsb_index = Box::new(Expr::Literal {
+            value: u64::from(self.right),
+            width: 32,
+        });
+        if self.is_plain() {
+            index
+        } else if self.ascending() {
+            Expr::Sub(lsb_index, Box::new(index))
+        } else {
+            Expr::Sub(Box::new(index), lsb_index)
+        }
+    }
+}
+
+/// A declared signal's ranges: the packed one (its bits), and for an array
+/// the unpacked one (its elements).
+#[derive(Debug, Clone, Copy)]
+struct SignalRanges {
+    packed: DeclaredRange,
+    unpacked: Option<DeclaredRange>,
+}
+
 fn lower_packed_range(
     range_node: RefNode,
     tree: &SyntaxTree,
     parameters: &HashMap<String, (u64, u32)>,
-) -> Result<u32, String> {
+) -> Result<DeclaredRange, String> {
     let RefNode::PackedDimensionRange(range) = range_node else {
         return Err(
             "packed dimension form not supported in v1 (only a plain `[msb:lsb]` range)"
@@ -1819,15 +2006,37 @@ fn lower_packed_range(
         );
     };
     let constant_range = &range.nodes.0.nodes.1;
-    let msb = lower_constant_expr(&constant_range.nodes.0, tree, parameters)?;
-    let lsb = lower_constant_expr(&constant_range.nodes.2, tree, parameters)?;
-    let msb = try_const_fold(&msb).ok_or_else(|| {
-        "packed range bound does not reduce to a compile-time constant".to_string()
-    })?;
-    let lsb = try_const_fold(&lsb).ok_or_else(|| {
-        "packed range bound does not reduce to a compile-time constant".to_string()
-    })?;
-    Ok((msb as u32).abs_diff(lsb as u32) + 1)
+    let left = lower_constant_index(&constant_range.nodes.0, tree, parameters)?;
+    let right = lower_constant_index(&constant_range.nodes.2, tree, parameters)?;
+    Ok(DeclaredRange { left, right })
+}
+
+/// Rejects a declaration marked `signed` -- `reg signed [7:0] s`, `input
+/// signed [7:0] a`, `parameter signed ...`.
+///
+/// It used to be accepted and silently ignored: the keyword was never
+/// looked at, so `s` was treated as unsigned and `s >>> 1` of a negative
+/// value shifted in zeros (Icarus gives 253 where Ictus gave 5). Doing it
+/// properly needs something v1 doesn't have yet -- knowing which literals
+/// are signed. In Verilog an unsized `1` is a signed integer, so `s + 1`
+/// is signed arithmetic, and without that knowledge nearly every use of a
+/// signed signal would hit the mixed-signedness rejection (decisions.md
+/// D31) anyway. `$signed(...)` covers the uses picorv32 makes.
+fn reject_signed_declaration<'a, T>(decl: &'a T, what: &str) -> Result<(), String>
+where
+    &'a T: IntoIterator<Item = RefNode<'a>>,
+{
+    if decl
+        .into_iter()
+        .any(|node| matches!(node, RefNode::Signing(sv_parser::Signing::Signed(_))))
+    {
+        return Err(format!(
+            "{what} is declared `signed`, which v1 doesn't support yet: it would need to know \
+             which literals are signed (an unsized `1` is, in Verilog), which it doesn't. Use \
+             `$signed(...)` where the value is used"
+        ));
+    }
+    Ok(())
 }
 
 /// What an `always` block lowered to. Every block is now one of these or
@@ -2691,8 +2900,7 @@ fn lower_procedural_assign(
         }]);
     }
 
-    let target_range = lower_select_target_range(lvalue, target_name, tree, module)?;
-    check_target_range(target_range, target, target_name, module)?;
+    let target_range = lower_select_target_range(lvalue, target_name, target, tree, module)?;
 
     // Sized against what is actually written: the selected bits, or the
     // whole signal. See `width`.
@@ -2781,8 +2989,7 @@ fn lower_concat_target_assign(
                  not supported in v1 -- assign the element on its own"
             ));
         }
-        let target_range = lower_select_target_range(part, name, tree, module)?;
-        check_target_range(target_range, target, name, module)?;
+        let target_range = lower_select_target_range(part, name, target, tree, module)?;
         let width = target_range
             .map(|(msb, lsb)| msb - lsb + 1)
             .unwrap_or(module.signals[target].width);
@@ -3011,14 +3218,14 @@ fn lower_continuous_assign(
     // isn't implemented. A constant bit-select/part-select target is
     // therefore still rejected here, even though it's now accepted for
     // `<=`.
-    if lower_select_target_range(&assignment.nodes.0, target_name, tree, module)?.is_some() {
+    let target = module
+        .signal_id(target_name)
+        .ok_or_else(|| format!("assign target '{target_name}' is not a known signal"))?;
+    if lower_select_target_range(&assignment.nodes.0, target_name, target, tree, module)?.is_some() {
         return Err(format!(
             "assign target '{target_name}' uses a bit-select/part-select, which v1 doesn't support as a continuous-assignment write target (only for non-blocking `<=`)"
         ));
     }
-    let target = module
-        .signal_id(target_name)
-        .ok_or_else(|| format!("assign target '{target_name}' is not a known signal"))?;
     // Same reasoning as the bit-select case just above: `ictus_ir::Assign`
     // names one whole signal, with no element index to carry, and
     // `settle_combinational` has no commit phase to resolve one in.
@@ -3627,24 +3834,25 @@ fn lower_select(
         }
     }
 
+    // Indices are written against the base's declared range and become bit
+    // positions here (see `DeclaredRange`): `r[1]` of `reg [8:1] r` is
+    // position 0, as is `q[7]` of `reg [0:7] q`.
+    let range = module.packed_range(&base)?;
+    let what = "a select";
+
     // Part-select: `x[msb:lsb]`, or indexed, `x[base +: width]`.
     if let Some(bracket) = &select.nodes.2 {
         let (msb, lsb) = match &bracket.nodes.1 {
-            sv_parser::PartSelectRange::ConstantRange(range) => {
-                let msb = lower_constant_index(&range.nodes.0, tree, module.parameters)?;
-                let lsb = lower_constant_index(&range.nodes.2, tree, module.parameters)?;
-                if lsb > msb {
-                    return Err(format!(
-                        "part-select `[{msb}:{lsb}]` has lsb greater than msb"
-                    ));
-                }
-                (msb, lsb)
+            sv_parser::PartSelectRange::ConstantRange(written) => {
+                let first = lower_constant_index(&written.nodes.0, tree, module.parameters)?;
+                let second = lower_constant_index(&written.nodes.2, tree, module.parameters)?;
+                range.positions(first, second, true, what)?
             }
-            sv_parser::PartSelectRange::IndexedRange(range) => {
-                lower_indexed_range(range, tree, module)?
+            sv_parser::PartSelectRange::IndexedRange(indexed) => {
+                let (high, low) = lower_indexed_range(indexed, tree, module)?;
+                range.positions(high, low, false, what)?
             }
         };
-        check_read_range(&base, msb, module)?;
         return Ok(Expr::Select {
             base: Box::new(base),
             msb,
@@ -3659,8 +3867,8 @@ fn lower_select(
             let index = lower_expr(&only.nodes.1, tree, module)?;
             match try_const_fold(&index) {
                 Some(value) => {
-                    let bit = constant_bit(value)?;
-                    check_read_range(&base, bit, module)?;
+                    let index = constant_bit(value)?;
+                    let (bit, _) = range.positions(index, index, false, what)?;
                     Ok(Expr::Select {
                         base: Box::new(base),
                         msb: bit,
@@ -3669,10 +3877,11 @@ fn lower_select(
                 }
                 // Not foldable at lowering time (a genuine signal
                 // reference somewhere in the index expression) -- evaluated
-                // fresh each simulation cycle instead.
+                // fresh each simulation cycle instead, at the position the
+                // index names.
                 None => Ok(Expr::DynamicBitSelect {
                     base: Box::new(base),
-                    index: Box::new(index),
+                    index: Box::new(range.position_expr(index)),
                 }),
             }
         }
@@ -3706,10 +3915,36 @@ fn lower_array_index(
             "array '{name}' is used without an index -- v1 has no whole-array read or write, \
              only `{name}[i]`"
         )),
-        [only] => Ok(Expr::ArrayRead {
-            array,
-            index: Box::new(lower_expr(&only.nodes.1, tree, module)?),
-        }),
+        [only] => {
+            // Elements are numbered as declared: `mem [1:4]` has `mem[1]`
+            // through `mem[4]`, stored in slots 0 to 3. Which way the range
+            // runs doesn't matter -- unlike a vector's bits, elements aren't
+            // packed into one number, so any consistent slot order works --
+            // only where it starts does. An index below that comes out
+            // negative and wraps to a slot that doesn't exist, which reads
+            // as 0 and drops a write, the same as any out-of-range index.
+            let index = lower_expr(&only.nodes.1, tree, module)?;
+            let low = module
+                .ranges
+                .get(&array)
+                .and_then(|r| r.unpacked)
+                .map_or(0, DeclaredRange::low);
+            let index = if low == 0 {
+                index
+            } else {
+                Expr::Sub(
+                    Box::new(index),
+                    Box::new(Expr::Literal {
+                        value: u64::from(low),
+                        width: 32,
+                    }),
+                )
+            };
+            Ok(Expr::ArrayRead {
+                array,
+                index: Box::new(index),
+            })
+        }
         // A second index on a one-dimensional array is a bit-select of the
         // chosen element (`mem[i][3]`) -- the parser can't tell that apart
         // from a genuinely multi-dimensional array, and neither is
@@ -3759,20 +3994,6 @@ fn constant_bit(value: u64) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("bit position {value} is out of range"))
 }
 
-/// Rejects a constant select that reaches past the value it selects from.
-/// Verilog reads such bits as `x`; the kernel would read zeros, or for a
-/// position of 64 or more, fail. Not reachable from ordinary source until
-/// `for` loops made positions computed (`x[i + 1]` on the last iteration).
-fn check_read_range(base: &Expr, msb: u32, module: &Ctx) -> Result<(), String> {
-    let width = expr_width(base, module)?;
-    if msb >= width {
-        return Err(format!(
-            "a select of bit {msb} is out of range for a {width}-bit value -- Verilog reads \
-             out-of-range bits as `x`, and v1 rejects a constant select that reaches them"
-        ));
-    }
-    Ok(())
-}
 
 /// A bit-select/part-select bound (`x[7:0]`) is the same constant-
 /// expression grammar a `parameter`/`localparam` default or a
@@ -3898,6 +4119,7 @@ pub fn expr_width(expr: &Expr, module: &Module) -> Result<u32, String> {
 fn lower_select_target_range<'a, T>(
     target: &'a T,
     target_name: &str,
+    target_id: SignalId,
     tree: &SyntaxTree,
     module: &Ctx,
 ) -> Result<Option<(u32, u32)>, String>
@@ -3907,22 +4129,22 @@ where
     let Some(RefNode::Select(select)) = unwrap_node!(target, Select) else {
         return Ok(None);
     };
+    // Indices are written against the target's declared range; the write
+    // range is in bit positions. See `DeclaredRange`.
+    let range = module.packed_range(&Expr::Ref(target_id))?;
+    let what = format!("assignment target '{target_name}'");
 
     // Part-select: `x[msb:lsb]`.
     if let Some(bracket) = &select.nodes.2 {
         return match &bracket.nodes.1 {
-            sv_parser::PartSelectRange::ConstantRange(range) => {
-                let msb = lower_constant_index(&range.nodes.0, tree, module.parameters)?;
-                let lsb = lower_constant_index(&range.nodes.2, tree, module.parameters)?;
-                if lsb > msb {
-                    return Err(format!(
-                        "assignment target '{target_name}' has a part-select `[{msb}:{lsb}]` with lsb greater than msb"
-                    ));
-                }
-                Ok(Some((msb, lsb)))
+            sv_parser::PartSelectRange::ConstantRange(written) => {
+                let first = lower_constant_index(&written.nodes.0, tree, module.parameters)?;
+                let second = lower_constant_index(&written.nodes.2, tree, module.parameters)?;
+                Ok(Some(range.positions(first, second, true, &what)?))
             }
-            sv_parser::PartSelectRange::IndexedRange(range) => {
-                Ok(Some(lower_indexed_range(range, tree, module)?))
+            sv_parser::PartSelectRange::IndexedRange(indexed) => {
+                let (high, low) = lower_indexed_range(indexed, tree, module)?;
+                Ok(Some(range.positions(high, low, false, &what)?))
             }
         };
     }
@@ -3935,7 +4157,7 @@ where
             match try_const_fold(&index) {
                 Some(value) => {
                     let bit = constant_bit(value)?;
-                    Ok(Some((bit, bit)))
+                    Ok(Some(range.positions(bit, bit, false, &what)?))
                 }
                 None => Err(format!(
                     "assignment target '{target_name}' uses a variable-indexed bit-select (`x[i] <= v;`), which v1 doesn't support as a write target"
@@ -3948,29 +4170,6 @@ where
     }
 }
 
-/// Confirms a target write range's `msb` actually fits inside the target
-/// signal's declared width -- `lower_select_target_range` only knows the
-/// literal bounds written in the source, not the signal's width, so
-/// `x[40:38] <= v;` on an 8-bit `x` needs to be caught here rather than
-/// silently accepted and producing an out-of-range write at simulation
-/// time.
-fn check_target_range(
-    range: Option<(u32, u32)>,
-    target: SignalId,
-    target_name: &str,
-    module: &Module,
-) -> Result<(), String> {
-    let Some((msb, _lsb)) = range else {
-        return Ok(());
-    };
-    let width = module.signals[target].width;
-    if msb >= width {
-        return Err(format!(
-            "assignment target '{target_name}' selects bit {msb}, which is out of range for its {width}-bit width"
-        ));
-    }
-    Ok(())
-}
 
 fn symbol_text<'a, T>(op: &'a T, tree: &'a SyntaxTree) -> Option<&'a str>
 where

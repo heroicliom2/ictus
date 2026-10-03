@@ -1211,15 +1211,59 @@ divider and either multiplier. Dropping one iteration of each loop makes
 exactly `mulh`, `mulhsu` and `mulhu` fail (they read the product's high
 half; `mul` doesn't), and leaves the loop-free fast multiplier passing.
 
-**Next: three declaration forms still silently misread** -- all
-confirmed against Icarus while writing this up, none used by picorv32.
-`reg signed` is lowered unsigned (the keyword is never looked at, so
-`s >>> 1` of a negative `s` gives 5 where Icarus gives 253), and a
-declared range is kept only as a width, so `reg [8:1] r; r[1]` reads the
-wrong bit, as does `reg [0:7] r; r[0]`. Each should become either
-correct or a rejection. Then **Cranelift codegen**, whose precondition
-from D12 is met.
+**Declared ranges are honoured, and `signed` declarations are rejected
+instead of ignored.** Design in decisions.md D34.
 
+The three forms D33 left as silently misread -- plus a fourth found on
+the way -- all came from one loss: a declared range was reduced to its
+width, and every index taken as a bit position from 0. So `reg [8:1] r;
+r[1]` read the second bit, `reg [0:7] q; q[0]` read the bottom bit
+instead of the top, and `reg [7:0] mem [1:4]` dropped every write to
+`mem[4]` as out of range.
+
+- A `DeclaredRange` keeps each declaration's bounds as written and turns
+  an index into a position (`index - right` descending, `right - index`
+  ascending). Every select goes through it -- constant bits, part-selects,
+  indexed part-selects, runtime indices, and the same as write targets --
+  and so does an array element index, offset by its lowest element. The
+  kernel and IR are unchanged.
+- The translation owns the checks that depend on the declaration: a
+  part-select must run the same way as its range (`q[0:3]` on `[0:7]` is
+  now accepted, `q[3:0]` rejected, both as in Verilog), and a constant
+  index must be one the declaration has.
+- A parameter with a range not ending at 0 is rejected: it becomes a
+  plain literal wherever it's used, with no range to select against.
+- `signed` on a variable, port or parameter is rejected. Doing it
+  properly needs to know which literals are signed (an unsized `1` is),
+  which is also what D31's mixed-signedness rejection is waiting on --
+  so the two belong to one increment.
+
+Verified against Icarus (`ictus-cli/tests/differential_range.rs`, every
+select form through offset and ascending ranges, an offset port and an
+offset array), with restoring the old behaviour failing the first check.
+
+**Next: a strategic choice rather than a gap.** Nothing left in the
+language subset blocks picorv32: it runs its base, compressed and full
+M-extension test programs in six configurations, matching Icarus on
+every port, every cycle, and on the register file. Two directions are
+ready:
+
+- **Cranelift codegen** -- phase 1's actual goal, and pillar 1 (D11).
+  D12 deferred it until there was a correctness baseline with a real
+  design behind it; that has been true for several increments now, and
+  every differential test in the suite would become a test of the
+  compiled kernel for free, since the IR is the interface between them
+  and recent increments have needed no IR changes at all.
+- **Signedness** -- literal signedness (an unsized decimal is signed;
+  `'d5` and `8'd5` are not; `8'sd5` is) together with signed
+  declarations. It would lift both D31's mixed-signedness rejection and
+  this entry's `signed` rejection, and it's the most common thing
+  ordinary RTL outside picorv32 would hit.
+
+The recommendation is Cranelift: it's the phase's goal, it's the work the
+correctness baseline was built to support, and the language subset is
+now broad enough that further breadth has diminishing returns for the
+benchmark design. Signedness is the clear next language item after it.
 
 The supported language subset is still intentionally narrow:
 ANSI-style modules -- the first in the file is the top, and the rest can
@@ -1263,12 +1307,16 @@ module instantiation but no positional ports or parameters and no
 instance arrays, a single clock domain, and at most one driving process
 or assignment per signal. Expression widths and signedness follow IEEE
 1800 §11.6 and §11.8.1 exactly, except that an operator mixing a
-`$signed(...)` operand with an unsigned one is rejected. The whole of
+`$signed(...)` operand with an unsigned one is rejected. Declared ranges
+are honoured as written -- offset (`[8:1]`), ascending (`[0:7]`), and for
+array elements (`[1:4]`) -- but a declaration marked `signed` is rejected,
+as is a parameter whose range doesn't end at 0. The whole of
 picorv32.v lowers within this subset, and it runs picorv32's complete
 base-ISA test suite -- in four configurations, including compressed
 instructions -- plus the whole M extension through its instantiated
 divider and either of its multipliers, with every traced port and the final
-register file matching Icarus; Cranelift codegen is further out still.
+register file matching Icarus; Cranelift codegen is the recommended next
+step.
 
 
 **Acceptance**: benchmark suite from phase 0 runs correctly (differential
